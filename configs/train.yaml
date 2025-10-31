@@ -1,0 +1,49 @@
+seed: 42
+
+data:
+  root: /home/dl/Git/CSIRO/data
+  train_csv: train.csv
+  image_size: 224
+  batch_size: 16
+  num_workers: 20
+  val_split: 0.1
+  shuffle: true
+  target_order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
+  augment:
+    random_resized_crop_scale: [0.8, 1.0]
+    horizontal_flip_prob: 0.5
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+model:
+  backbone: dinov3_vitl16
+  # If weights_url is provided, it will be used to load the checkpoint.
+  # Otherwise the official default weights are used via torch.hub.
+  weights_url: null
+  pretrained: true
+  freeze_backbone: true
+  embedding_dim: 1024
+  head:
+    dropout: 0.0
+
+optimizer:
+  name: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+
+scheduler:
+  name: cosine
+  warmup_epochs: 1
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  precision: 16-mixed
+  log_every_n_steps: 50
+
+logging:
+  log_dir: /home/dl/Git/CSIRO/outputs
+  ckpt_dir: /home/dl/Git/CSIRO/outputs/checkpoints
+  use_loguru: true
