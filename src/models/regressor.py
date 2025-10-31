@@ -42,7 +42,13 @@ class BiomassRegressor(LightningModule):
         if dropout and dropout > 0:
             layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(embedding_dim, num_outputs))
+        # enforce non-negative predictions (>= 0) with Smooth activation for stable gradients
+        layers.append(nn.Softplus())
         self.head = nn.Sequential(*layers)
+
+        # buffers for epoch-wise metrics on validation set
+        self._val_preds: list[Tensor] = []
+        self._val_targets: list[Tensor] = []
 
     def forward(self, images: Tensor) -> Tensor:
         features = self.feature_extractor(images)
@@ -54,15 +60,35 @@ class BiomassRegressor(LightningModule):
         preds = self(images)
         loss = F.mse_loss(preds, targets)
         mae = F.l1_loss(preds, targets)
+        mse = loss
         self.log(f"{stage}_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"{stage}_mae", mae, on_step=False, on_epoch=True, prog_bar=False)
-        return {"loss": loss, "mae": mae}
+        self.log(f"{stage}_mse", mse, on_step=False, on_epoch=True, prog_bar=False)
+        return {"loss": loss, "mae": mae, "mse": mse, "preds": preds, "targets": targets}
 
     def training_step(self, batch: Any, batch_idx: int):
         return self._shared_step(batch, stage="train")["loss"]
 
     def validation_step(self, batch: Any, batch_idx: int):
-        self._shared_step(batch, stage="val")
+        out = self._shared_step(batch, stage="val")
+        self._val_preds.append(out["preds"].detach().float().cpu())
+        self._val_targets.append(out["targets"].detach().float().cpu())
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_preds.clear()
+        self._val_targets.clear()
+
+    def on_validation_epoch_end(self) -> None:
+        if len(self._val_preds) == 0:
+            return
+        preds = torch.cat(self._val_preds, dim=0)
+        targets = torch.cat(self._val_targets, dim=0)
+        # overall R^2 across all outputs
+        ss_res = torch.sum((targets - preds) ** 2)
+        mean_t = torch.mean(targets)
+        ss_tot = torch.sum((targets - mean_t) ** 2)
+        r2 = 1.0 - (ss_res / (ss_tot + 1e-8))
+        self.log("val_r2", r2, on_step=False, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
         params = [p for p in self.parameters() if p.requires_grad]

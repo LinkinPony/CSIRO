@@ -1,9 +1,10 @@
 seed: 42
+version: liner
 
 data:
   root: /home/dl/Git/CSIRO/data
   train_csv: train.csv
-  image_size: 224
+  image_size: 640
   batch_size: 16
   num_workers: 20
   val_split: 0.1
@@ -42,6 +43,7 @@ trainer:
   devices: 1
   precision: 16-mixed
   log_every_n_steps: 50
+  resume_from: null
 
 logging:
   log_dir: /home/dl/Git/CSIRO/outputs
