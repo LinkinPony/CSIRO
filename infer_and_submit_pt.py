@@ -14,7 +14,86 @@ import torchvision.transforms as T
 from PIL import Image
 import pandas as pd
 
-from src.models.regressor import BiomassRegressor
+from torch import nn
+
+
+# ===== Standalone minimal model and backbone (no local imports) =====
+class DinoV3FeatureExtractor(nn.Module):
+    def __init__(self, backbone: nn.Module) -> None:
+        super().__init__()
+        self.backbone = backbone
+        for parameter in self.backbone.parameters():
+            parameter.requires_grad = False
+        self.backbone.eval()
+
+    @torch.inference_mode()
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        feats = self.backbone.forward_features(images)
+        return feats["x_norm_clstoken"]
+
+
+from typing import Optional
+
+
+def load_dinov3_vitl16(pretrained: bool = True, weights_url: Optional[str] = None, check_hash: bool = False) -> nn.Module:
+    if weights_url:
+        model = torch.hub.load(
+            repo_or_dir="facebookresearch/dinov3",
+            model="dinov3_vitl16",
+            pretrained=pretrained,
+            weights=weights_url,
+            check_hash=check_hash,
+        )
+    else:
+        model = torch.hub.load(
+            repo_or_dir="facebookresearch/dinov3",
+            model="dinov3_vitl16",
+            pretrained=pretrained,
+        )
+    return model
+
+
+def build_feature_extractor(backbone_name: str, pretrained: bool = True, weights_url: Optional[str] = None) -> nn.Module:
+    if backbone_name != "dinov3_vitl16":
+        raise ValueError(f"Unsupported backbone: {backbone_name}")
+    backbone = load_dinov3_vitl16(pretrained=pretrained, weights_url=weights_url)
+    return DinoV3FeatureExtractor(backbone)
+
+
+class BiomassRegressor(nn.Module):
+    def __init__(
+        self,
+        backbone_name: str,
+        embedding_dim: int,
+        num_outputs: int = 3,
+        dropout: float = 0.0,
+        pretrained: bool = True,
+        weights_url: Optional[str] = None,
+        freeze_backbone: bool = True,
+    ) -> None:
+        super().__init__()
+        feature_extractor = build_feature_extractor(
+            backbone_name=backbone_name,
+            pretrained=pretrained,
+            weights_url=weights_url,
+        )
+        if not freeze_backbone:
+            for parameter in feature_extractor.backbone.parameters():
+                parameter.requires_grad = True
+            feature_extractor.backbone.train()
+        self.feature_extractor = feature_extractor
+
+        layers: List[nn.Module] = []
+        if dropout and dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        layers.append(nn.Linear(embedding_dim, num_outputs))
+        layers.append(nn.Softplus())  # enforce non-negative outputs
+        self.head = nn.Sequential(*layers)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        features = self.feature_extractor(images)
+        outputs = self.head(features)
+        return outputs
 
 
 
