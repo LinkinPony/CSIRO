@@ -1,3 +1,10 @@
+
+# ===== User variables (edit these three) =====
+WEIGHTS_PT_PATH = "/home/dl/Git/CSIRO/weights/best.pt"  # exported by export_ckpt_to_pt.py
+INPUT_PATH = "/home/dl/Git/CSIRO/data"  # dir containing test.csv & images, or a direct test.csv path
+OUTPUT_SUBMISSION_PATH = "/home/dl/Git/CSIRO/submission.csv"
+# ============================================
+
 import os
 from typing import Dict, List, Tuple
 
@@ -10,11 +17,6 @@ import pandas as pd
 from src.models.regressor import BiomassRegressor
 
 
-# ===== User variables (edit these three) =====
-WEIGHTS_PT_PATH = "/home/dl/Git/CSIRO/weights/best.pt"  # exported by export_ckpt_to_pt.py
-INPUT_PATH = "/home/dl/Git/CSIRO/data"  # dir containing test.csv & images, or a direct test.csv path
-OUTPUT_SUBMISSION_PATH = "/home/dl/Git/CSIRO/submission.csv"
-# ============================================
 
 IMAGE_SIZE = 640
 MEAN = [0.485, 0.456, 0.406]
