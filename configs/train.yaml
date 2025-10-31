@@ -1,8 +1,8 @@
 seed: 42
-version: liner
+version: mlp
 
 data:
-  root: /home/dl/Git/CSIRO/data
+  root: data
   train_csv: train.csv
   image_size: 640
   batch_size: 16
@@ -22,11 +22,18 @@ model:
   # If weights_url is provided, it will be used to load the checkpoint.
   # Otherwise the official default weights are used via torch.hub.
   weights_url: null
+  # Provide a local path to an offline checkpoint to avoid any network access.
+  # Example: /path/to/dinov3_vitl16_pretrain.pth
+  weights_path: /media/dl/dataset/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
   pretrained: true
   freeze_backbone: true
   embedding_dim: 1024
   head:
-    dropout: 0.0
+    type: mlp
+    hidden_dims: [1024 , 512, 256]
+    activation: relu
+    dropout: 0.2
+    use_output_softplus: true
 
 optimizer:
   name: adamw
@@ -46,6 +53,6 @@ trainer:
   resume_from: null
 
 logging:
-  log_dir: /home/dl/Git/CSIRO/outputs
-  ckpt_dir: /home/dl/Git/CSIRO/outputs/checkpoints
+  log_dir: outputs
+  ckpt_dir: outputs/checkpoints
   use_loguru: true

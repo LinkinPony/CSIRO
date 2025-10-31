@@ -6,7 +6,7 @@ import yaml
 from loguru import logger
 
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 import torch
 
@@ -68,8 +68,12 @@ def main():
         embedding_dim=int(cfg["model"]["embedding_dim"]),
         num_outputs=3,
         dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
+        head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
+        head_activation=str(cfg["model"]["head"].get("activation", "relu")),
+        use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
         pretrained=bool(cfg["model"].get("pretrained", True)),
         weights_url=cfg["model"].get("weights_url", None),
+        weights_path=cfg["model"].get("weights_path", None),
         freeze_backbone=bool(cfg["model"].get("freeze_backbone", True)),
         learning_rate=float(cfg["optimizer"]["lr"]),
         weight_decay=float(cfg["optimizer"]["weight_decay"]),
@@ -77,51 +81,7 @@ def main():
         max_epochs=int(cfg["trainer"]["max_epochs"]),
     )
 
-    class ExportTorchScriptCallback(Callback):
-        def __init__(self, ckpt_dir: Path, image_size: int) -> None:
-            super().__init__()
-            self.ckpt_dir = ckpt_dir
-            self.best_path = ckpt_dir / "best.ckpt"
-            self.last_path = ckpt_dir / "last.ckpt"
-            self.best_mtime = -1.0
-            self.last_mtime = -1.0
-            self.image_size = int(image_size)
-
-        def _export_ts(self, model: pl.LightningModule, out_path: Path):
-            try:
-                example = torch.randn(1, 3, self.image_size, self.image_size)
-                model_cpu = model.to("cpu").eval()
-                ts = model_cpu.to_torchscript(method="trace", example_inputs=example)
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.jit.save(ts, str(out_path))
-                logger.info(f"Exported TorchScript to {out_path}")
-            except Exception as e:
-                logger.warning(f"TorchScript export failed for {out_path.name}: {e}")
-
-        def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-            # Save and export 'last.ckpt' every epoch
-            try:
-                trainer.save_checkpoint(str(self.last_path))
-                if self.last_path.exists():
-                    mtime = self.last_path.stat().st_mtime
-                    if mtime != self.last_mtime:
-                        self.last_mtime = mtime
-                        self._export_ts(pl_module, self.ckpt_dir / "last.ts")
-            except Exception as e:
-                logger.warning(f"Saving last.ckpt failed: {e}")
-
-        def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-            # If best.ckpt updated, export
-            try:
-                if self.best_path.exists():
-                    mtime = self.best_path.stat().st_mtime
-                    if mtime != self.best_mtime:
-                        self.best_mtime = mtime
-                        # Load best weights to a fresh module to ensure consistency
-                        best_model = type(pl_module).load_from_checkpoint(str(self.best_path))
-                        self._export_ts(best_model, self.ckpt_dir / "best.ts")
-            except Exception as e:
-                logger.warning(f"Exporting best.ts failed: {e}")
+    # TorchScript export callback removed per user request
 
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
@@ -136,7 +96,6 @@ def main():
     callbacks = [
         checkpoint_cb,
         LearningRateMonitor(logging_interval="epoch"),
-        ExportTorchScriptCallback(ckpt_dir=ckpt_dir, image_size=int(cfg["data"]["image_size"])),
     ]
 
     csv_logger = CSVLogger(save_dir=str(log_dir), name="lightning", version=None)

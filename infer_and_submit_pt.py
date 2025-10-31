@@ -1,17 +1,48 @@
+# ===== Required user variables =====
+WEIGHTS_PT_PATH = "weights/best.pt"  # exported by export_ckpt_to_pt.py
+INPUT_PATH = "data"  # dir containing test.csv & images, or a direct test.csv path
+OUTPUT_SUBMISSION_PATH = "submission.csv"
+DINOV3_PATH = "third_party/dinov3/dinov3"  # path to dinov3 source folder (contains dinov3/*)
+# ===================================
+# ==========================================================
+# STRICT OFFLINE INFERENCE SCRIPT (READ ME CAREFULLY)
+# - Only one weight file is allowed: WEIGHTS_PT_PATH, exported by export_ckpt_to_pt.py
+# - Strictly offline: NO hub/network downloads allowed anywhere
+# - Only code allowed to be imported outside this file is the dinov3 library
+#   from DINOV3_PATH. Do NOT import any other local project code.
+# - This script reconstructs the MLP head used during training from the
+#   configuration below. If you changed training head settings, update here too.
+# ==========================================================
 
-# ===== User variables (edit these three) =====
-WEIGHTS_PT_PATH = "/home/dl/Git/CSIRO/weights/best.pt"  # exported by export_ckpt_to_pt.py
-INPUT_PATH = "/home/dl/Git/CSIRO/data"  # dir containing test.csv & images, or a direct test.csv path
-OUTPUT_SUBMISSION_PATH = "/home/dl/Git/CSIRO/submission.csv"
-DINOV3_PATH = "/home/dl/Git/CSIRO/third_party/dinov3-src/dinov3"
-# ============================================
 
-# Optional: set to absolute path of local dinov3 source dir; leave empty to use default relative path
+
+# ===== Model/data configuration (copy of required train.yaml parts) =====
+# Backbone and embedding
+BACKBONE_NAME = "dinov3_vitl16"
+EMBEDDING_DIM = 1024
+NUM_OUTPUTS = 3  # predicts [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
+
+# MLP head settings (must match training)
+HEAD_HIDDEN_DIMS = [1024, 512, 256]
+HEAD_ACTIVATION = "relu"  # one of: relu, gelu, silu
+HEAD_DROPOUT = 0.2
+USE_OUTPUT_SOFTPLUS = True  # keep predictions non-negative
+
+# Preprocessing
+IMAGE_SIZE = 640
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
+TARGET_BASES = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"]
+
+# Inference loader
+BATCH_SIZE = 32
+NUM_WORKERS = 4
+# ==============================================
 
 
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -20,10 +51,9 @@ from PIL import Image
 import pandas as pd
 
 from torch import nn
-from typing import Optional
 
 
-# ===== Optional: add local dinov3 to import path (offline) =====
+# ===== Add local dinov3 to import path (strictly offline) =====
 _DINOV3_DIR = os.path.abspath(DINOV3_PATH) if DINOV3_PATH else ""
 if _DINOV3_DIR and os.path.isdir(_DINOV3_DIR) and _DINOV3_DIR not in sys.path:
     sys.path.insert(0, _DINOV3_DIR)
@@ -56,12 +86,6 @@ def load_model_or_state(pt_path: str) -> Tuple[Optional[nn.Module], Optional[dic
         return obj, None, {"format": "pickled_module"}
     raise RuntimeError("Unsupported weights file format. Provide a TorchScript .pt for offline inference.")
 
-
-
-IMAGE_SIZE = 640
-MEAN = [0.485, 0.456, 0.406]
-STD = [0.229, 0.224, 0.225]
-TARGET_BASES = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"]
 
 
 def resolve_paths(input_path: str) -> Tuple[str, str]:
@@ -120,6 +144,13 @@ class DinoV3FeatureExtractor(nn.Module):
 
     @torch.inference_mode()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # Ensure dtype alignment (e.g., avoid Half vs Float mismatch)
+        try:
+            backbone_dtype = next(self.backbone.parameters()).dtype
+        except StopIteration:
+            backbone_dtype = images.dtype
+        if images.dtype != backbone_dtype:
+            images = images.to(dtype=backbone_dtype)
         feats = self.backbone.forward_features(images)
         return feats["x_norm_clstoken"]
 
@@ -141,7 +172,10 @@ class BiomassRegressor(nn.Module):
         backbone_name: str,
         embedding_dim: int,
         num_outputs: int = 3,
-        dropout: float = 0.0,
+        head_hidden_dims: Optional[List[int]] = None,
+        head_activation: str = "relu",
+        head_dropout: float = 0.0,
+        use_output_softplus: bool = True,
         freeze_backbone: bool = True,
     ) -> None:
         super().__init__()
@@ -152,11 +186,34 @@ class BiomassRegressor(nn.Module):
             feature_extractor.backbone.train()
         self.feature_extractor = feature_extractor
 
+        def build_activation(name: str) -> nn.Module:
+            name = (name or "").lower()
+            if name == "relu":
+                return nn.ReLU(inplace=True)
+            if name == "gelu":
+                return nn.GELU()
+            if name == "silu" or name == "swish":
+                return nn.SiLU(inplace=True)
+            return nn.ReLU(inplace=True)
+
+        hidden_dims: List[int] = list(head_hidden_dims or [])
         layers: List[nn.Module] = []
-        if dropout and dropout > 0:
-            layers.append(nn.Dropout(dropout))
-        layers.append(nn.Linear(embedding_dim, num_outputs))
-        layers.append(nn.Softplus())
+        in_dim = embedding_dim
+        act = build_activation(head_activation)
+
+        if head_dropout and head_dropout > 0:
+            layers.append(nn.Dropout(head_dropout))
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(act.__class__())
+            if head_dropout and head_dropout > 0:
+                layers.append(nn.Dropout(head_dropout))
+            in_dim = hidden_dim
+
+        layers.append(nn.Linear(in_dim, num_outputs))
+        if use_output_softplus:
+            layers.append(nn.Softplus())
         self.head = nn.Sequential(*layers)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -165,27 +222,31 @@ class BiomassRegressor(nn.Module):
 
 
 def build_model_from_meta(meta: Dict) -> BiomassRegressor:
-    backbone_name = str(meta.get("backbone", "dinov3_vitl16"))
-    embedding_dim = int(meta.get("embedding_dim", 1024))
-    num_outputs = int(meta.get("num_outputs", 3))
+    # Use meta for backbone/embedding/outputs if present, otherwise fallback to config
+    backbone_name = str(meta.get("backbone", BACKBONE_NAME))
+    embedding_dim = int(meta.get("embedding_dim", EMBEDDING_DIM))
+    num_outputs = int(meta.get("num_outputs", NUM_OUTPUTS))
     model = BiomassRegressor(
         backbone_name=backbone_name,
         embedding_dim=embedding_dim,
         num_outputs=num_outputs,
-        dropout=0.0,
+        head_hidden_dims=HEAD_HIDDEN_DIMS,
+        head_activation=HEAD_ACTIVATION,
+        head_dropout=HEAD_DROPOUT,
+        use_output_softplus=USE_OUTPUT_SOFTPLUS,
         freeze_backbone=True,
     )
     return model
 
 
-def predict_for_images(model: nn.Module, dataset_root: str, image_paths: List[str], batch_size: int = 32) -> Dict[str, Tuple[float, float, float]]:
+def predict_for_images(model: nn.Module, dataset_root: str, image_paths: List[str], batch_size: int = BATCH_SIZE) -> Dict[str, Tuple[float, float, float]]:
     if not torch.cuda.is_available():
         raise RuntimeError("GPU-only inference is enforced. CUDA is not available.")
     device = "cuda"
 
     tf = build_transforms()
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
     model.eval().to(device)
     torch.set_float32_matmul_precision("high")

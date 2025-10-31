@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import torch
 import torch.nn.functional as F
@@ -18,8 +18,12 @@ class BiomassRegressor(LightningModule):
         embedding_dim: int,
         num_outputs: int = 3,
         dropout: float = 0.0,
+        head_hidden_dims: Optional[List[int]] = None,
+        head_activation: str = "relu",
+        use_output_softplus: bool = True,
         pretrained: bool = True,
         weights_url: Optional[str] = None,
+        weights_path: Optional[str] = None,
         freeze_backbone: bool = True,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
@@ -30,7 +34,10 @@ class BiomassRegressor(LightningModule):
         self.save_hyperparameters()
 
         feature_extractor = build_feature_extractor(
-            backbone_name=backbone_name, pretrained=pretrained, weights_url=weights_url
+            backbone_name=backbone_name,
+            pretrained=pretrained,
+            weights_url=weights_url,
+            weights_path=weights_path,
         )
         if not freeze_backbone:
             for parameter in feature_extractor.backbone.parameters():
@@ -38,12 +45,35 @@ class BiomassRegressor(LightningModule):
             feature_extractor.backbone.train()
         self.feature_extractor = feature_extractor
 
-        layers = []
+        def build_activation(name: str) -> nn.Module:
+            name = (name or "").lower()
+            if name == "relu":
+                return nn.ReLU(inplace=True)
+            if name == "gelu":
+                return nn.GELU()
+            if name == "silu" or name == "swish":
+                return nn.SiLU(inplace=True)
+            # default
+            return nn.ReLU(inplace=True)
+
+        hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
+        layers: List[nn.Module] = []
+        in_dim = embedding_dim
+        act = build_activation(head_activation)
+
         if dropout and dropout > 0:
             layers.append(nn.Dropout(dropout))
-        layers.append(nn.Linear(embedding_dim, num_outputs))
-        # enforce non-negative predictions (>= 0) with Smooth activation for stable gradients
-        layers.append(nn.Softplus())
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(act.__class__())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+
+        layers.append(nn.Linear(in_dim, num_outputs))
+        if use_output_softplus:
+            layers.append(nn.Softplus())
         self.head = nn.Sequential(*layers)
 
         # buffers for epoch-wise metrics on validation set
