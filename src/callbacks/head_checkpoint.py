@@ -15,6 +15,28 @@ class HeadCheckpoint(Callback):
 
     def on_validation_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
         epoch = trainer.current_epoch
+        # Collect metrics for filename suffix if available
+        metrics = getattr(trainer, "callback_metrics", {}) or {}
+        def _get_float(name: str):
+            try:
+                v = metrics.get(name, None)
+                if v is None:
+                    return None
+                # torch.Tensor -> float
+                try:
+                    import torch as _t
+                    if isinstance(v, _t.Tensor):
+                        v = v.detach().cpu().item()
+                except Exception:
+                    pass
+                return float(v)
+            except Exception:
+                return None
+
+        val_loss = _get_float("val_loss")
+        train_loss = _get_float("train_loss")
+        val_r2 = _get_float("val_r2")
+
         state: Dict[str, Any] = {
             "state_dict": pl_module.head.state_dict(),
             "meta": {
@@ -27,7 +49,16 @@ class HeadCheckpoint(Callback):
                 "use_output_softplus": bool(getattr(pl_module.hparams, "use_output_softplus", True)) if hasattr(pl_module, "hparams") else True,
             },
         }
-        out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}.pt")
+        # Build filename with optional metric suffixes
+        suffix_parts: list[str] = []
+        if val_loss is not None:
+            suffix_parts.append(f"val_loss{val_loss:.6f}")
+        if train_loss is not None:
+            suffix_parts.append(f"train_loss{train_loss:.6f}")
+        if val_r2 is not None:
+            suffix_parts.append(f"val_r2{val_r2:.6f}")
+        metrics_suffix = ("-" + "-".join(suffix_parts)) if suffix_parts else ""
+        out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}{metrics_suffix}.pt")
         torch.save(state, out_path)
 
 

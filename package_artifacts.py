@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 from pathlib import Path
+import math
 
 import yaml
 
@@ -89,15 +90,25 @@ def list_head_checkpoints(head_dir: Path) -> list[Path]:
 
 
 def find_head_by_epoch(head_dir: Path, epoch: int) -> Path | None:
-    target = head_dir / f"head-epoch{epoch:03d}.pt"
-    return target if target.is_file() else None
+    # Support metric-suffixed filenames like head-epoch003-val_loss0.123456-...pt
+    candidates = []
+    prefix = f"head-epoch{epoch:03d}"
+    for p in list_head_checkpoints(head_dir):
+        name = p.name
+        if name.startswith(prefix) and name.endswith(".pt"):
+            candidates.append(p)
+    if not candidates:
+        return None
+    # If multiple, prefer the most recent
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
 def pick_latest_head(head_files: list[Path]) -> Path | None:
     if not head_files:
         return None
     def parse_epoch(p: Path) -> int:
-        m = re.search(r"head-epoch(\d+)\.pt$", p.name)
+        m = re.search(r"head-epoch(\d+)(?:[^/]*)\.pt$", p.name)
         return int(m.group(1)) if m else -1
     head_files.sort(key=lambda p: (parse_epoch(p), p.stat().st_mtime), reverse=True)
     return head_files[0]
@@ -131,32 +142,73 @@ def main():
     cfg = load_cfg(args.config)
     log_dir, ckpt_dir = resolve_dirs(cfg)
 
-    head_dir = ckpt_dir / "head"
-    head_files = list_head_checkpoints(head_dir)
-    if not head_files:
-        raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
-
-    # Try to pick best by val_loss from latest metrics.csv
-    metrics_csv = find_latest_metrics_csv(log_dir)
-    chosen: Path | None = None
-    if metrics_csv is not None:
-        best_epoch = pick_best_epoch_from_metrics(metrics_csv)
-        if best_epoch is not None:
-            p = find_head_by_epoch(head_dir, best_epoch)
-            if p is not None:
-                chosen = p
-
-    # Fallback to latest by epoch/mtime
-    if chosen is None:
-        chosen = pick_latest_head(head_files)
-    if chosen is None:
-        raise FileNotFoundError("Failed to determine a head checkpoint to package.")
-
     weights_dir = Path(args.weights_dir).expanduser()
     weights_dir.mkdir(parents=True, exist_ok=True)
 
-    copied_head = copy_head_to_weights(chosen, weights_dir)
-    print(f"Copied head checkpoint to: {copied_head}")
+    # If kfold is enabled, export one head per fold under weights/head/fold_*/infer_head.pt
+    kfold_cfg = cfg.get("kfold", {})
+    kfold_enabled = bool(kfold_cfg.get("enabled", False))
+    if kfold_enabled:
+        k = int(kfold_cfg.get("k", 5))
+        exported = []
+        for fold_idx in range(k):
+            fold_ckpt_head_dir = ckpt_dir / f"fold_{fold_idx}" / "head"
+            head_files = list_head_checkpoints(fold_ckpt_head_dir)
+            if not head_files:
+                raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
+
+            # Pick best by val_loss using this fold's latest metrics.csv
+            fold_log_dir = log_dir / f"fold_{fold_idx}"
+            metrics_csv = find_latest_metrics_csv(fold_log_dir)
+            chosen: Path | None = None
+            if metrics_csv is not None:
+                best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+                if best_epoch is not None:
+                    p = find_head_by_epoch(fold_ckpt_head_dir, best_epoch)
+                    if p is not None:
+                        chosen = p
+
+            # Fallback to latest
+            if chosen is None:
+                chosen = pick_latest_head(head_files)
+            if chosen is None:
+                raise FileNotFoundError(f"Failed to determine a head checkpoint for fold {fold_idx}.")
+
+            # Copy into weights/head/fold_{i}/infer_head.pt (clean per-fold dir)
+            dst_dir = weights_dir / "head" / f"fold_{fold_idx}"
+            if dst_dir.exists() and dst_dir.is_dir():
+                shutil.rmtree(dst_dir)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst_path = dst_dir / "infer_head.pt"
+            shutil.copyfile(str(chosen), str(dst_path))
+            exported.append(dst_path)
+
+        print("Copied per-fold head checkpoints:")
+        for p in exported:
+            print(f" - {p}")
+    else:
+        # Single-run export (non-kfold)
+        head_dir = ckpt_dir / "head"
+        head_files = list_head_checkpoints(head_dir)
+        if not head_files:
+            raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
+
+        metrics_csv = find_latest_metrics_csv(log_dir)
+        chosen: Path | None = None
+        if metrics_csv is not None:
+            best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+            if best_epoch is not None:
+                p = find_head_by_epoch(head_dir, best_epoch)
+                if p is not None:
+                    chosen = p
+
+        if chosen is None:
+            chosen = pick_latest_head(head_files)
+        if chosen is None:
+            raise FileNotFoundError("Failed to determine a head checkpoint to package.")
+
+        copied_head = copy_head_to_weights(chosen, weights_dir)
+        print(f"Copied head checkpoint to: {copied_head}")
 
     # Copy configs and src into weights/
     repo_root = Path(__file__).parent

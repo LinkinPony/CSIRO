@@ -27,6 +27,19 @@ def parse_args():
     return parser.parse_args()
 
 
+def _parse_image_size(value):
+    # Accept int (square) or [width, height]; return (height, width)
+    try:
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            w, h = int(value[0]), int(value[1])
+            return (int(h), int(w))
+        v = int(value)
+        return (v, v)
+    except Exception:
+        v = int(value)
+        return (v, v)
+
+
 def main():
     args = parse_args()
     with open(args.config, "r") as f:
@@ -74,9 +87,11 @@ def main():
         dm = PastureDataModule(
             data_root=cfg["data"]["root"],
             train_csv=cfg["data"]["train_csv"],
-            image_size=int(cfg["data"]["image_size"]),
+            image_size=_parse_image_size(cfg["data"]["image_size"]),
             batch_size=int(cfg["data"]["batch_size"]),
+            val_batch_size=int(cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])),
             num_workers=int(cfg["data"]["num_workers"]),
+            prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
             val_split=float(cfg["data"]["val_split"]),
             target_order=list(cfg["data"]["target_order"]),
             mean=list(cfg["data"]["normalization"]["mean"]),

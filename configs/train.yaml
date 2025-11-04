@@ -1,12 +1,14 @@
 seed: 42
-version: mlp
+version: mlp-full
 
 data:
   root: data
   train_csv: train.csv
-  image_size: 640
+  image_size: [960, 480]
   batch_size: 16
+  val_batch_size: 16
   num_workers: 20
+  prefetch_factor: 4
   val_split: 0.1
   shuffle: true
   target_order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
@@ -30,7 +32,7 @@ model:
   embedding_dim: 1024
   head:
     type: mlp
-    hidden_dims: [1024 , 512, 256]
+    hidden_dims: [512, 256]
     activation: relu
     dropout: 0.2
     use_output_softplus: true
@@ -46,10 +48,10 @@ scheduler:
 
 kfold:
   enabled: true
-  k: 5
+  k: 10
 
 trainer:
-  max_epochs: 35
+  max_epochs: 20
   accelerator: auto
   devices: 1
   precision: 16-mixed

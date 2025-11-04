@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -18,7 +18,7 @@ class NormalizationSpec:
 
 
 def build_transforms(
-    image_size: int,
+    image_size: Union[int, Tuple[int, int]],
     mean: Sequence[float],
     std: Sequence[float],
     train_scale: Tuple[float, float] = (0.8, 1.0),
@@ -35,7 +35,6 @@ def build_transforms(
     val_tf = T.Compose(
         [
             T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
-            T.CenterCrop(image_size),
             T.ToTensor(),
             T.Normalize(mean=mean, std=std),
         ]
@@ -76,8 +75,9 @@ class PastureDataModule(LightningDataModule):
         self,
         data_root: str,
         train_csv: str,
-        image_size: int,
+        image_size: Union[int, Tuple[int, int]],
         batch_size: int,
+        val_batch_size: int,
         num_workers: int,
         val_split: float,
         target_order: Sequence[str],
@@ -86,6 +86,7 @@ class PastureDataModule(LightningDataModule):
         train_scale: Tuple[float, float] = (0.8, 1.0),
         hflip_prob: float = 0.5,
         shuffle: bool = True,
+        prefetch_factor: int = 2,
         predefined_train_df: Optional[pd.DataFrame] = None,
         predefined_val_df: Optional[pd.DataFrame] = None,
     ) -> None:
@@ -94,7 +95,9 @@ class PastureDataModule(LightningDataModule):
         self.train_csv = train_csv
         self.image_size = image_size
         self.batch_size = batch_size
+        self.val_batch_size = val_batch_size
         self.num_workers = num_workers
+        self.prefetch_factor = int(prefetch_factor)
         self.val_split = float(val_split)
         self.target_order = list(target_order)
         self.shuffle = shuffle
@@ -163,6 +166,8 @@ class PastureDataModule(LightningDataModule):
             shuffle=self.shuffle,
             num_workers=self.num_workers,
             pin_memory=True,
+            prefetch_factor=self.prefetch_factor,
+            persistent_workers=bool(self.num_workers > 0),
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -175,10 +180,12 @@ class PastureDataModule(LightningDataModule):
         )
         return DataLoader(
             ds,
-            batch_size=self.batch_size,
+            batch_size=self.val_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            prefetch_factor=self.prefetch_factor,
+            persistent_workers=bool(self.num_workers > 0),
         )
 
 

@@ -1,6 +1,6 @@
 # ===== Required user variables =====
 # Backward-compat: WEIGHTS_PT_PATH is ignored when HEAD_WEIGHTS_PT_PATH is provided.
-HEAD_WEIGHTS_PT_PATH = "weights/head/infer_head.pt"  # regression head-only weights (.pt)
+HEAD_WEIGHTS_PT_PATH = "weights/head/"  # regression head-only weights (.pt)
 DINO_WEIGHTS_PT_PATH = "dinov3_weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pt"  # frozen DINOv3 weights (.pt)
 INPUT_PATH = "data"  # dir containing test.csv & images, or a direct test.csv path
 OUTPUT_SUBMISSION_PATH = "submission.csv"
@@ -116,10 +116,9 @@ class TestImageDataset(Dataset):
         return image, rel_path
 
 
-def build_transforms(image_size: int, mean: List[float], std: List[float]) -> T.Compose:
+def build_transforms(image_size: Tuple[int, int], mean: List[float], std: List[float]) -> T.Compose:
     return T.Compose([
         T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
-        T.CenterCrop(image_size),
         T.ToTensor(),
         T.Normalize(mean=mean, std=std),
     ])
@@ -181,6 +180,88 @@ def load_config(project_dir: str) -> Dict:
         raise FileNotFoundError(f"Config YAML not found: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+def _parse_image_size(value) -> Tuple[int, int]:
+    try:
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            w, h = int(value[0]), int(value[1])
+            return (int(h), int(w))
+        v = int(value)
+        return (v, v)
+    except Exception:
+        v = int(value)
+        return (v, v)
+
+
+
+def discover_head_weight_paths(path: str) -> List[str]:
+    # Accept single-file or directory containing per-fold heads
+    if os.path.isfile(path):
+        return [path]
+    if os.path.isdir(path):
+        # Preferred: weights/head/fold_*/infer_head.pt
+        fold_paths: List[str] = []
+        try:
+            for name in sorted(os.listdir(path)):
+                if name.startswith("fold_"):
+                    cand = os.path.join(path, name, "infer_head.pt")
+                    if os.path.isfile(cand):
+                        fold_paths.append(cand)
+        except Exception:
+            pass
+        if fold_paths:
+            return fold_paths
+        # Fallback: weights/head/infer_head.pt under the directory
+        single = os.path.join(path, "infer_head.pt")
+        if os.path.isfile(single):
+            return [single]
+        # Fallback: any .pt directly under directory
+        pts = [os.path.join(path, n) for n in os.listdir(path) if n.endswith('.pt')]
+        pts.sort()
+        if pts:
+            return pts
+    raise FileNotFoundError(f"Cannot find head weights at: {path}")
+
+
+def extract_features_for_images(
+    feature_extractor: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: int,
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+) -> Tuple[List[str], torch.Tensor]:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
+
+    feature_extractor.eval().to(device)
+
+    rels: List[str] = []
+    feats_cpu: List[torch.Tensor] = []
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device, non_blocking=True)
+            feats = feature_extractor(images)
+            feats_cpu.append(feats.detach().cpu().float())
+            rels.extend(list(rel_paths))
+    features = torch.cat(feats_cpu, dim=0) if feats_cpu else torch.empty((0, 0), dtype=torch.float32)
+    return rels, features
+
+
+def predict_from_features(features_cpu: torch.Tensor, head: nn.Module, batch_size: int) -> torch.Tensor:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    head = head.eval().to(device)
+    N = features_cpu.shape[0]
+    preds_list: List[torch.Tensor] = []
+    with torch.inference_mode():
+        for i in range(0, N, max(1, batch_size)):
+            chunk = features_cpu[i:i + max(1, batch_size)].to(device, non_blocking=True)
+            out = head(chunk)
+            preds_list.append(out.detach().cpu().float())
+    return torch.cat(preds_list, dim=0) if preds_list else torch.empty((0, 3), dtype=torch.float32)
 
 
 def predict_for_images(
@@ -218,7 +299,7 @@ def main():
     cfg = load_config(_PROJECT_DIR_ABS)
 
     # Data settings from config (single source of truth)
-    image_size = int(cfg["data"]["image_size"])  # e.g., 640
+    image_size = _parse_image_size(cfg["data"]["image_size"])  # (H, W), e.g., (640, 640) or (640, 1280)
     mean = list(cfg["data"]["normalization"]["mean"])  # e.g., [0.485, 0.456, 0.406]
     std = list(cfg["data"]["normalization"]["std"])    # e.g., [0.229, 0.224, 0.225]
     target_bases = list(cfg["data"]["target_order"])    # e.g., [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
@@ -232,10 +313,10 @@ def main():
         raise ValueError("test.csv must contain columns: sample_id, image_path, target_name")
     unique_image_paths = df["image_path"].astype(str).unique().tolist()
 
-    # Build model and load weights (new preferred path uses separate backbone + head)
+    # Build model and load weights (supports single head or k-fold heads under a directory)
     # Strictly offline path: require both backbone and head weights
-    if not (HEAD_WEIGHTS_PT_PATH and os.path.isfile(HEAD_WEIGHTS_PT_PATH)):
-        raise FileNotFoundError("HEAD_WEIGHTS_PT_PATH must be set to a valid head .pt file.")
+    if not HEAD_WEIGHTS_PT_PATH:
+        raise FileNotFoundError("HEAD_WEIGHTS_PT_PATH must be set to a valid head file or directory.")
     if not (DINO_WEIGHTS_PT_PATH and os.path.isfile(DINO_WEIGHTS_PT_PATH)):
         raise FileNotFoundError("DINO_WEIGHTS_PT_PATH must be set to a valid backbone .pt file.")
 
@@ -256,21 +337,9 @@ def main():
 
     feature_extractor = DinoV3FeatureExtractor(backbone)
 
-    head = build_head_layer(
-        embedding_dim=int(cfg["model"]["embedding_dim"]),
-        num_outputs=3,
-        head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-        head_activation=str(cfg["model"]["head"].get("activation", "relu")),
-        dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
-        use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
-    )
-    model = OfflineRegressor(feature_extractor=feature_extractor, head=head)
-    head_state, _ = load_head_state(HEAD_WEIGHTS_PT_PATH)
-    model.head.load_state_dict(head_state, strict=True)
-
-    # Run prediction
-    image_to_base_preds = predict_for_images(
-        model=model,
+    # 1) Extract DINOv3 features ONCE for all images
+    rels_in_order, features_cpu = extract_features_for_images(
+        feature_extractor=feature_extractor,
         dataset_root=dataset_root,
         image_paths=unique_image_paths,
         image_size=image_size,
@@ -279,6 +348,36 @@ def main():
         batch_size=batch_size,
         num_workers=num_workers,
     )
+
+    # 2) Discover heads (single or per-fold) and ensemble predictions by averaging
+    head_weight_paths = discover_head_weight_paths(HEAD_WEIGHTS_PT_PATH)
+
+    preds_sum = torch.zeros((features_cpu.shape[0], 3), dtype=torch.float32)
+    num_heads = 0
+    for head_pt in head_weight_paths:
+        head_module = build_head_layer(
+            embedding_dim=int(cfg["model"]["embedding_dim"]),
+            num_outputs=3,
+            head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
+            head_activation=str(cfg["model"]["head"].get("activation", "relu")),
+            dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
+            use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
+        )
+        state, _ = load_head_state(head_pt)
+        head_module.load_state_dict(state, strict=True)
+        preds = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
+        preds_sum += preds
+        num_heads += 1
+
+    if num_heads == 0:
+        raise RuntimeError("No valid head weights found for inference.")
+    avg_preds = (preds_sum / float(num_heads)).tolist()
+
+    # Build mapping from image path to base predictions
+    image_to_base_preds: Dict[str, Tuple[float, float, float]] = {}
+    for rel_path, vec in zip(rels_in_order, avg_preds):
+        dc, dd, dg = float(vec[0]), float(vec[1]), float(vec[2])
+        image_to_base_preds[rel_path] = (dc, dd, dg)
 
     # Build submission
     rows = []

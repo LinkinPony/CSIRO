@@ -1,0 +1,21 @@
+sanity:
+  # Path to the main training config (used for data/model settings & log dirs)
+  train_config: configs/train.yaml
+
+  # Repository root containing `configs/` and `src/`
+  project_dir: .
+
+  # Where packaged heads (by package_artifacts.py) are exported
+  weights_dir: weights
+
+  # Output directory for sanity-check reports and CSVs
+  out_dir: outputs/sanity
+
+  # Local dinov3 source folder (must contain `dinov3/*`)
+  dinov3_source: third_party/dinov3/dinov3
+
+  # DINOv3 backbone weights (.pt). If empty or missing, falls back to
+  # `model.weights_path` in the training config.
+  dino_weights_path: dinov3_weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pt
+
+
