@@ -44,6 +44,10 @@ scheduler:
   name: cosine
   warmup_epochs: 1
 
+kfold:
+  enabled: true
+  k: 5
+
 trainer:
   max_epochs: 35
   accelerator: auto

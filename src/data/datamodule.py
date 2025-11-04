@@ -86,6 +86,8 @@ class PastureDataModule(LightningDataModule):
         train_scale: Tuple[float, float] = (0.8, 1.0),
         hflip_prob: float = 0.5,
         shuffle: bool = True,
+        predefined_train_df: Optional[pd.DataFrame] = None,
+        predefined_val_df: Optional[pd.DataFrame] = None,
     ) -> None:
         super().__init__()
         self.data_root = data_root
@@ -102,6 +104,8 @@ class PastureDataModule(LightningDataModule):
 
         self.train_df: Optional[pd.DataFrame] = None
         self.val_df: Optional[pd.DataFrame] = None
+        self._predefined_train_df: Optional[pd.DataFrame] = predefined_train_df
+        self._predefined_val_df: Optional[pd.DataFrame] = predefined_val_df
 
     def _read_and_pivot(self) -> pd.DataFrame:
         csv_path = os.path.join(self.data_root, self.train_csv)
@@ -126,6 +130,12 @@ class PastureDataModule(LightningDataModule):
         return merged
 
     def setup(self, stage: Optional[str] = None) -> None:
+        # If predefined splits are provided, use them and skip random splitting
+        if self._predefined_train_df is not None and self._predefined_val_df is not None:
+            self.train_df = self._predefined_train_df.reset_index(drop=True)
+            self.val_df = self._predefined_val_df.reset_index(drop=True)
+            return
+
         merged = self._read_and_pivot()
         rng = np.random.default_rng(seed=42)
         indices = np.arange(len(merged))
@@ -135,6 +145,9 @@ class PastureDataModule(LightningDataModule):
         train_idx = indices[n_val:]
         self.train_df = merged.iloc[train_idx].reset_index(drop=True)
         self.val_df = merged.iloc[val_idx].reset_index(drop=True)
+
+    def build_full_dataframe(self) -> pd.DataFrame:
+        return self._read_and_pivot()
 
     def train_dataloader(self) -> DataLoader:
         assert self.train_df is not None

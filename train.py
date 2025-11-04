@@ -7,12 +7,13 @@ from loguru import logger
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 import torch
 
 from src.data.datamodule import PastureDataModule
 from src.models.regressor import BiomassRegressor
 from src.callbacks.head_checkpoint import HeadCheckpoint
+from src.training.kfold_runner import run_kfold
+from src.training.logging_utils import init_logging, create_lightning_loggers, plot_epoch_metrics
 
 
 def parse_args():
@@ -43,46 +44,10 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    if cfg["logging"].get("use_loguru", True):
-        logger.add(log_dir / "train.log", rotation="10 MB", retention="7 days")
-        logger.info("Loaded config from {}", args.config)
+    init_logging(log_dir, use_loguru=cfg["logging"].get("use_loguru", True))
+    logger.info("Loaded config from {}", args.config)
 
     pl.seed_everything(cfg.get("seed", 42), workers=True)
-
-    dm = PastureDataModule(
-        data_root=cfg["data"]["root"],
-        train_csv=cfg["data"]["train_csv"],
-        image_size=int(cfg["data"]["image_size"]),
-        batch_size=int(cfg["data"]["batch_size"]),
-        num_workers=int(cfg["data"]["num_workers"]),
-        val_split=float(cfg["data"]["val_split"]),
-        target_order=list(cfg["data"]["target_order"]),
-        mean=list(cfg["data"]["normalization"]["mean"]),
-        std=list(cfg["data"]["normalization"]["std"]),
-        train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
-        hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
-        shuffle=bool(cfg["data"].get("shuffle", True)),
-    )
-
-    model = BiomassRegressor(
-        backbone_name=str(cfg["model"]["backbone"]),
-        embedding_dim=int(cfg["model"]["embedding_dim"]),
-        num_outputs=3,
-        dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
-        head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-        head_activation=str(cfg["model"]["head"].get("activation", "relu")),
-        use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
-        pretrained=bool(cfg["model"].get("pretrained", True)),
-        weights_url=cfg["model"].get("weights_url", None),
-        weights_path=cfg["model"].get("weights_path", None),
-        freeze_backbone=bool(cfg["model"].get("freeze_backbone", True)),
-        learning_rate=float(cfg["optimizer"]["lr"]),
-        weight_decay=float(cfg["optimizer"]["weight_decay"]),
-        scheduler_name=str(cfg.get("scheduler", {}).get("name", "")).lower() or None,
-        max_epochs=int(cfg["trainer"]["max_epochs"]),
-    )
-
-    # TorchScript export callback removed per user request
 
     # Ensure DINOv3 weights are copied to dinov3_weights for consistent, frozen backbone reuse
     try:
@@ -98,138 +63,94 @@ def main():
     except Exception as e:
         logger.warning(f"Copying DINOv3 weights failed: {e}")
 
-    checkpoint_cb = ModelCheckpoint(
-        dirpath=str(ckpt_dir),
-        filename="best",
-        auto_insert_metric_name=False,
-        monitor="val_loss",
-        mode="min",
-        save_top_k=1,
-        save_last=True,
-    )
+    # Optional k-fold configuration
+    kfold_cfg = cfg.get("kfold", {})
+    use_kfold = bool(kfold_cfg.get("enabled", False))
 
-    # Save regression head weights every epoch (lightweight since backbone is frozen and excluded)
-    head_ckpt_dir = ckpt_dir / "head"
-    callbacks = [
-        checkpoint_cb,
-        LearningRateMonitor(logging_interval="epoch"),
-        HeadCheckpoint(output_dir=str(head_ckpt_dir)),
-    ]
-
-    csv_logger = CSVLogger(save_dir=str(log_dir), name="lightning", version=None)
-    tb_logger = TensorBoardLogger(save_dir=str(log_dir), name="tensorboard", version=None)
-
-    trainer = pl.Trainer(
-        max_epochs=int(cfg["trainer"]["max_epochs"]),
-        accelerator=str(cfg["trainer"]["accelerator"]),
-        devices=cfg["trainer"]["devices"],
-        precision=cfg["trainer"]["precision"],
-        callbacks=callbacks,
-        logger=[csv_logger, tb_logger],
-        log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
-    )
-
-    # Auto-resume: prefer last.ckpt if present; otherwise, fall back to config resume_from
-    last_ckpt = ckpt_dir / "last.ckpt"
-    resume_from_cfg = cfg.get("trainer", {}).get("resume_from", None)
-    if last_ckpt.is_file():
-        resume_path = str(last_ckpt)
-        logger.info(f"Auto-resuming from last checkpoint: {resume_path}")
-    elif resume_from_cfg is not None and resume_from_cfg != "null" and str(resume_from_cfg).strip() != "":
-        resume_path = str(resume_from_cfg)
-        logger.info(f"Resuming from checkpoint (config): {resume_path}")
+    if use_kfold:
+        run_kfold(cfg, log_dir, ckpt_dir)
     else:
-        resume_path = None
+        # Regular single-split training
+        dm = PastureDataModule(
+            data_root=cfg["data"]["root"],
+            train_csv=cfg["data"]["train_csv"],
+            image_size=int(cfg["data"]["image_size"]),
+            batch_size=int(cfg["data"]["batch_size"]),
+            num_workers=int(cfg["data"]["num_workers"]),
+            val_split=float(cfg["data"]["val_split"]),
+            target_order=list(cfg["data"]["target_order"]),
+            mean=list(cfg["data"]["normalization"]["mean"]),
+            std=list(cfg["data"]["normalization"]["std"]),
+            train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
+            hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
+            shuffle=bool(cfg["data"].get("shuffle", True)),
+        )
 
-    trainer.fit(model=model, datamodule=dm, ckpt_path=resume_path)
+        model = BiomassRegressor(
+            backbone_name=str(cfg["model"]["backbone"]),
+            embedding_dim=int(cfg["model"]["embedding_dim"]),
+            num_outputs=3,
+            dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
+            head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
+            head_activation=str(cfg["model"]["head"].get("activation", "relu")),
+            use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
+            pretrained=bool(cfg["model"].get("pretrained", True)),
+            weights_url=cfg["model"].get("weights_url", None),
+            weights_path=cfg["model"].get("weights_path", None),
+            freeze_backbone=bool(cfg["model"].get("freeze_backbone", True)),
+            learning_rate=float(cfg["optimizer"]["lr"]),
+            weight_decay=float(cfg["optimizer"]["weight_decay"]),
+            scheduler_name=str(cfg.get("scheduler", {}).get("name", "")).lower() or None,
+            max_epochs=int(cfg["trainer"]["max_epochs"]),
+        )
 
-    # Generate metric plots into outputs
-    try:
-        import pandas as pd
-        import matplotlib.pyplot as plt
+        checkpoint_cb = ModelCheckpoint(
+            dirpath=str(ckpt_dir),
+            filename="best",
+            auto_insert_metric_name=False,
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1,
+            save_last=True,
+        )
 
+        head_ckpt_dir = ckpt_dir / "head"
+        callbacks = [
+            checkpoint_cb,
+            LearningRateMonitor(logging_interval="epoch"),
+            HeadCheckpoint(output_dir=str(head_ckpt_dir)),
+        ]
+
+        csv_logger, tb_logger = create_lightning_loggers(log_dir)
+
+        trainer = pl.Trainer(
+            max_epochs=int(cfg["trainer"]["max_epochs"]),
+            accelerator=str(cfg["trainer"]["accelerator"]),
+            devices=cfg["trainer"]["devices"],
+            precision=cfg["trainer"]["precision"],
+            callbacks=callbacks,
+            logger=[csv_logger, tb_logger],
+            log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
+        )
+
+        last_ckpt = ckpt_dir / "last.ckpt"
+        resume_from_cfg = cfg.get("trainer", {}).get("resume_from", None)
+        if last_ckpt.is_file():
+            resume_path = str(last_ckpt)
+            logger.info(f"Auto-resuming from last checkpoint: {resume_path}")
+        elif resume_from_cfg is not None and resume_from_cfg != "null" and str(resume_from_cfg).strip() != "":
+            resume_path = str(resume_from_cfg)
+            logger.info(f"Resuming from checkpoint (config): {resume_path}")
+        else:
+            resume_path = None
+
+        trainer.fit(model=model, datamodule=dm, ckpt_path=resume_path)
+
+    # Generate metric plots for non-kfold run
+    if not use_kfold:
         metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
-        if metrics_csv.is_file():
-            df = pd.read_csv(metrics_csv)
-            # take last value per epoch
-            if "epoch" not in df.columns:
-                raise ValueError("metrics.csv missing epoch column")
-            gb = df.groupby("epoch").tail(1).reset_index(drop=True)
-
-            def get_col(candidates):
-                for c in candidates:
-                    if c in gb.columns:
-                        return c
-                return None
-
-            cols = {
-                "train_loss": get_col(["train_loss_epoch", "train_loss"]),
-                "val_loss": get_col(["val_loss"]),
-                "train_mae": get_col(["train_mae_epoch", "train_mae"]),
-                "val_mae": get_col(["val_mae"]),
-                "train_mse": get_col(["train_mse_epoch", "train_mse", "train_loss_epoch", "train_loss"]),
-                "val_mse": get_col(["val_mse", "val_loss"]),
-                "val_r2": get_col(["val_r2"]),
-            }
-
-            plots_dir = Path(log_dir) / "plots"
-            plots_dir.mkdir(parents=True, exist_ok=True)
-
-            # loss
-            plt.figure()
-            if cols["train_loss"]:
-                plt.plot(gb["epoch"], gb[cols["train_loss"]], label="train")
-            if cols["val_loss"]:
-                plt.plot(gb["epoch"], gb[cols["val_loss"]], label="val")
-            plt.xlabel("epoch")
-            plt.ylabel("loss")
-            plt.legend()
-            plt.title("Loss")
-            plt.tight_layout()
-            plt.savefig(plots_dir / "loss.png")
-            plt.close()
-
-            # MAE
-            plt.figure()
-            if cols["train_mae"]:
-                plt.plot(gb["epoch"], gb[cols["train_mae"]], label="train")
-            if cols["val_mae"]:
-                plt.plot(gb["epoch"], gb[cols["val_mae"]], label="val")
-            plt.xlabel("epoch")
-            plt.ylabel("MAE")
-            plt.legend()
-            plt.title("MAE")
-            plt.tight_layout()
-            plt.savefig(plots_dir / "mae.png")
-            plt.close()
-
-            # MSE
-            plt.figure()
-            if cols["train_mse"]:
-                plt.plot(gb["epoch"], gb[cols["train_mse"]], label="train")
-            if cols["val_mse"]:
-                plt.plot(gb["epoch"], gb[cols["val_mse"]], label="val")
-            plt.xlabel("epoch")
-            plt.ylabel("MSE")
-            plt.legend()
-            plt.title("MSE")
-            plt.tight_layout()
-            plt.savefig(plots_dir / "mse.png")
-            plt.close()
-
-            # R^2 (val only)
-            if cols["val_r2"]:
-                plt.figure()
-                plt.plot(gb["epoch"], gb[cols["val_r2"]], label="val_r2")
-                plt.xlabel("epoch")
-                plt.ylabel("R^2")
-                plt.legend()
-                plt.title("R^2")
-                plt.tight_layout()
-                plt.savefig(plots_dir / "r2.png")
-                plt.close()
-    except Exception as e:
-        logger.warning(f"Metric plotting failed: {e}")
+        plots_dir = Path(log_dir) / "plots"
+        plot_epoch_metrics(metrics_csv, plots_dir)
 
 
 if __name__ == "__main__":
