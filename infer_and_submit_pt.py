@@ -1,43 +1,25 @@
 # ===== Required user variables =====
-WEIGHTS_PT_PATH = "weights/best.pt"  # exported by export_ckpt_to_pt.py
+# Backward-compat: WEIGHTS_PT_PATH is ignored when HEAD_WEIGHTS_PT_PATH is provided.
+HEAD_WEIGHTS_PT_PATH = "weights/head/infer_head.pt"  # regression head-only weights (.pt)
+DINO_WEIGHTS_PT_PATH = "dinov3_weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pt"  # frozen DINOv3 weights (.pt)
 INPUT_PATH = "data"  # dir containing test.csv & images, or a direct test.csv path
 OUTPUT_SUBMISSION_PATH = "submission.csv"
 DINOV3_PATH = "third_party/dinov3/dinov3"  # path to dinov3 source folder (contains dinov3/*)
+
+# New: specify the project directory that contains both `configs/` and `src/` folders.
+# Example: PROJECT_DIR = "/media/dl/dataset/Git/CSIRO"
+PROJECT_DIR = "."
 # ===================================
 # ==========================================================
-# STRICT OFFLINE INFERENCE SCRIPT (READ ME CAREFULLY)
-# - Only one weight file is allowed: WEIGHTS_PT_PATH, exported by export_ckpt_to_pt.py
-# - Strictly offline: NO hub/network downloads allowed anywhere
-# - Only code allowed to be imported outside this file is the dinov3 library
-#   from DINOV3_PATH. Do NOT import any other local project code.
-# - This script reconstructs the MLP head used during training from the
-#   configuration below. If you changed training head settings, update here too.
+# INFERENCE SCRIPT (UPDATED REQUIREMENTS)
+# - Allowed to import this project's source code from `src/` and configuration from `configs/`.
+# - Ensures single source of truth: model head settings, image transforms, etc. are read from YAML config.
+# - A valid PROJECT_DIR must be provided, and it must contain both `configs/` and `src/`.
+# - Inference requires two weights when using the new format:
+#   1) DINOv3 backbone weights: DINO_WEIGHTS_PT_PATH (frozen, shared across runs)
+#   2) Regression head weights: HEAD_WEIGHTS_PT_PATH (packaged as weights/head/infer_head.pt)
+# - Legacy support: if HEAD_WEIGHTS_PT_PATH is empty, fall back to WEIGHTS_PT_PATH.
 # ==========================================================
-
-
-
-# ===== Model/data configuration (copy of required train.yaml parts) =====
-# Backbone and embedding
-BACKBONE_NAME = "dinov3_vitl16"
-EMBEDDING_DIM = 1024
-NUM_OUTPUTS = 3  # predicts [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
-
-# MLP head settings (must match training)
-HEAD_HIDDEN_DIMS = [1024, 512, 256]
-HEAD_ACTIVATION = "relu"  # one of: relu, gelu, silu
-HEAD_DROPOUT = 0.2
-USE_OUTPUT_SOFTPLUS = True  # keep predictions non-negative
-
-# Preprocessing
-IMAGE_SIZE = 640
-MEAN = [0.485, 0.456, 0.406]
-STD = [0.229, 0.224, 0.225]
-TARGET_BASES = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"]
-
-# Inference loader
-BATCH_SIZE = 32
-NUM_WORKERS = 4
-# ==============================================
 
 
 import os
@@ -53,18 +35,35 @@ import pandas as pd
 from torch import nn
 
 
-# ===== Add local dinov3 to import path (strictly offline) =====
+import yaml
+
+# ===== Add local dinov3 to import path (optional, for offline use) =====
 _DINOV3_DIR = os.path.abspath(DINOV3_PATH) if DINOV3_PATH else ""
 if _DINOV3_DIR and os.path.isdir(_DINOV3_DIR) and _DINOV3_DIR not in sys.path:
     sys.path.insert(0, _DINOV3_DIR)
 
 try:
-    from dinov3.hub.backbones import dinov3_vitl16 as _dinov3_vitl16
+    from dinov3.hub.backbones import dinov3_vitl16 as _dinov3_vitl16  # noqa: F401
 except Exception:
-    _dinov3_vitl16 = None
+    _dinov3_vitl16 = None  # noqa: F401
+
+# ===== Validate project directory and import project modules =====
+_PROJECT_DIR_ABS = os.path.abspath(PROJECT_DIR) if PROJECT_DIR else ""
+_CONFIGS_DIR = os.path.join(_PROJECT_DIR_ABS, "configs")
+_SRC_DIR = os.path.join(_PROJECT_DIR_ABS, "src")
+if not (_PROJECT_DIR_ABS and os.path.isdir(_PROJECT_DIR_ABS)):
+    raise RuntimeError("PROJECT_DIR must point to the repository root containing `configs/` and `src/`.")
+if not os.path.isdir(_CONFIGS_DIR):
+    raise RuntimeError(f"configs/ not found under PROJECT_DIR: {_CONFIGS_DIR}")
+if not os.path.isdir(_SRC_DIR):
+    raise RuntimeError(f"src/ not found under PROJECT_DIR: {_SRC_DIR}")
+if _PROJECT_DIR_ABS not in sys.path:
+    sys.path.insert(0, _PROJECT_DIR_ABS)
+
+from src.models.head_builder import build_head_layer  # noqa: E402
 
 
-# ===== Offline-only weights loader (TorchScript supported, state_dict also supported) =====
+# ===== Weights loader (TorchScript supported, state_dict also supported) =====
 def load_model_or_state(pt_path: str) -> Tuple[Optional[nn.Module], Optional[dict], dict]:
     if not os.path.isfile(pt_path):
         raise FileNotFoundError(f"Weights not found: {pt_path}")
@@ -117,12 +116,12 @@ class TestImageDataset(Dataset):
         return image, rel_path
 
 
-def build_transforms() -> T.Compose:
+def build_transforms(image_size: int, mean: List[float], std: List[float]) -> T.Compose:
     return T.Compose([
-        T.Resize(IMAGE_SIZE, interpolation=T.InterpolationMode.BICUBIC),
-        T.CenterCrop(IMAGE_SIZE),
+        T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(image_size),
         T.ToTensor(),
-        T.Normalize(mean=MEAN, std=STD),
+        T.Normalize(mean=mean, std=std),
     ])
 
 
@@ -132,6 +131,17 @@ def load_state_and_meta(pt_path: str):
     if model is not None:
         return model, meta
     return state_dict, meta
+
+
+def load_head_state(pt_path: str) -> Tuple[dict, dict]:
+    if not os.path.isfile(pt_path):
+        raise FileNotFoundError(f"Head weights not found: {pt_path}")
+    obj = torch.load(pt_path, map_location="cpu")
+    if isinstance(obj, dict) and "state_dict" in obj:
+        return obj["state_dict"], obj.get("meta", {})
+    if isinstance(obj, dict):
+        return obj, {}
+    raise RuntimeError("Unsupported head weights file format. Expect a dict with 'state_dict'.")
 
 
 class DinoV3FeatureExtractor(nn.Module):
@@ -144,7 +154,6 @@ class DinoV3FeatureExtractor(nn.Module):
 
     @torch.inference_mode()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        # Ensure dtype alignment (e.g., avoid Half vs Float mismatch)
         try:
             backbone_dtype = next(self.backbone.parameters()).dtype
         except StopIteration:
@@ -155,101 +164,42 @@ class DinoV3FeatureExtractor(nn.Module):
         return feats["x_norm_clstoken"]
 
 
-def build_feature_extractor(backbone_name: str) -> nn.Module:
-    if backbone_name != "dinov3_vitl16":
-        raise ValueError(f"Unsupported backbone: {backbone_name}")
-    if _dinov3_vitl16 is None:
-        raise ImportError(
-            "dinov3 is not available locally. Ensure third_party/dinov3 is present and importable."
-        )
-    backbone = _dinov3_vitl16(pretrained=False)  # strictly offline, no downloads
-    return DinoV3FeatureExtractor(backbone)
-
-
-class BiomassRegressor(nn.Module):
-    def __init__(
-        self,
-        backbone_name: str,
-        embedding_dim: int,
-        num_outputs: int = 3,
-        head_hidden_dims: Optional[List[int]] = None,
-        head_activation: str = "relu",
-        head_dropout: float = 0.0,
-        use_output_softplus: bool = True,
-        freeze_backbone: bool = True,
-    ) -> None:
+class OfflineRegressor(nn.Module):
+    def __init__(self, feature_extractor: nn.Module, head: nn.Module) -> None:
         super().__init__()
-        feature_extractor = build_feature_extractor(backbone_name)
-        if not freeze_backbone:
-            for p in feature_extractor.backbone.parameters():
-                p.requires_grad = True
-            feature_extractor.backbone.train()
         self.feature_extractor = feature_extractor
-
-        def build_activation(name: str) -> nn.Module:
-            name = (name or "").lower()
-            if name == "relu":
-                return nn.ReLU(inplace=True)
-            if name == "gelu":
-                return nn.GELU()
-            if name == "silu" or name == "swish":
-                return nn.SiLU(inplace=True)
-            return nn.ReLU(inplace=True)
-
-        hidden_dims: List[int] = list(head_hidden_dims or [])
-        layers: List[nn.Module] = []
-        in_dim = embedding_dim
-        act = build_activation(head_activation)
-
-        if head_dropout and head_dropout > 0:
-            layers.append(nn.Dropout(head_dropout))
-
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(act.__class__())
-            if head_dropout and head_dropout > 0:
-                layers.append(nn.Dropout(head_dropout))
-            in_dim = hidden_dim
-
-        layers.append(nn.Linear(in_dim, num_outputs))
-        if use_output_softplus:
-            layers.append(nn.Softplus())
-        self.head = nn.Sequential(*layers)
+        self.head = head
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         features = self.feature_extractor(images)
         return self.head(features)
 
 
-def build_model_from_meta(meta: Dict) -> BiomassRegressor:
-    # Use meta for backbone/embedding/outputs if present, otherwise fallback to config
-    backbone_name = str(meta.get("backbone", BACKBONE_NAME))
-    embedding_dim = int(meta.get("embedding_dim", EMBEDDING_DIM))
-    num_outputs = int(meta.get("num_outputs", NUM_OUTPUTS))
-    model = BiomassRegressor(
-        backbone_name=backbone_name,
-        embedding_dim=embedding_dim,
-        num_outputs=num_outputs,
-        head_hidden_dims=HEAD_HIDDEN_DIMS,
-        head_activation=HEAD_ACTIVATION,
-        head_dropout=HEAD_DROPOUT,
-        use_output_softplus=USE_OUTPUT_SOFTPLUS,
-        freeze_backbone=True,
-    )
-    return model
+def load_config(project_dir: str) -> Dict:
+    config_path = os.path.join(project_dir, "configs", "train.yaml")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Config YAML not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def predict_for_images(model: nn.Module, dataset_root: str, image_paths: List[str], batch_size: int = BATCH_SIZE) -> Dict[str, Tuple[float, float, float]]:
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU-only inference is enforced. CUDA is not available.")
-    device = "cuda"
+def predict_for_images(
+    model: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: int,
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+) -> Dict[str, Tuple[float, float, float]]:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    tf = build_transforms()
+    tf = build_transforms(image_size=image_size, mean=mean, std=std)
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
 
     model.eval().to(device)
-    torch.set_float32_matmul_precision("high")
 
     preds: Dict[str, Tuple[float, float, float]] = {}
     with torch.inference_mode():
@@ -264,29 +214,71 @@ def predict_for_images(model: nn.Module, dataset_root: str, image_paths: List[st
 
 
 def main():
+    # Load configuration from project
+    cfg = load_config(_PROJECT_DIR_ABS)
+
+    # Data settings from config (single source of truth)
+    image_size = int(cfg["data"]["image_size"])  # e.g., 640
+    mean = list(cfg["data"]["normalization"]["mean"])  # e.g., [0.485, 0.456, 0.406]
+    std = list(cfg["data"]["normalization"]["std"])    # e.g., [0.229, 0.224, 0.225]
+    target_bases = list(cfg["data"]["target_order"])    # e.g., [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
+    batch_size = int(cfg["data"].get("batch_size", 32))
+    num_workers = int(cfg["data"].get("num_workers", 4))
+
+    # Read test.csv
     dataset_root, test_csv = resolve_paths(INPUT_PATH)
     df = pd.read_csv(test_csv)
     if not {"sample_id", "image_path", "target_name"}.issubset(df.columns):
         raise ValueError("test.csv must contain columns: sample_id, image_path, target_name")
-
     unique_image_paths = df["image_path"].astype(str).unique().tolist()
 
-    model_loaded, state_dict = None, None
-    model_or_state, meta = load_state_and_meta(WEIGHTS_PT_PATH)
-    if isinstance(model_or_state, nn.Module):
-        # TorchScript path
-        model = model_or_state
-    else:
-        # state_dict path from export_ckpt_to_pt.py (offline, no downloads)
-        state_dict = model_or_state
-        model = build_model_from_meta(meta)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"[WARN] Missing keys: {missing}")
-        if unexpected:
-            print(f"[WARN] Unexpected keys: {unexpected}")
+    # Build model and load weights (new preferred path uses separate backbone + head)
+    # Strictly offline path: require both backbone and head weights
+    if not (HEAD_WEIGHTS_PT_PATH and os.path.isfile(HEAD_WEIGHTS_PT_PATH)):
+        raise FileNotFoundError("HEAD_WEIGHTS_PT_PATH must be set to a valid head .pt file.")
+    if not (DINO_WEIGHTS_PT_PATH and os.path.isfile(DINO_WEIGHTS_PT_PATH)):
+        raise FileNotFoundError("DINO_WEIGHTS_PT_PATH must be set to a valid backbone .pt file.")
 
-    image_to_base_preds = predict_for_images(model, dataset_root, unique_image_paths, batch_size=32)
+    if _dinov3_vitl16 is None:
+        raise ImportError(
+            "dinov3 is not available locally. Ensure DINOV3_PATH points to third_party/dinov3/dinov3."
+        )
+
+    # Build backbone architecture locally (no torch.hub), then load state_dict
+    backbone = _dinov3_vitl16(pretrained=False)
+    dino_state = torch.load(DINO_WEIGHTS_PT_PATH, map_location="cpu")
+    if isinstance(dino_state, dict) and "state_dict" in dino_state:
+        dino_state = dino_state["state_dict"]
+    try:
+        backbone.load_state_dict(dino_state, strict=True)
+    except Exception:
+        backbone.load_state_dict(dino_state, strict=False)
+
+    feature_extractor = DinoV3FeatureExtractor(backbone)
+
+    head = build_head_layer(
+        embedding_dim=int(cfg["model"]["embedding_dim"]),
+        num_outputs=3,
+        head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
+        head_activation=str(cfg["model"]["head"].get("activation", "relu")),
+        dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
+        use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
+    )
+    model = OfflineRegressor(feature_extractor=feature_extractor, head=head)
+    head_state, _ = load_head_state(HEAD_WEIGHTS_PT_PATH)
+    model.head.load_state_dict(head_state, strict=True)
+
+    # Run prediction
+    image_to_base_preds = predict_for_images(
+        model=model,
+        dataset_root=dataset_root,
+        image_paths=unique_image_paths,
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
 
     # Build submission
     rows = []
@@ -295,11 +287,11 @@ def main():
         rel_path = str(r["image_path"])  # e.g., test/IDxxxx.jpg
         target_name = str(r["target_name"])  # one of 5
         dc, dd, dg = image_to_base_preds.get(rel_path, (0.0, 0.0, 0.0))
-        if target_name == "Dry_Clover_g":
+        if target_name == target_bases[0]:  # Dry_Clover_g
             value = dc
-        elif target_name == "Dry_Dead_g":
+        elif target_name == target_bases[1]:  # Dry_Dead_g
             value = dd
-        elif target_name == "Dry_Green_g":
+        elif target_name == target_bases[2]:  # Dry_Green_g
             value = dg
         elif target_name == "GDM_g":
             value = dc + dg

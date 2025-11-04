@@ -12,6 +12,7 @@ import torch
 
 from src.data.datamodule import PastureDataModule
 from src.models.regressor import BiomassRegressor
+from src.callbacks.head_checkpoint import HeadCheckpoint
 
 
 def parse_args():
@@ -83,6 +84,20 @@ def main():
 
     # TorchScript export callback removed per user request
 
+    # Ensure DINOv3 weights are copied to dinov3_weights for consistent, frozen backbone reuse
+    try:
+        import shutil
+        dinov3_src = cfg["model"].get("weights_path")
+        if dinov3_src and str(dinov3_src).strip() and os.path.isfile(str(dinov3_src)):
+            repo_root = Path(__file__).parent
+            dinov3_dir = repo_root / "dinov3_weights"
+            dinov3_dir.mkdir(parents=True, exist_ok=True)
+            dinov3_dst = dinov3_dir / "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pt"
+            if not dinov3_dst.is_file() or os.path.getsize(dinov3_dst) == 0:
+                shutil.copyfile(str(dinov3_src), str(dinov3_dst))
+    except Exception as e:
+        logger.warning(f"Copying DINOv3 weights failed: {e}")
+
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
         filename="best",
@@ -93,9 +108,12 @@ def main():
         save_last=True,
     )
 
+    # Save regression head weights every epoch (lightweight since backbone is frozen and excluded)
+    head_ckpt_dir = ckpt_dir / "head"
     callbacks = [
         checkpoint_cb,
         LearningRateMonitor(logging_interval="epoch"),
+        HeadCheckpoint(output_dir=str(head_ckpt_dir)),
     ]
 
     csv_logger = CSVLogger(save_dir=str(log_dir), name="lightning", version=None)
@@ -111,10 +129,15 @@ def main():
         log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
     )
 
-    resume_path = cfg.get("trainer", {}).get("resume_from", None)
-    if resume_path is not None and resume_path != "null" and str(resume_path).strip() != "":
-        resume_path = str(resume_path)
-        logger.info(f"Resuming from checkpoint: {resume_path}")
+    # Auto-resume: prefer last.ckpt if present; otherwise, fall back to config resume_from
+    last_ckpt = ckpt_dir / "last.ckpt"
+    resume_from_cfg = cfg.get("trainer", {}).get("resume_from", None)
+    if last_ckpt.is_file():
+        resume_path = str(last_ckpt)
+        logger.info(f"Auto-resuming from last checkpoint: {resume_path}")
+    elif resume_from_cfg is not None and resume_from_cfg != "null" and str(resume_from_cfg).strip() != "":
+        resume_path = str(resume_from_cfg)
+        logger.info(f"Resuming from checkpoint (config): {resume_path}")
     else:
         resume_path = None
 

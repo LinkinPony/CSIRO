@@ -9,6 +9,7 @@ from lightning.pytorch import LightningModule
 from loguru import logger
 
 from .backbone import build_feature_extractor
+from .head_builder import build_head_layer
 
 
 class BiomassRegressor(LightningModule):
@@ -45,36 +46,14 @@ class BiomassRegressor(LightningModule):
             feature_extractor.backbone.train()
         self.feature_extractor = feature_extractor
 
-        def build_activation(name: str) -> nn.Module:
-            name = (name or "").lower()
-            if name == "relu":
-                return nn.ReLU(inplace=True)
-            if name == "gelu":
-                return nn.GELU()
-            if name == "silu" or name == "swish":
-                return nn.SiLU(inplace=True)
-            # default
-            return nn.ReLU(inplace=True)
-
-        hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
-        layers: List[nn.Module] = []
-        in_dim = embedding_dim
-        act = build_activation(head_activation)
-
-        if dropout and dropout > 0:
-            layers.append(nn.Dropout(dropout))
-
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(act.__class__())
-            if dropout and dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            in_dim = hidden_dim
-
-        layers.append(nn.Linear(in_dim, num_outputs))
-        if use_output_softplus:
-            layers.append(nn.Softplus())
-        self.head = nn.Sequential(*layers)
+        self.head = build_head_layer(
+            embedding_dim=embedding_dim,
+            num_outputs=num_outputs,
+            head_hidden_dims=head_hidden_dims,
+            head_activation=head_activation,
+            dropout=dropout,
+            use_output_softplus=use_output_softplus,
+        )
 
         # buffers for epoch-wise metrics on validation set
         self._val_preds: list[Tensor] = []
