@@ -68,13 +68,20 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
     full_df = base_dm.build_full_dataframe()
 
     num_folds = int(cfg.get("kfold", {}).get("k", 5))
+    even_split = bool(cfg.get("kfold", {}).get("even_split", False))
 
     # Prepare fold indices
     n_samples = len(full_df)
     indices = np.arange(n_samples)
     rng = np.random.default_rng(seed=int(cfg.get("seed", 42)))
-    rng.shuffle(indices)
-    folds = np.array_split(indices, num_folds)
+    # When even_split is disabled, we use classic K-fold style where each fold
+    # uses one contiguous chunk as validation and the remainder as training.
+    # When enabled, for each fold we generate a fresh random 50/50 split.
+    if not even_split:
+        rng.shuffle(indices)
+        folds = np.array_split(indices, num_folds)
+    else:
+        folds = None  # not used under even_split
 
     # Export fold splits
     splits_root = log_dir / "folds"
@@ -95,8 +102,14 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
         logger.warning(f"Reading test.csv for split export failed: {e}")
 
     for fold_idx in range(num_folds):
-        val_idx = folds[fold_idx]
-        train_idx = np.concatenate([folds[i] for i in range(num_folds) if i != fold_idx])
+        if even_split:
+            perm = rng.permutation(indices)
+            n_train = n_samples // 2
+            train_idx = perm[:n_train]
+            val_idx = perm[n_train:]
+        else:
+            val_idx = folds[fold_idx]
+            train_idx = np.concatenate([folds[i] for i in range(num_folds) if i != fold_idx])
 
         train_df = full_df.iloc[train_idx].reset_index(drop=True)
         val_df = full_df.iloc[val_idx].reset_index(drop=True)

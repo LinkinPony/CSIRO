@@ -4,3 +4,9 @@
 [submodule "third_party/pytorch-lightning"]
 	path = third_party/pytorch-lightning
 	url = git@github.com:Lightning-AI/pytorch-lightning.git
+[submodule "third_party/multi_task_learning_pytorch"]
+	path = third_party/multi_task_learning_pytorch
+	url = git@github.com:SimonVandenhende/Multi-Task-Learning-PyTorch.git
+[submodule "third_party/LibMTL"]
+	path = third_party/LibMTL
+	url = git@github.com:median-research-group/LibMTL.git
