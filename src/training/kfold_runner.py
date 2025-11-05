@@ -7,7 +7,7 @@ from typing import Dict
 import numpy as np
 from loguru import logger
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, StochasticWeightAveraging
 
 from src.data.datamodule import PastureDataModule
 from src.models.regressor import BiomassRegressor
@@ -182,6 +182,20 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
             HeadCheckpoint(output_dir=str(head_ckpt_dir)),
         ]
 
+        # Optional SWA to stabilize small-batch updates
+        swa_cfg = cfg.get("trainer", {}).get("swa", {})
+        if bool(swa_cfg.get("enabled", False)):
+            try:
+                swa_cb = StochasticWeightAveraging(
+                    swa_lrs=float(swa_cfg.get("swa_lrs", cfg["optimizer"]["lr"])),
+                    swa_epoch_start=float(swa_cfg.get("swa_epoch_start", 0.8)),
+                    annealing_epochs=int(swa_cfg.get("annealing_epochs", 5)),
+                    annealing_strategy=str(swa_cfg.get("annealing_strategy", "cos")),
+                )
+                callbacks.append(swa_cb)
+            except Exception as e:
+                logger.warning(f"SWA callback creation failed, continuing without SWA: {e}")
+
         csv_logger, tb_logger = create_lightning_loggers(fold_log_dir)
 
         trainer = pl.Trainer(
@@ -192,6 +206,9 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
             callbacks=callbacks,
             logger=[csv_logger, tb_logger],
             log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
+            accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
+            gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
+            gradient_clip_algorithm=str(cfg["trainer"].get("gradient_clip_algorithm", "norm")),
         )
 
         last_ckpt = fold_ckpt_dir / "last.ckpt"

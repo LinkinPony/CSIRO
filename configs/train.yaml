@@ -1,12 +1,12 @@
 seed: 42
-version: mlp-uw-mtl-lora-vith16plus
+version: mlp-uw-mtl-lora-vith16plus-hard-norm-large-image
 
 data:
   root: data
   train_csv: train.csv
-  image_size: [640, 640]
-  batch_size: 3
-  val_batch_size: 16
+  image_size: [1280, 640]
+  batch_size: 1
+  val_batch_size: 2
   num_workers: 20
   prefetch_factor: 4
   val_split: 0.1
@@ -32,7 +32,7 @@ model:
   embedding_dim: 1280
   head:
     type: mlp
-    hidden_dims: [512]
+    hidden_dims: [1280,640]
     activation: relu
     dropout: 0.2
     use_output_softplus: true
@@ -47,7 +47,7 @@ peft:
   init: true
   last_k_blocks: 0
   layers_pattern: blocks
-  target_modules: [qkv, proj]
+  target_modules: [qkv, proj, w1, w2, w3]
   lora_lr: 0.00005
 
 loss:
@@ -56,7 +56,7 @@ loss:
 optimizer:
   name: adamw
   lr: 0.001
-  weight_decay: 0.0001
+  weight_decay: 0.01
 
 scheduler:
   name: cosine
@@ -74,6 +74,15 @@ trainer:
   precision: 16-mixed
   log_every_n_steps: 1
   resume_from: null
+  accumulate_grad_batches: 8
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  swa:
+    enabled: true
+    swa_lrs: 0.0005
+    swa_epoch_start: 0.8
+    annealing_epochs: 5
+    annealing_strategy: cos
 
 logging:
   log_dir: outputs
