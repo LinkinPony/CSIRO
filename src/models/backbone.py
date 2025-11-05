@@ -81,21 +81,64 @@ def load_dinov3_vitl16(
     return model
 
 
+def load_dinov3_vith16plus(
+    pretrained: bool = True,
+    weights_url: Optional[str] = None,
+    weights_path: Optional[str] = None,
+    check_hash: bool = False,
+) -> nn.Module:
+    # Prefer explicit offline weights if provided
+    if weights_path:
+        model = torch.hub.load(
+            repo_or_dir="facebookresearch/dinov3",
+            model="dinov3_vith16plus",
+            pretrained=False,
+        )
+        state = torch.load(weights_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state, strict=False)
+        return model
+
+    if weights_url:
+        model = torch.hub.load(
+            repo_or_dir="facebookresearch/dinov3",
+            model="dinov3_vith16plus",
+            pretrained=pretrained,
+            weights=weights_url,
+            check_hash=check_hash,
+        )
+        return model
+
+    model = torch.hub.load(
+        repo_or_dir="facebookresearch/dinov3",
+        model="dinov3_vith16plus",
+        pretrained=pretrained,
+    )
+    return model
+
 def build_feature_extractor(
     backbone_name: str,
     pretrained: bool = True,
     weights_url: Optional[str] = None,
     weights_path: Optional[str] = None,
 ) -> nn.Module:
-    if backbone_name != "dinov3_vitl16":
-        raise ValueError(f"Unsupported backbone: {backbone_name}")
     # When weights_path is provided, force pretrained=False to avoid online fetch
     use_pretrained = False if weights_path else pretrained
-    backbone = load_dinov3_vitl16(
-        pretrained=use_pretrained,
-        weights_url=weights_url if not weights_path else None,
-        weights_path=weights_path,
-    )
+    if backbone_name == "dinov3_vitl16":
+        backbone = load_dinov3_vitl16(
+            pretrained=use_pretrained,
+            weights_url=weights_url if not weights_path else None,
+            weights_path=weights_path,
+        )
+    elif backbone_name == "dinov3_vith16plus":
+        backbone = load_dinov3_vith16plus(
+            pretrained=use_pretrained,
+            weights_url=weights_url if not weights_path else None,
+            weights_path=weights_path,
+        )
+    else:
+        raise ValueError(f"Unsupported backbone: {backbone_name}")
     return DinoV3FeatureExtractor(backbone)
 
 

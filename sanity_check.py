@@ -203,19 +203,24 @@ def load_head_state_dict(pt_path: Path) -> Dict[str, torch.Tensor]:
     raise RuntimeError(f"Unsupported head weights file: {pt_path}")
 
 
-def build_feature_extractor_offline(dinov3_source_dir: str, dino_weights_path: str) -> nn.Module:
+def build_feature_extractor_offline(dinov3_source_dir: str, dino_weights_path: str, backbone_name: str = "dinov3_vitl16") -> nn.Module:
     # Use the same offline approach as infer_and_submit_pt.py to avoid torch.hub
     import sys
     if dinov3_source_dir and os.path.isdir(dinov3_source_dir) and dinov3_source_dir not in sys.path:
         sys.path.insert(0, dinov3_source_dir)
     try:
-        from dinov3.hub.backbones import dinov3_vitl16 as _dinov3_vitl16  # type: ignore
+        if backbone_name == "dinov3_vith16plus":
+            from dinov3.hub.backbones import dinov3_vith16plus as _make_backbone  # type: ignore
+        elif backbone_name == "dinov3_vitl16":
+            from dinov3.hub.backbones import dinov3_vitl16 as _make_backbone  # type: ignore
+        else:
+            raise ImportError(f"Unsupported backbone: {backbone_name}")
     except Exception as e:
         raise ImportError(
             f"Failed to import dinov3 backbones from '{dinov3_source_dir}'. Please ensure the path is correct. Error: {e}"
         )
 
-    backbone = _dinov3_vitl16(pretrained=False)
+    backbone = _make_backbone(pretrained=False)
     state = torch.load(dino_weights_path, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]

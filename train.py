@@ -70,7 +70,7 @@ def main():
             repo_root = Path(__file__).parent
             dinov3_dir = repo_root / "dinov3_weights"
             dinov3_dir.mkdir(parents=True, exist_ok=True)
-            dinov3_dst = dinov3_dir / "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pt"
+            dinov3_dst = dinov3_dir / "dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pt"
             if not dinov3_dst.is_file() or os.path.getsize(dinov3_dst) == 0:
                 shutil.copyfile(str(dinov3_src), str(dinov3_dst))
     except Exception as e:

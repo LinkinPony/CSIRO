@@ -1,10 +1,11 @@
 # ===== Required user variables =====
 # Backward-compat: WEIGHTS_PT_PATH is ignored when HEAD_WEIGHTS_PT_PATH is provided.
 HEAD_WEIGHTS_PT_PATH = "weights/head/"  # regression head-only weights (.pt)
-DINO_WEIGHTS_PT_PATH = "dinov3_weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pt"  # frozen DINOv3 weights (.pt)
+DINO_WEIGHTS_PT_PATH = "dinov3_weights/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pt"  # frozen DINOv3 weights (.pt)
 INPUT_PATH = "data"  # dir containing test.csv & images, or a direct test.csv path
 OUTPUT_SUBMISSION_PATH = "submission.csv"
 DINOV3_PATH = "third_party/dinov3/dinov3"  # path to dinov3 source folder (contains dinov3/*)
+PEFT_PATH = "third_party/peft/src"  # path to peft source folder (contains peft/*)
 
 # New: specify the project directory that contains both `configs/` and `src/` folders.
 # Example: PROJECT_DIR = "/media/dl/dataset/Git/CSIRO"
@@ -42,10 +43,10 @@ _DINOV3_DIR = os.path.abspath(DINOV3_PATH) if DINOV3_PATH else ""
 if _DINOV3_DIR and os.path.isdir(_DINOV3_DIR) and _DINOV3_DIR not in sys.path:
     sys.path.insert(0, _DINOV3_DIR)
 
-try:
-    from dinov3.hub.backbones import dinov3_vitl16 as _dinov3_vitl16  # noqa: F401
-except Exception:
-    _dinov3_vitl16 = None  # noqa: F401
+# ===== Prefer vendored PEFT over system installation (if available) =====
+_PEFT_DIR = os.path.abspath(PEFT_PATH) if PEFT_PATH else ""
+if _PEFT_DIR and os.path.isdir(_PEFT_DIR) and _PEFT_DIR not in sys.path:
+    sys.path.insert(0, _PEFT_DIR)
 
 # ===== Validate project directory and import project modules =====
 _PROJECT_DIR_ABS = os.path.abspath(PROJECT_DIR) if PROJECT_DIR else ""
@@ -354,7 +355,16 @@ def main():
     if not (DINO_WEIGHTS_PT_PATH and os.path.isfile(DINO_WEIGHTS_PT_PATH)):
         raise FileNotFoundError("DINO_WEIGHTS_PT_PATH must be set to a valid backbone .pt file.")
 
-    if _dinov3_vitl16 is None:
+    # Import correct DINOv3 constructor based on config
+    try:
+        backbone_name = str(cfg["model"]["backbone"]).strip()
+        if backbone_name == "dinov3_vith16plus":
+            from dinov3.hub.backbones import dinov3_vith16plus as _make_backbone  # type: ignore
+        elif backbone_name == "dinov3_vitl16":
+            from dinov3.hub.backbones import dinov3_vitl16 as _make_backbone  # type: ignore
+        else:
+            raise ImportError(f"Unsupported backbone in config: {backbone_name}")
+    except Exception:
         raise ImportError(
             "dinov3 is not available locally. Ensure DINOV3_PATH points to third_party/dinov3/dinov3."
         )
@@ -363,7 +373,7 @@ def main():
     head_weight_paths = discover_head_weight_paths(HEAD_WEIGHTS_PT_PATH)
 
     # Build backbone architecture locally (no torch.hub), then load state_dict
-    backbone = _dinov3_vitl16(pretrained=False)
+    backbone = _make_backbone(pretrained=False)
     dino_state = torch.load(DINO_WEIGHTS_PT_PATH, map_location="cpu")
     if isinstance(dino_state, dict) and "state_dict" in dino_state:
         dino_state = dino_state["state_dict"]
