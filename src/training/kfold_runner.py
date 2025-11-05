@@ -15,7 +15,7 @@ from src.callbacks.head_checkpoint import HeadCheckpoint
 from src.training.logging_utils import create_lightning_loggers, plot_epoch_metrics
 
 
-def _build_model(cfg: Dict) -> BiomassRegressor:
+def _build_model(cfg: Dict, num_species_classes: int) -> BiomassRegressor:
     return BiomassRegressor(
         backbone_name=str(cfg["model"]["backbone"]),
         embedding_dim=int(cfg["model"]["embedding_dim"]),
@@ -32,6 +32,9 @@ def _build_model(cfg: Dict) -> BiomassRegressor:
         weight_decay=float(cfg["optimizer"]["weight_decay"]),
         scheduler_name=str(cfg.get("scheduler", {}).get("name", "")).lower() or None,
         max_epochs=int(cfg["trainer"]["max_epochs"]),
+        loss_weighting=(str(cfg.get("loss", {}).get("weighting", "")).lower() or None),
+        num_species_classes=int(num_species_classes),
+        peft_cfg=dict(cfg.get("peft", {})),
     )
 
 
@@ -66,6 +69,14 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
         shuffle=bool(cfg["data"].get("shuffle", True)),
     )
     full_df = base_dm.build_full_dataframe()
+    # infer number of species classes
+    try:
+        num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
+        if num_species_classes <= 1:
+            raise ValueError("Species column has <=1 unique values")
+    except Exception as e:
+        logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
+        num_species_classes = 2
 
     num_folds = int(cfg.get("kfold", {}).get("k", 5))
     even_split = bool(cfg.get("kfold", {}).get("even_split", False))
@@ -152,7 +163,7 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
             predefined_val_df=val_df,
         )
 
-        model = _build_model(cfg)
+        model = _build_model(cfg, num_species_classes)
 
         checkpoint_cb = ModelCheckpoint(
             dirpath=str(fold_ckpt_dir),

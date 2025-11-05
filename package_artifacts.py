@@ -137,6 +137,21 @@ def copy_tree(src_dir: Path, dst_dir: Path) -> None:
     )
 
 
+def copy_optional_third_party(repo_root: Path, weights_dir: Path) -> None:
+    # Copy PEFT sources for offline PEFT inference (optional)
+    peft_src = repo_root / "third_party" / "peft"
+    if peft_src.exists() and peft_src.is_dir():
+        dst = weights_dir / "third_party" / "peft"
+        if dst.exists() and dst.is_dir():
+            shutil.rmtree(dst)
+        shutil.copytree(
+            peft_src,
+            dst,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "*.pyd", ".git", ".DS_Store"),
+        )
+
+
 def main():
     args = parse_args()
     cfg = load_cfg(args.config)
@@ -214,6 +229,7 @@ def main():
     repo_root = Path(__file__).parent
     copy_tree(repo_root / "configs", weights_dir / "configs")
     copy_tree(repo_root / "src", weights_dir / "src")
+    copy_optional_third_party(repo_root, weights_dir)
     print(f"Copied configs/ and src/ to: {weights_dir}")
 
 

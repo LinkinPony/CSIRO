@@ -1,11 +1,11 @@
 seed: 42
-version: mlp-test-50-50
+version: mlp-uw-mtl-lora
 
 data:
   root: data
   train_csv: train.csv
-  image_size: [960, 480]
-  batch_size: 16
+  image_size: [640, 640]
+  batch_size: 8
   val_batch_size: 16
   num_workers: 20
   prefetch_factor: 4
@@ -32,10 +32,26 @@ model:
   embedding_dim: 1024
   head:
     type: mlp
-    hidden_dims: [512, 256]
+    hidden_dims: [512]
     activation: relu
     dropout: 0.2
     use_output_softplus: true
+
+peft:
+  enabled: true
+  method: lora
+  use_dora: true
+  r: 8
+  lora_alpha: 8
+  lora_dropout: 0.05
+  init: true
+  last_k_blocks: 0
+  layers_pattern: blocks
+  target_modules: [qkv, proj]
+  lora_lr: 0.00005
+
+loss:
+  weighting: uw
 
 optimizer:
   name: adamw
@@ -49,14 +65,14 @@ scheduler:
 kfold:
   enabled: true
   k: 5
-  even_split: true
+  even_split: false
 
 trainer:
   max_epochs: 20
   accelerator: auto
   devices: 1
   precision: 16-mixed
-  log_every_n_steps: 50
+  log_every_n_steps: 1
   resume_from: null
 
 logging:

@@ -5,15 +5,15 @@ from torch import Tensor, nn
 
 
 class DinoV3FeatureExtractor(nn.Module):
-    def __init__(self, backbone: nn.Module) -> None:
+    def __init__(self, backbone: nn.Module, *, inference_only: bool = True) -> None:
         super().__init__()
         self.backbone = backbone
+        self.inference_only = bool(inference_only)
         for parameter in self.backbone.parameters():
             parameter.requires_grad = False
         self.backbone.eval()
 
-    @torch.inference_mode()
-    def forward(self, images: Tensor) -> Tensor:
+    def _forward_impl(self, images: Tensor) -> Tensor:
         # Ensure AMP half inputs match backbone (float32) to avoid dtype mismatch in conv2d
         try:
             backbone_dtype = next(self.backbone.parameters()).dtype
@@ -21,8 +21,26 @@ class DinoV3FeatureExtractor(nn.Module):
             backbone_dtype = images.dtype
         if images.dtype != backbone_dtype:
             images = images.to(dtype=backbone_dtype)
-        feats = self.backbone.forward_features(images)
+        # Support both raw DINOv3 and PEFT-wrapped backbones
+        try:
+            forward_features = getattr(self.backbone, "forward_features", None)
+            if forward_features is None and hasattr(self.backbone, "base_model"):
+                forward_features = getattr(self.backbone.base_model, "forward_features", None)
+            if forward_features is None:
+                # Fallback: call forward and expect a dict-like output
+                out = self.backbone(images)
+                feats = out if isinstance(out, dict) else {"x_norm_clstoken": out}
+            else:
+                feats = forward_features(images)
+        except Exception:
+            feats = self.backbone.forward_features(images)
         return feats["x_norm_clstoken"]
+
+    def forward(self, images: Tensor) -> Tensor:
+        if self.inference_only:
+            with torch.inference_mode():
+                return self._forward_impl(images)
+        return self._forward_impl(images)
 
 
 def load_dinov3_vitl16(

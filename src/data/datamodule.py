@@ -48,11 +48,13 @@ class PastureImageDataset(Dataset):
         records: pd.DataFrame,
         root_dir: str,
         target_order: Sequence[str],
+        species_to_idx: Optional[dict] = None,
         transform: Optional[T.Compose] = None,
     ) -> None:
         self.records = records.reset_index(drop=True)
         self.root_dir = root_dir
         self.target_order = list(target_order)
+        self.species_to_idx = dict(species_to_idx or {})
         self.transform = transform
 
     def __len__(self) -> int:
@@ -64,10 +66,17 @@ class PastureImageDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        targets = torch.tensor(
-            [row[t] for t in self.target_order], dtype=torch.float32
-        )
-        return image, targets
+        # main regression targets (triple)
+        y_reg3 = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
+        # auxiliary regression target: height
+        y_height = torch.tensor([float(row.get("Height_Ave_cm", 0.0))], dtype=torch.float32)
+        # auxiliary classification target: species index
+        species = str(row.get("Species", ""))
+        if self.species_to_idx and species in self.species_to_idx:
+            y_species = torch.tensor(int(self.species_to_idx[species]), dtype=torch.long)
+        else:
+            y_species = torch.tensor(0, dtype=torch.long)
+        return {"image": image, "y_reg3": y_reg3, "y_height": y_height, "y_species": y_species}
 
 
 class PastureDataModule(LightningDataModule):
@@ -126,10 +135,16 @@ class PastureDataModule(LightningDataModule):
             aggfunc="first",
         )
         image_path_series = df.groupby("image_id")["image_path"].first()
-        merged = pivot.join(image_path_series, how="inner").dropna(subset=self.target_order)
+        # also aggregate auxiliary labels
+        height_series = df.groupby("image_id")["Height_Ave_cm"].first()
+        species_series = df.groupby("image_id")["Species"].first()
+        merged = pivot.join(image_path_series, how="inner")
+        merged = merged.join(height_series, how="left").join(species_series, how="left")
+        merged = merged.dropna(subset=self.target_order)
         merged = merged.reset_index(drop=False)
         # Ensure proper column order: targets then image_path and image_id
-        merged = merged[[*self.target_order, "image_path", "image_id"]]
+        cols = [*self.target_order, "Height_Ave_cm", "Species", "image_path", "image_id"]
+        merged = merged[cols]
         return merged
 
     def setup(self, stage: Optional[str] = None) -> None:
@@ -154,10 +169,12 @@ class PastureDataModule(LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         assert self.train_df is not None
+        species_to_idx = self._ensure_species_mapping()
         ds = PastureImageDataset(
             records=self.train_df,
             root_dir=self.data_root,
             target_order=self.target_order,
+            species_to_idx=species_to_idx,
             transform=self.train_tf,
         )
         return DataLoader(
@@ -172,10 +189,12 @@ class PastureDataModule(LightningDataModule):
 
     def val_dataloader(self) -> DataLoader:
         assert self.val_df is not None
+        species_to_idx = self._ensure_species_mapping()
         ds = PastureImageDataset(
             records=self.val_df,
             root_dir=self.data_root,
             target_order=self.target_order,
+            species_to_idx=species_to_idx,
             transform=self.val_tf,
         )
         return DataLoader(
@@ -187,5 +206,19 @@ class PastureDataModule(LightningDataModule):
             prefetch_factor=self.prefetch_factor,
             persistent_workers=bool(self.num_workers > 0),
         )
+
+    # --- Auxiliary label utilities ---
+    def _ensure_species_mapping(self) -> dict:
+        if not hasattr(self, "_species_to_idx") or self._species_to_idx is None:
+            df_all = self._read_and_pivot()
+            uniques = sorted([str(s) for s in df_all["Species"].dropna().astype(str).unique().tolist()])
+            mapping = {s: i for i, s in enumerate(uniques)}
+            self._species_to_idx = mapping
+        return self._species_to_idx
+
+    @property
+    def num_species_classes(self) -> int:
+        mapping = self._ensure_species_mapping()
+        return int(len(mapping))
 
 

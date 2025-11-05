@@ -101,6 +101,16 @@ def main():
             shuffle=bool(cfg["data"].get("shuffle", True)),
         )
 
+        # infer number of species classes for auxiliary classification task
+        try:
+            full_df = dm.build_full_dataframe()
+            num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
+            if num_species_classes <= 1:
+                raise ValueError("Species column has <=1 unique values")
+        except Exception as e:
+            logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
+            num_species_classes = 2
+
         model = BiomassRegressor(
             backbone_name=str(cfg["model"]["backbone"]),
             embedding_dim=int(cfg["model"]["embedding_dim"]),
@@ -117,6 +127,9 @@ def main():
             weight_decay=float(cfg["optimizer"]["weight_decay"]),
             scheduler_name=str(cfg.get("scheduler", {}).get("name", "")).lower() or None,
             max_epochs=int(cfg["trainer"]["max_epochs"]),
+            loss_weighting=(str(cfg.get("loss", {}).get("weighting", "")).lower() or None),
+            num_species_classes=num_species_classes,
+            peft_cfg=dict(cfg.get("peft", {})),
         )
 
         checkpoint_cb = ModelCheckpoint(

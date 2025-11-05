@@ -10,3 +10,9 @@
 [submodule "third_party/LibMTL"]
 	path = third_party/LibMTL
 	url = git@github.com:median-research-group/LibMTL.git
+[submodule "third_party/dinov3-finetune"]
+	path = third_party/dinov3-finetune
+	url = git@github.com:RobvanGastel/dinov3-finetune.git
+[submodule "third_party/peft"]
+	path = third_party/peft
+	url = git@github.com:huggingface/peft.git

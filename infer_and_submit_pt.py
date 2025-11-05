@@ -61,6 +61,7 @@ if _PROJECT_DIR_ABS not in sys.path:
     sys.path.insert(0, _PROJECT_DIR_ABS)
 
 from src.models.head_builder import build_head_layer  # noqa: E402
+from src.models.peft_integration import _import_peft  # noqa: E402
 
 
 # ===== Weights loader (TorchScript supported, state_dict also supported) =====
@@ -132,14 +133,14 @@ def load_state_and_meta(pt_path: str):
     return state_dict, meta
 
 
-def load_head_state(pt_path: str) -> Tuple[dict, dict]:
+def load_head_state(pt_path: str) -> Tuple[dict, dict, Optional[dict]]:
     if not os.path.isfile(pt_path):
         raise FileNotFoundError(f"Head weights not found: {pt_path}")
     obj = torch.load(pt_path, map_location="cpu")
     if isinstance(obj, dict) and "state_dict" in obj:
-        return obj["state_dict"], obj.get("meta", {})
+        return obj["state_dict"], obj.get("meta", {}), obj.get("peft", None)
     if isinstance(obj, dict):
-        return obj, {}
+        return obj, {}, obj.get("peft", None)
     raise RuntimeError("Unsupported head weights file format. Expect a dict with 'state_dict'.")
 
 
@@ -159,7 +160,18 @@ class DinoV3FeatureExtractor(nn.Module):
             backbone_dtype = images.dtype
         if images.dtype != backbone_dtype:
             images = images.to(dtype=backbone_dtype)
-        feats = self.backbone.forward_features(images)
+        # Support PEFT-wrapped backbones (forward_features may live on base_model)
+        try:
+            forward_features = getattr(self.backbone, "forward_features", None)
+            if forward_features is None and hasattr(self.backbone, "base_model"):
+                forward_features = getattr(self.backbone.base_model, "forward_features", None)
+            if forward_features is None:
+                out = self.backbone(images)
+                feats = out if isinstance(out, dict) else {"x_norm_clstoken": out}
+            else:
+                feats = forward_features(images)
+        except Exception:
+            feats = self.backbone.forward_features(images)
         return feats["x_norm_clstoken"]
 
 
@@ -325,6 +337,9 @@ def main():
             "dinov3 is not available locally. Ensure DINOV3_PATH points to third_party/dinov3/dinov3."
         )
 
+    # Discover head weights early to read optional PEFT payload
+    head_weight_paths = discover_head_weight_paths(HEAD_WEIGHTS_PT_PATH)
+
     # Build backbone architecture locally (no torch.hub), then load state_dict
     backbone = _dinov3_vitl16(pretrained=False)
     dino_state = torch.load(DINO_WEIGHTS_PT_PATH, map_location="cpu")
@@ -334,6 +349,39 @@ def main():
         backbone.load_state_dict(dino_state, strict=True)
     except Exception:
         backbone.load_state_dict(dino_state, strict=False)
+
+    # If any head carries a PEFT payload, inject LoRA adapters into the backbone and load adapter weights
+    try:
+        # Load first head file to inspect for peft payload
+        peft_payload: Optional[dict] = None
+        if head_weight_paths:
+            _obj = torch.load(head_weight_paths[0], map_location="cpu")
+            if isinstance(_obj, dict) and ("peft" in _obj):
+                peft_payload = _obj.get("peft")
+        if peft_payload is not None and isinstance(peft_payload, dict):
+            peft_cfg_dict = peft_payload.get("config", None)
+            peft_state = peft_payload.get("state_dict", None)
+            if peft_cfg_dict and peft_state:
+                # Import PEFT lazily and wrap backbone
+                try:
+                    from peft.config import PeftConfig  # type: ignore
+                    from peft.mapping_func import get_peft_model  # type: ignore
+                    from peft.utils.save_and_load import set_peft_model_state_dict  # type: ignore
+                except Exception:
+                    # Fallback via our integration helper to ensure third_party path is added
+                    LoraConfig, get_peft_model_alt, _, _ = _import_peft()  # noqa: F841
+                    from peft.config import PeftConfig  # type: ignore
+                    from peft.utils.save_and_load import set_peft_model_state_dict  # type: ignore
+                    get_peft_model = get_peft_model_alt  # type: ignore
+
+                peft_config = PeftConfig.from_peft_type(**peft_cfg_dict)
+                backbone = get_peft_model(backbone, peft_config)
+                # Load adapter weights into wrapped model
+                set_peft_model_state_dict(backbone, peft_state, adapter_name="default")
+                backbone.eval()
+    except Exception as _e:
+        # If PEFT injection fails, continue without adapters
+        print(f"[WARN] PEFT injection skipped: {_e}")
 
     feature_extractor = DinoV3FeatureExtractor(backbone)
 
@@ -349,8 +397,7 @@ def main():
         num_workers=num_workers,
     )
 
-    # 2) Discover heads (single or per-fold) and ensemble predictions by averaging
-    head_weight_paths = discover_head_weight_paths(HEAD_WEIGHTS_PT_PATH)
+    # 2) Use discovered heads (single or per-fold) and ensemble predictions by averaging
 
     preds_sum = torch.zeros((features_cpu.shape[0], 3), dtype=torch.float32)
     num_heads = 0
@@ -363,7 +410,7 @@ def main():
             dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
             use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
         )
-        state, _ = load_head_state(head_pt)
+        state, _, _ = load_head_state(head_pt)
         head_module.load_state_dict(state, strict=True)
         preds = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
         preds_sum += preds
