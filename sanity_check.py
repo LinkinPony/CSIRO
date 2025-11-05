@@ -14,6 +14,29 @@ import yaml
 from loguru import logger
 import time
 
+# Allowlist PEFT types for PyTorch 2.6+ safe deserialization (weights_only=True)
+try:
+    from torch.serialization import add_safe_globals  # type: ignore
+except Exception:
+    add_safe_globals = None  # type: ignore
+
+try:
+    from peft.utils.peft_types import PeftType  # type: ignore
+except Exception:
+    try:
+        # Try to enable third_party peft import path via project setup (later)
+        from src.models.peft_integration import _import_peft  # type: ignore
+        _import_peft()
+        from peft.utils.peft_types import PeftType  # type: ignore
+    except Exception:
+        PeftType = None  # type: ignore
+
+if add_safe_globals is not None and PeftType is not None:  # type: ignore
+    try:
+        add_safe_globals([PeftType])  # type: ignore
+    except Exception:
+        pass
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Sanity check runner (config-driven)")
@@ -279,6 +302,69 @@ def compute_metrics(preds: torch.Tensor, targets: torch.Tensor) -> Dict[str, flo
     }
 
 
+def _write_test_csv_for_images(
+    image_paths: List[str],
+    target_order: List[str],
+    out_csv_path: Path,
+) -> None:
+    rows: List[Dict[str, str]] = []
+    # Build rows: one per (image, target) for the three base targets
+    for rel_path in image_paths:
+        for t in target_order:
+            # Use a stable sample_id that preserves mapping back
+            sid = f"{rel_path}__{t}"
+            rows.append({
+                "sample_id": sid,
+                "image_path": rel_path,
+                "target_name": t,
+            })
+    df = pd.DataFrame(rows, columns=["sample_id", "image_path", "target_name"])  # type: ignore
+    out_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv_path, index=False)
+
+
+def _run_infer_module(
+    *,
+    project_dir: str,
+    head_path_or_dir: Path,
+    dino_weights_path: str,
+    input_csv_path: Path,
+    output_submission_path: Path,
+) -> None:
+    # Import once and reuse the single inference implementation
+    import importlib
+    infer = importlib.import_module("infer_and_submit_pt")
+
+    # Override module variables BEFORE calling main()
+    infer.PROJECT_DIR = project_dir
+    # Also update derived absolute path used internally
+    try:
+        infer._PROJECT_DIR_ABS = os.path.abspath(project_dir)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    infer.HEAD_WEIGHTS_PT_PATH = str(head_path_or_dir)
+    infer.DINO_WEIGHTS_PT_PATH = str(dino_weights_path)
+    infer.INPUT_PATH = str(input_csv_path)
+    infer.OUTPUT_SUBMISSION_PATH = str(output_submission_path)
+
+    # Execute the single source of truth inference
+    infer.main()
+
+
+def _read_submission_as_wide(
+    submission_csv: Path,
+    test_csv: Path,
+) -> pd.DataFrame:
+    # Join back to recover image_path and target_name, then pivot to wide per image_path
+    sub = pd.read_csv(str(submission_csv))  # columns: sample_id, target
+    test_df = pd.read_csv(str(test_csv))    # columns: sample_id, image_path, target_name
+    merged = sub.merge(test_df, on="sample_id", how="inner")
+    # Pivot to columns pred_dc, pred_dd, pred_dg in train target order
+    pv = merged.pivot_table(index="image_path", columns="target_name", values="target", aggfunc="first").reset_index()
+    return pv
+
+
 def main():
     args = parse_args()
     sanity = load_sanity_cfg(args.config)
@@ -352,12 +438,11 @@ def main():
     full_df = dm.build_full_dataframe()
     logger.info("Full dataset rows: {} (unique images)", len(full_df))
 
-    # 3) Build offline DINO feature extractor
-    logger.info("[3/4] Loading DINOv3 backbone and preparing transforms ...")
+    # 3) Configure shared resources for inference module (single source of truth)
+    logger.info("[3/4] Preparing single-source inference via infer_and_submit_pt.py ...")
     cfg_dino_weights = sanity.get("dino_weights_path", "")
     dino_weights_path = _to_abs(project_dir, cfg_dino_weights) if cfg_dino_weights else ""
     if not dino_weights_path or not os.path.isfile(dino_weights_path):
-        # Fallback to training config
         cfg_weights_path = train_cfg["model"].get("weights_path", None)
         if not (cfg_weights_path and os.path.isfile(_to_abs(project_dir, str(cfg_weights_path)))):
             raise FileNotFoundError(
@@ -367,10 +452,6 @@ def main():
     logger.info("DINO weights: {}", dino_weights_path)
     dinov3_source = _to_abs(project_dir, sanity.get("dinov3_source", "third_party/dinov3/dinov3"))
     logger.info("dinov3 source: {}", dinov3_source)
-    t0 = time.time()
-    feature_extractor = build_feature_extractor_offline(dinov3_source, dino_weights_path)
-    logger.success("Backbone ready in {:.2f}s", time.time() - t0)
-    val_tf = build_val_transforms(image_size=image_size, mean=mean, std=std)
 
     # 4) Per-fold validation inference using each fold's head (if kfold is enabled)
     k_cfg = int(train_cfg.get("kfold", {}).get("k", 5))
@@ -384,7 +465,7 @@ def main():
     per_fold_metrics: List[Dict[str, float]] = []
     per_fold_rows: List[Dict[str, object]] = []
 
-    logger.info("[4/4] Running per-fold validation inference ...")
+    logger.info("[4/4] Running per-fold validation inference via infer_and_submit_pt ...")
     for fold_idx in range(k_cfg):
         val_csv = fold_splits_root / f"fold_{fold_idx}" / "val.csv"
         if not val_csv.is_file():
@@ -396,27 +477,38 @@ def main():
         logger.info("Fold {}: val rows={} ({})", fold_idx, len(merged), val_csv.name)
 
         image_paths = merged["image_path"].astype(str).tolist()
-        targets_np = merged[target_order].to_numpy(dtype=np.float32)
-        t0 = time.time()
-        _, feats = extract_features(
-            feature_extractor=feature_extractor,
-            root_dir=data_root,
+        targets = torch.from_numpy(merged[target_order].to_numpy(dtype=np.float32))
+
+        tmp_dir = out_ver_dir / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        # IMPORTANT: place test.csv inside the true dataset_root so image paths resolve
+        test_csv_path = Path(data_root) / f"sanity_fold_{fold_idx}_test.csv"
+        sub_csv_path = tmp_dir / f"fold_{fold_idx}_submission.csv"
+
+        # Build test.csv for this fold and run the unified inference
+        _write_test_csv_for_images(
             image_paths=image_paths,
-            transform=val_tf,
-            batch_size=val_batch_size,
-            num_workers=num_workers,
+            target_order=target_order,
+            out_csv_path=test_csv_path,
         )
-        logger.debug("Fold {}: features shape={}  extracted in {:.2f}s", fold_idx, tuple(feats.shape), time.time() - t0)
 
-        head = load_head_module(train_cfg)
-        state = load_head_state_dict(fold_head_paths[fold_idx])
-        head.load_state_dict(state, strict=True)
-        t0 = time.time()
-        preds = predict_from_features(features_cpu=feats, head=head, batch_size=val_batch_size)
-        logger.debug("Fold {}: head preds shape={}  in {:.2f}s", fold_idx, tuple(preds.shape), time.time() - t0)
+        # Point the inference module to the specific fold head directory
+        head_dir_for_fold = fold_head_paths[fold_idx].parent
+        _run_infer_module(
+            project_dir=str(project_dir),
+            head_path_or_dir=head_dir_for_fold,
+            dino_weights_path=str(dino_weights_path),
+            input_csv_path=test_csv_path,
+            output_submission_path=sub_csv_path,
+        )
 
-        targets = torch.from_numpy(targets_np)
-        m = compute_metrics(preds=preds, targets=targets)
+        # Read predictions and compute metrics
+        wide_preds = _read_submission_as_wide(sub_csv_path, test_csv_path)
+        # Ensure order matches image_paths
+        pred_map = {r["image_path"]: [r.get(target_order[0], 0.0), r.get(target_order[1], 0.0), r.get(target_order[2], 0.0)] for _, r in wide_preds.iterrows()}
+        preds_mat = torch.tensor([pred_map[p] for p in image_paths], dtype=torch.float32)
+
+        m = compute_metrics(preds=preds_mat, targets=targets)
         per_fold_metrics.append({"fold": float(fold_idx), **m})
         logger.info(
             "Fold {} metrics: MSE={:.6f} MAE={:.6f} RMSE={:.6f} R2={:.4f}",
@@ -436,9 +528,9 @@ def main():
                     "target_dc": float(merged.iloc[i][target_order[0]]),
                     "target_dd": float(merged.iloc[i][target_order[1]]),
                     "target_dg": float(merged.iloc[i][target_order[2]]),
-                    "pred_dc": float(preds[i, 0].item()),
-                    "pred_dd": float(preds[i, 1].item()),
-                    "pred_dg": float(preds[i, 2].item()),
+                    "pred_dc": float(preds_mat[i, 0].item()),
+                    "pred_dd": float(preds_mat[i, 1].item()),
+                    "pred_dg": float(preds_mat[i, 2].item()),
                 }
             )
 
@@ -462,41 +554,39 @@ def main():
         agg_per_fold_metrics["r2"],
     )
 
+    # Ensemble over all available heads by pointing inference to weights/head/
     all_head_paths = discover_all_head_paths(weights_dir)
     if not all_head_paths:
         raise FileNotFoundError(f"No head weights found under: {weights_dir / 'head'}")
-    logger.info("Ensemble heads discovered: {}", len(all_head_paths))
+    used_heads = len(all_head_paths)
+    logger.info("Ensemble heads discovered: {}", used_heads)
 
     unique_paths = full_df["image_path"].astype(str).tolist()
-    t0 = time.time()
-    rels_in_order, full_feats = extract_features(
-        feature_extractor=feature_extractor,
-        root_dir=data_root,
+
+    tmp_dir = out_ver_dir / "tmp"
+    # IMPORTANT: place test.csv inside the true dataset_root so image paths resolve
+    test_csv_path = Path(data_root) / "sanity_full_test.csv"
+    sub_csv_path = tmp_dir / "ensemble_full_submission.csv"
+    _write_test_csv_for_images(
         image_paths=unique_paths,
-        transform=val_tf,
-        batch_size=val_batch_size,
-        num_workers=num_workers,
+        target_order=target_order,
+        out_csv_path=test_csv_path,
     )
-    logger.info("Full features extracted: shape={} in {:.2f}s", tuple(full_feats.shape), time.time() - t0)
 
-    ensemble_sum = torch.zeros((full_feats.shape[0], 3), dtype=torch.float32)
-    used_heads = 0
-    for head_pt in all_head_paths:
-        head = load_head_module(train_cfg)
-        state = load_head_state_dict(head_pt)
-        head.load_state_dict(state, strict=True)
-        preds = predict_from_features(features_cpu=full_feats, head=head, batch_size=val_batch_size)
-        ensemble_sum += preds
-        used_heads += 1
-    if used_heads == 0:
-        raise RuntimeError("No valid head weights for ensemble inference.")
-    ensemble_preds = ensemble_sum / float(used_heads)
-    logger.info("Ensemble predictions computed using {} heads", used_heads)
+    _run_infer_module(
+        project_dir=str(project_dir),
+        head_path_or_dir=weights_dir / "head",
+        dino_weights_path=str(dino_weights_path),
+        input_csv_path=test_csv_path,
+        output_submission_path=sub_csv_path,
+    )
 
-    df_full_preds = pd.DataFrame({"image_path": rels_in_order})
-    df_full_preds["pred_dc"] = ensemble_preds[:, 0].numpy()
-    df_full_preds["pred_dd"] = ensemble_preds[:, 1].numpy()
-    df_full_preds["pred_dg"] = ensemble_preds[:, 2].numpy()
+    wide_preds = _read_submission_as_wide(sub_csv_path, test_csv_path)
+    df_full_preds = wide_preds.rename(columns={
+        target_order[0]: "pred_dc",
+        target_order[1]: "pred_dd",
+        target_order[2]: "pred_dg",
+    })
 
     merged_full = full_df.merge(df_full_preds, on="image_path", how="inner")
     ens_targets = torch.from_numpy(merged_full[target_order].to_numpy(dtype=np.float32))

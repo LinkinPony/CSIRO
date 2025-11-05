@@ -65,6 +65,28 @@ from src.models.peft_integration import _import_peft  # noqa: E402
 
 
 # ===== Weights loader (TorchScript supported, state_dict also supported) =====
+# Allowlist PEFT types for PyTorch 2.6+ safe deserialization (weights_only=True)
+try:
+    from torch.serialization import add_safe_globals  # type: ignore
+except Exception:
+    add_safe_globals = None  # type: ignore
+
+try:
+    from peft.utils.peft_types import PeftType  # type: ignore
+except Exception:
+    try:
+        # Ensure third_party/peft is importable if bundled
+        _import_peft()
+        from peft.utils.peft_types import PeftType  # type: ignore
+    except Exception:
+        PeftType = None  # type: ignore
+
+if add_safe_globals is not None and PeftType is not None:  # type: ignore
+    try:
+        add_safe_globals([PeftType])  # type: ignore
+    except Exception:
+        pass
+
 def load_model_or_state(pt_path: str) -> Tuple[Optional[nn.Module], Optional[dict], dict]:
     if not os.path.isfile(pt_path):
         raise FileNotFoundError(f"Weights not found: {pt_path}")
