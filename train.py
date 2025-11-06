@@ -6,7 +6,7 @@ import yaml
 from loguru import logger
 
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, StochasticWeightAveraging
 import torch
 
 from src.data.datamodule import PastureDataModule
@@ -54,6 +54,14 @@ def main():
     # Route outputs to versioned subfolders if specified
     log_dir = base_log_dir / version if version else base_log_dir
     ckpt_dir = base_ckpt_dir / version if version else base_ckpt_dir
+
+    # Train-all mode may redirect outputs under a single fold_0 for consistency
+    train_all_cfg = cfg.get("train_all", {})
+    train_all_enabled = bool(train_all_cfg.get("enabled", False))
+    if train_all_enabled:
+        log_dir = log_dir / "fold_0"
+        ckpt_dir = ckpt_dir / "fold_0"
+
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -76,9 +84,9 @@ def main():
     except Exception as e:
         logger.warning(f"Copying DINOv3 weights failed: {e}")
 
-    # Optional k-fold configuration
+    # Optional k-fold configuration (ignored when train_all is enabled)
     kfold_cfg = cfg.get("kfold", {})
-    use_kfold = bool(kfold_cfg.get("enabled", False))
+    use_kfold = bool(kfold_cfg.get("enabled", False)) and not train_all_enabled
 
     if use_kfold:
         run_kfold(cfg, log_dir, ckpt_dir)
@@ -101,15 +109,62 @@ def main():
             shuffle=bool(cfg["data"].get("shuffle", True)),
         )
 
-        # infer number of species classes for auxiliary classification task
+        # MTL toggle: when disabled, train only reg3 task
+        mtl_cfg = cfg.get("mtl", {})
+        mtl_enabled = bool(mtl_cfg.get("enabled", True))
+
+        # Build full dataframe once (also used by train_all)
         try:
             full_df = dm.build_full_dataframe()
-            num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
-            if num_species_classes <= 1:
-                raise ValueError("Species column has <=1 unique values")
         except Exception as e:
-            logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
-            num_species_classes = 2
+            logger.warning(f"Building full dataframe failed: {e}")
+            raise
+
+        # Train-all: use all samples for train and a single duplicated sample as dummy val
+        if train_all_enabled:
+            try:
+                import pandas as pd  # local import to avoid global dependency if unused
+                rng_seed = int(cfg.get("seed", 42))
+                if len(full_df) < 1:
+                    raise ValueError("No samples available to construct train_all splits.")
+                dummy_val = full_df.sample(n=1, random_state=rng_seed)
+                # Optionally duplicate the single row to avoid degenerate loader corner cases
+                val_df = pd.concat([dummy_val], ignore_index=True)
+                train_df = full_df.reset_index(drop=True)
+                # Recreate datamodule with predefined splits
+                dm = PastureDataModule(
+                    data_root=cfg["data"]["root"],
+                    train_csv=cfg["data"]["train_csv"],
+                    image_size=_parse_image_size(cfg["data"]["image_size"]),
+                    batch_size=int(cfg["data"]["batch_size"]),
+                    val_batch_size=int(cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])),
+                    num_workers=int(cfg["data"]["num_workers"]),
+                    prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
+                    val_split=0.0,
+                    target_order=list(cfg["data"]["target_order"]),
+                    mean=list(cfg["data"]["normalization"]["mean"]),
+                    std=list(cfg["data"]["normalization"]["std"]),
+                    train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
+                    hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
+                    shuffle=bool(cfg["data"].get("shuffle", True)),
+                    predefined_train_df=train_df,
+                    predefined_val_df=val_df,
+                )
+            except Exception as e:
+                logger.warning(f"Constructing train_all splits failed: {e}")
+                raise
+
+        # Infer number of species classes only if MTL is enabled
+        if mtl_enabled:
+            try:
+                num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
+                if num_species_classes <= 1:
+                    raise ValueError("Species column has <=1 unique values")
+            except Exception as e:
+                logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
+                num_species_classes = 2
+        else:
+            num_species_classes = None
 
         model = BiomassRegressor(
             backbone_name=str(cfg["model"]["backbone"]),
@@ -129,6 +184,7 @@ def main():
             max_epochs=int(cfg["trainer"]["max_epochs"]),
             loss_weighting=(str(cfg.get("loss", {}).get("weighting", "")).lower() or None),
             num_species_classes=num_species_classes,
+            mtl_enabled=mtl_enabled,
             peft_cfg=dict(cfg.get("peft", {})),
         )
 
@@ -149,6 +205,20 @@ def main():
             HeadCheckpoint(output_dir=str(head_ckpt_dir)),
         ]
 
+        # Optional SWA to stabilize small-batch updates (match k-fold behavior)
+        swa_cfg = cfg.get("trainer", {}).get("swa", {})
+        if bool(swa_cfg.get("enabled", False)):
+            try:
+                swa_cb = StochasticWeightAveraging(
+                    swa_lrs=float(swa_cfg.get("swa_lrs", cfg["optimizer"]["lr"])),
+                    swa_epoch_start=float(swa_cfg.get("swa_epoch_start", 0.8)),
+                    annealing_epochs=int(swa_cfg.get("annealing_epochs", 5)),
+                    annealing_strategy=str(swa_cfg.get("annealing_strategy", "cos")),
+                )
+                callbacks.append(swa_cb)
+            except Exception as e:
+                logger.warning(f"SWA callback creation failed, continuing without SWA: {e}")
+
         csv_logger, tb_logger = create_lightning_loggers(log_dir)
 
         trainer = pl.Trainer(
@@ -159,6 +229,9 @@ def main():
             callbacks=callbacks,
             logger=[csv_logger, tb_logger],
             log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
+            accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
+            gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
+            gradient_clip_algorithm=str(cfg["trainer"].get("gradient_clip_algorithm", "norm")),
         )
 
         last_ckpt = ckpt_dir / "last.ckpt"

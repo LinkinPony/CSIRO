@@ -34,6 +34,7 @@ class BiomassRegressor(LightningModule):
         loss_weighting: Optional[str] = None,
         num_species_classes: Optional[int] = None,
         peft_cfg: Optional[Dict[str, Any]] = None,
+        mtl_enabled: bool = True,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -91,18 +92,29 @@ class BiomassRegressor(LightningModule):
         # Task heads
         bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
         self.reg_head = nn.Linear(bottleneck_dim, num_outputs)  # main 3-d regression
-        self.height_head = nn.Linear(bottleneck_dim, 1)         # auxiliary regression
-        if num_species_classes is None or int(num_species_classes) <= 1:
-            raise ValueError("num_species_classes must be provided (>1) for classification task")
-        self.num_species_classes = int(num_species_classes)
-        self.species_head = nn.Linear(bottleneck_dim, self.num_species_classes)
+
+        self.mtl_enabled: bool = bool(mtl_enabled)
+        if self.mtl_enabled:
+            self.height_head = nn.Linear(bottleneck_dim, 1)  # auxiliary regression (height)
+            self.ndvi_head = nn.Linear(bottleneck_dim, 1)  # auxiliary regression (Pre_GSHH_NDVI)
+            if num_species_classes is None or int(num_species_classes) <= 1:
+                raise ValueError("num_species_classes must be provided (>1) for classification task")
+            self.num_species_classes = int(num_species_classes)
+            self.species_head = nn.Linear(bottleneck_dim, self.num_species_classes)
+        else:
+            self.height_head = None
+            self.ndvi_head = None
+            self.num_species_classes = 0
+            self.species_head = None
         self.out_softplus = nn.Softplus() if use_output_softplus else None
 
         # Uncertainty Weighting (UW) parameters (optional)
         self.loss_weighting: Optional[str] = (loss_weighting.lower() if loss_weighting else None)
-        if self.loss_weighting == "uw":
-            # three tasks: reg3, height, species
-            self.uw_logvars = nn.Parameter(torch.zeros(3))
+        if self.mtl_enabled and self.loss_weighting == "uw":
+            # four tasks: reg3, height, ndvi, species
+            self.uw_logvars = nn.Parameter(torch.zeros(4))
+        else:
+            self.uw_logvars = None
 
         # buffers for epoch-wise metrics on validation set
         self._val_preds: list[Tensor] = []
@@ -122,6 +134,7 @@ class BiomassRegressor(LightningModule):
         images: Tensor = batch["image"]
         y_reg3: Tensor = batch["y_reg3"]  # (B,3)
         y_height: Tensor = batch["y_height"]  # (B,1)
+        y_ndvi: Tensor = batch["y_ndvi"]  # (B,1)
         y_species: Tensor = batch["y_species"]  # (B,)
 
         features = self.feature_extractor(images)
@@ -129,27 +142,54 @@ class BiomassRegressor(LightningModule):
         pred_reg3 = self.reg_head(z)
         if self.out_softplus is not None:
             pred_reg3 = self.out_softplus(pred_reg3)
-        pred_height = self.height_head(z)
-        logits_species = self.species_head(z)
 
-        # Task losses
-        loss_reg3 = F.mse_loss(pred_reg3, y_reg3)  # agg over dims
+        # If MTL is disabled, optimize only the main regression task
+        loss_reg3 = F.mse_loss(pred_reg3, y_reg3)
+        if not self.mtl_enabled:
+            self.log(f"{stage}_loss_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            mae_reg3 = F.l1_loss(pred_reg3, y_reg3)
+            self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            with torch.no_grad():
+                per_dim_mse = torch.mean((pred_reg3 - y_reg3) ** 2, dim=0)
+                for i in range(per_dim_mse.shape[0]):
+                    self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
+
+            total_loss = loss_reg3
+            self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+            self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            return {
+                "loss": total_loss,
+                "mae": mae_reg3,
+                "mse": loss_reg3,
+                "preds": pred_reg3,
+                "targets": y_reg3,
+            }
+
+        # Otherwise, compute auxiliary task heads and losses
+        pred_height = self.height_head(z)  # type: ignore[attr-defined]
+        pred_ndvi = self.ndvi_head(z)  # type: ignore[attr-defined]
+        logits_species = self.species_head(z)  # type: ignore[attr-defined]
+
         loss_height = F.mse_loss(pred_height, y_height)
+        loss_ndvi = F.mse_loss(pred_ndvi, y_ndvi)
         loss_species = F.cross_entropy(logits_species, y_species)
 
         # Metrics logging
-        # per-task losses
         self.log(f"{stage}_loss_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_loss_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_loss_species", loss_species, on_step=False, on_epoch=True, prog_bar=False)
-        # per-task metrics
         self.log(f"{stage}_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_mse_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
         mae_reg3 = F.l1_loss(pred_reg3, y_reg3)
         mae_height = F.l1_loss(pred_height, y_height)
+        mae_ndvi = F.l1_loss(pred_ndvi, y_ndvi)
         self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_mae_height", mae_height, on_step=False, on_epoch=True, prog_bar=False)
-        # per-dimension MSE for the 3-d regression task
+        self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
         with torch.no_grad():
             per_dim_mse = torch.mean((pred_reg3 - y_reg3) ** 2, dim=0)
             for i in range(per_dim_mse.shape[0]):
@@ -159,19 +199,19 @@ class BiomassRegressor(LightningModule):
         self.log(f"{stage}_acc_species", acc, on_step=False, on_epoch=True, prog_bar=False)
 
         # UW over three tasks or equal weighting
-        if self.loss_weighting == "uw":
-            s = self.uw_logvars  # (3,)
-            losses_vec = torch.stack([loss_reg3, loss_height, loss_species])
+        if self.mtl_enabled and self.loss_weighting == "uw":
+            s = self.uw_logvars  # type: ignore[operator]
+            losses_vec = torch.stack([loss_reg3, loss_height, loss_ndvi, loss_species])
             total_loss = 0.5 * torch.sum(torch.exp(-s) * losses_vec + s)
             with torch.no_grad():
                 w_eff = 0.5 * torch.exp(-s)
                 sigma = torch.exp(0.5 * s)
-                for i, name in enumerate(["reg3", "height", "species"]):
+                for i, name in enumerate(["reg3", "height", "ndvi", "species"]):
                     self.log(f"{stage}_uw_w_{name}", w_eff[i], on_step=False, on_epoch=True, prog_bar=False)
                     self.log(f"{stage}_uw_logvar_{name}", s[i], on_step=False, on_epoch=True, prog_bar=False)
                     self.log(f"{stage}_uw_sigma_{name}", sigma[i], on_step=False, on_epoch=True, prog_bar=False)
         else:
-            total_loss = (loss_reg3 + loss_height + loss_species) / 3.0
+            total_loss = (loss_reg3 + loss_height + loss_ndvi + loss_species) / 4.0
 
         # overall metrics for backward-compat
         mae = F.l1_loss(pred_reg3, y_reg3)

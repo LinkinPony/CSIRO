@@ -1,5 +1,5 @@
 seed: 42
-version: h16p-lora-960-480
+version: h16p-lora-960-480-ndvi-full
 
 data:
   root: data
@@ -36,6 +36,12 @@ model:
     activation: relu
     dropout: 0.2
     use_output_softplus: true
+
+mtl:
+  enabled: true
+
+train_all:
+  enabled: true
 
 peft:
   enabled: true

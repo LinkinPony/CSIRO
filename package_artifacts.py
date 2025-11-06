@@ -163,8 +163,13 @@ def main():
     # If kfold is enabled, export one head per fold under weights/head/fold_*/infer_head.pt
     kfold_cfg = cfg.get("kfold", {})
     kfold_enabled = bool(kfold_cfg.get("enabled", False))
-    if kfold_enabled:
-        k = int(kfold_cfg.get("k", 5))
+
+    # Train-all mode is treated like kfold with a single fold (fold_0)
+    train_all_cfg = cfg.get("train_all", {})
+    train_all_enabled = bool(train_all_cfg.get("enabled", False))
+
+    if kfold_enabled or train_all_enabled:
+        k = 1 if train_all_enabled else int(kfold_cfg.get("k", 5))
         exported = []
         for fold_idx in range(k):
             fold_ckpt_head_dir = ckpt_dir / f"fold_{fold_idx}" / "head"

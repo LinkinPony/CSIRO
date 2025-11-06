@@ -70,13 +70,15 @@ class PastureImageDataset(Dataset):
         y_reg3 = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
         # auxiliary regression target: height
         y_height = torch.tensor([float(row.get("Height_Ave_cm", 0.0))], dtype=torch.float32)
+        # auxiliary regression target: Pre_GSHH_NDVI
+        y_ndvi = torch.tensor([float(row.get("Pre_GSHH_NDVI", 0.0))], dtype=torch.float32)
         # auxiliary classification target: species index
         species = str(row.get("Species", ""))
         if self.species_to_idx and species in self.species_to_idx:
             y_species = torch.tensor(int(self.species_to_idx[species]), dtype=torch.long)
         else:
             y_species = torch.tensor(0, dtype=torch.long)
-        return {"image": image, "y_reg3": y_reg3, "y_height": y_height, "y_species": y_species}
+        return {"image": image, "y_reg3": y_reg3, "y_height": y_height, "y_ndvi": y_ndvi, "y_species": y_species}
 
 
 class PastureDataModule(LightningDataModule):
@@ -137,13 +139,14 @@ class PastureDataModule(LightningDataModule):
         image_path_series = df.groupby("image_id")["image_path"].first()
         # also aggregate auxiliary labels
         height_series = df.groupby("image_id")["Height_Ave_cm"].first()
+        ndvi_series = df.groupby("image_id")["Pre_GSHH_NDVI"].first()
         species_series = df.groupby("image_id")["Species"].first()
         merged = pivot.join(image_path_series, how="inner")
-        merged = merged.join(height_series, how="left").join(species_series, how="left")
+        merged = merged.join(height_series, how="left").join(ndvi_series, how="left").join(species_series, how="left")
         merged = merged.dropna(subset=self.target_order)
         merged = merged.reset_index(drop=False)
         # Ensure proper column order: targets then image_path and image_id
-        cols = [*self.target_order, "Height_Ave_cm", "Species", "image_path", "image_id"]
+        cols = [*self.target_order, "Height_Ave_cm", "Pre_GSHH_NDVI", "Species", "image_path", "image_id"]
         merged = merged[cols]
         return merged
 
