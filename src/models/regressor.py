@@ -52,10 +52,12 @@ class BiomassRegressor(LightningModule):
             except Exception:
                 pass
             feature_extractor, lora_cfg = inject_lora_into_feature_extractor(feature_extractor, peft_cfg)
-            # Persist LoRA LR for optimizer grouping
+            # Persist LoRA LR and WD for optimizer grouping
             self._peft_lora_lr: Optional[float] = float(peft_cfg.get("lora_lr", 5e-5))
+            self._peft_lora_weight_decay: Optional[float] = float(peft_cfg.get("lora_weight_decay", 0.0))
         else:
             self._peft_lora_lr = None
+            self._peft_lora_weight_decay = None
         if not freeze_backbone:
             for parameter in feature_extractor.backbone.parameters():
                 parameter.requires_grad = True
@@ -230,10 +232,11 @@ class BiomassRegressor(LightningModule):
             })
         if len(lora_params) > 0:
             lora_lr = float(self._peft_lora_lr or (self.hparams.learning_rate * 0.1))
+            lora_wd = float(self._peft_lora_weight_decay if self._peft_lora_weight_decay is not None else self.hparams.weight_decay)
             param_groups.append({
                 "params": lora_params,
                 "lr": lora_lr,
-                "weight_decay": self.hparams.weight_decay,
+                "weight_decay": lora_wd,
             })
 
         optimizer: Optimizer = AdamW(param_groups)

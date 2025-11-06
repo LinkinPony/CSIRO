@@ -1,12 +1,12 @@
 seed: 42
-version: mlp-uw-mtl-lora-vith16plus-hard-norm-large-image
+version: h16p-lora-960-480
 
 data:
   root: data
   train_csv: train.csv
-  image_size: [1280, 640]
+  image_size: [960, 480]
   batch_size: 1
-  val_batch_size: 2
+  val_batch_size: 1
   num_workers: 20
   prefetch_factor: 4
   val_split: 0.1
@@ -32,7 +32,7 @@ model:
   embedding_dim: 1280
   head:
     type: mlp
-    hidden_dims: [1280,640]
+    hidden_dims: [640]
     activation: relu
     dropout: 0.2
     use_output_softplus: true
@@ -48,7 +48,8 @@ peft:
   last_k_blocks: 0
   layers_pattern: blocks
   target_modules: [qkv, proj, w1, w2, w3]
-  lora_lr: 0.00005
+  lora_lr: 0.0005
+  lora_weight_decay: 0.0
 
 loss:
   weighting: uw
@@ -68,7 +69,7 @@ kfold:
   even_split: false
 
 trainer:
-  max_epochs: 20
+  max_epochs: 30
   accelerator: auto
   devices: 1
   precision: 16-mixed
