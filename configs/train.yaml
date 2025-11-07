@@ -1,5 +1,5 @@
 seed: 42
-version: h16p-lora-960-480-ndvi-augment-kfold
+version: ndvi-argument-limit-lora
 
 data:
   root: data
@@ -29,18 +29,38 @@ data:
     gaussian_blur:
       enabled: true
       kernel_size: 3
+      kernel_size_range: [3, 7]
+      prob: 0.5
       sigma: [0.1, 1.0]
     gaussian_noise:
       enabled: true
       mean: 0.0
       std: 0.01
       prob: 0.5
+    watermark:
+      enabled: true
+      prob: 0.3
+      texts: []
+      use_random_text: true
+      random_text_length_range: [3, 20]
+      timestamp_prob: 0.5
+      font_size_frac_range: [0.04, 0.12]
+      alpha_range: [128, 200]
+      # color_choices: [[255,255,255],[255,230,0],[0,255,255],[255,128,0]]
+    light_spot:
+      enabled: true
+      prob: 0.3
+      radius_frac_range: [0.06, 0.18]
+      alpha_range: [0.2, 0.6]
+      color: [255, 255, 220]
+      blur_frac: 0.5
     random_erasing:
       enabled: true
       p: 0.25
       scale: [0.02, 0.1]
       ratio: [0.3, 3.3]
       value: random
+    no_augment_prob: 0.3
   normalization:
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
@@ -72,7 +92,7 @@ mtl:
     state: false
 
 train_all:
-  enabled: false
+  enabled: true
 
 peft:
   enabled: true
@@ -82,7 +102,7 @@ peft:
   lora_alpha: 8
   lora_dropout: 0.05
   init: true
-  last_k_blocks: 0
+  last_k_blocks: 4
   layers_pattern: blocks
   target_modules: [qkv, proj, w1, w2, w3]
   lora_lr: 0.0005
