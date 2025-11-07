@@ -1,5 +1,5 @@
 seed: 42
-version: h16p-lora-960-480-ndvi-full
+version: h16p-lora-960-480-ndvi-kfold
 
 data:
   root: data
@@ -39,9 +39,14 @@ model:
 
 mtl:
   enabled: true
+  tasks:
+    height: false
+    ndvi: true
+    species: false
+    state: false
 
 train_all:
-  enabled: true
+  enabled: false
 
 peft:
   enabled: true

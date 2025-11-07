@@ -154,17 +154,44 @@ def main():
                 logger.warning(f"Constructing train_all splits failed: {e}")
                 raise
 
-        # Infer number of species classes only if MTL is enabled
+        # Task toggles (default off)
+        tasks_cfg = cfg.get("mtl", {}).get("tasks", {})
+        height_enabled = bool(tasks_cfg.get("height", False)) and mtl_enabled
+        ndvi_enabled = bool(tasks_cfg.get("ndvi", False)) and mtl_enabled
+        species_enabled = bool(tasks_cfg.get("species", False)) and mtl_enabled
+        state_enabled = bool(tasks_cfg.get("state", False)) and mtl_enabled
+
+        # Infer number of species/state classes only if corresponding tasks are enabled
         if mtl_enabled:
             try:
-                num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
-                if num_species_classes <= 1:
-                    raise ValueError("Species column has <=1 unique values")
+                if species_enabled:
+                    num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
+                    if num_species_classes <= 1:
+                        raise ValueError("Species column has <=1 unique values")
+                else:
+                    num_species_classes = None
             except Exception as e:
-                logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
-                num_species_classes = 2
+                if species_enabled:
+                    logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
+                    num_species_classes = 2
+                else:
+                    num_species_classes = None
+            try:
+                if state_enabled:
+                    num_state_classes = int(len(sorted(full_df["State"].dropna().astype(str).unique().tolist())))
+                    if num_state_classes <= 1:
+                        raise ValueError("State column has <=1 unique values")
+                else:
+                    num_state_classes = None
+            except Exception as e:
+                if state_enabled:
+                    logger.warning(f"Falling back to num_state_classes=2 (reason: {e})")
+                    num_state_classes = 2
+                else:
+                    num_state_classes = None
         else:
             num_species_classes = None
+            num_state_classes = None
 
         model = BiomassRegressor(
             backbone_name=str(cfg["model"]["backbone"]),
@@ -184,7 +211,12 @@ def main():
             max_epochs=int(cfg["trainer"]["max_epochs"]),
             loss_weighting=(str(cfg.get("loss", {}).get("weighting", "")).lower() or None),
             num_species_classes=num_species_classes,
+            num_state_classes=num_state_classes,
             mtl_enabled=mtl_enabled,
+            enable_height=height_enabled,
+            enable_ndvi=ndvi_enabled,
+            enable_species=species_enabled,
+            enable_state=state_enabled,
             peft_cfg=dict(cfg.get("peft", {})),
         )
 

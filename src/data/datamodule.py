@@ -49,12 +49,14 @@ class PastureImageDataset(Dataset):
         root_dir: str,
         target_order: Sequence[str],
         species_to_idx: Optional[dict] = None,
+        state_to_idx: Optional[dict] = None,
         transform: Optional[T.Compose] = None,
     ) -> None:
         self.records = records.reset_index(drop=True)
         self.root_dir = root_dir
         self.target_order = list(target_order)
         self.species_to_idx = dict(species_to_idx or {})
+        self.state_to_idx = dict(state_to_idx or {})
         self.transform = transform
 
     def __len__(self) -> int:
@@ -78,7 +80,13 @@ class PastureImageDataset(Dataset):
             y_species = torch.tensor(int(self.species_to_idx[species]), dtype=torch.long)
         else:
             y_species = torch.tensor(0, dtype=torch.long)
-        return {"image": image, "y_reg3": y_reg3, "y_height": y_height, "y_ndvi": y_ndvi, "y_species": y_species}
+        # auxiliary classification target: state index
+        state = str(row.get("State", ""))
+        if self.state_to_idx and state in self.state_to_idx:
+            y_state = torch.tensor(int(self.state_to_idx[state]), dtype=torch.long)
+        else:
+            y_state = torch.tensor(0, dtype=torch.long)
+        return {"image": image, "y_reg3": y_reg3, "y_height": y_height, "y_ndvi": y_ndvi, "y_species": y_species, "y_state": y_state}
 
 
 class PastureDataModule(LightningDataModule):
@@ -141,12 +149,18 @@ class PastureDataModule(LightningDataModule):
         height_series = df.groupby("image_id")["Height_Ave_cm"].first()
         ndvi_series = df.groupby("image_id")["Pre_GSHH_NDVI"].first()
         species_series = df.groupby("image_id")["Species"].first()
+        state_series = df.groupby("image_id")["State"].first()
         merged = pivot.join(image_path_series, how="inner")
-        merged = merged.join(height_series, how="left").join(ndvi_series, how="left").join(species_series, how="left")
+        merged = (
+            merged.join(height_series, how="left")
+                  .join(ndvi_series, how="left")
+                  .join(species_series, how="left")
+                  .join(state_series, how="left")
+        )
         merged = merged.dropna(subset=self.target_order)
         merged = merged.reset_index(drop=False)
         # Ensure proper column order: targets then image_path and image_id
-        cols = [*self.target_order, "Height_Ave_cm", "Pre_GSHH_NDVI", "Species", "image_path", "image_id"]
+        cols = [*self.target_order, "Height_Ave_cm", "Pre_GSHH_NDVI", "Species", "State", "image_path", "image_id"]
         merged = merged[cols]
         return merged
 
@@ -173,11 +187,13 @@ class PastureDataModule(LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         assert self.train_df is not None
         species_to_idx = self._ensure_species_mapping()
+        state_to_idx = self._ensure_state_mapping()
         ds = PastureImageDataset(
             records=self.train_df,
             root_dir=self.data_root,
             target_order=self.target_order,
             species_to_idx=species_to_idx,
+            state_to_idx=state_to_idx,
             transform=self.train_tf,
         )
         return DataLoader(
@@ -193,11 +209,13 @@ class PastureDataModule(LightningDataModule):
     def val_dataloader(self) -> DataLoader:
         assert self.val_df is not None
         species_to_idx = self._ensure_species_mapping()
+        state_to_idx = self._ensure_state_mapping()
         ds = PastureImageDataset(
             records=self.val_df,
             root_dir=self.data_root,
             target_order=self.target_order,
             species_to_idx=species_to_idx,
+            state_to_idx=state_to_idx,
             transform=self.val_tf,
         )
         return DataLoader(
@@ -222,6 +240,19 @@ class PastureDataModule(LightningDataModule):
     @property
     def num_species_classes(self) -> int:
         mapping = self._ensure_species_mapping()
+        return int(len(mapping))
+
+    def _ensure_state_mapping(self) -> dict:
+        if not hasattr(self, "_state_to_idx") or self._state_to_idx is None:
+            df_all = self._read_and_pivot()
+            uniques = sorted([str(s) for s in df_all["State"].dropna().astype(str).unique().tolist()])
+            mapping = {s: i for i, s in enumerate(uniques)}
+            self._state_to_idx = mapping
+        return self._state_to_idx
+
+    @property
+    def num_state_classes(self) -> int:
+        mapping = self._ensure_state_mapping()
         return int(len(mapping))
 
 

@@ -15,7 +15,16 @@ from src.callbacks.head_checkpoint import HeadCheckpoint
 from src.training.logging_utils import create_lightning_loggers, plot_epoch_metrics
 
 
-def _build_model(cfg: Dict, num_species_classes: int | None, mtl_enabled: bool) -> BiomassRegressor:
+def _build_model(
+    cfg: Dict,
+    num_species_classes: int | None,
+    num_state_classes: int | None,
+    mtl_enabled: bool,
+    height_enabled: bool,
+    ndvi_enabled: bool,
+    species_enabled: bool,
+    state_enabled: bool,
+) -> BiomassRegressor:
     return BiomassRegressor(
         backbone_name=str(cfg["model"]["backbone"]),
         embedding_dim=int(cfg["model"]["embedding_dim"]),
@@ -34,8 +43,13 @@ def _build_model(cfg: Dict, num_species_classes: int | None, mtl_enabled: bool) 
         max_epochs=int(cfg["trainer"]["max_epochs"]),
         loss_weighting=(str(cfg.get("loss", {}).get("weighting", "")).lower() or None),
         num_species_classes=(int(num_species_classes) if num_species_classes is not None else None),
+        num_state_classes=(int(num_state_classes) if num_state_classes is not None else None),
         peft_cfg=dict(cfg.get("peft", {})),
         mtl_enabled=mtl_enabled,
+        enable_height=height_enabled,
+        enable_ndvi=ndvi_enabled,
+        enable_species=species_enabled,
+        enable_state=state_enabled,
     )
 
 
@@ -72,19 +86,44 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
     # MTL toggle
     mtl_cfg = cfg.get("mtl", {})
     mtl_enabled = bool(mtl_cfg.get("enabled", True))
+    tasks_cfg = mtl_cfg.get("tasks", {})
+    height_enabled = bool(tasks_cfg.get("height", False)) and mtl_enabled
+    ndvi_enabled = bool(tasks_cfg.get("ndvi", False)) and mtl_enabled
+    species_enabled = bool(tasks_cfg.get("species", False)) and mtl_enabled
+    state_enabled = bool(tasks_cfg.get("state", False)) and mtl_enabled
 
     full_df = base_dm.build_full_dataframe()
-    # infer number of species classes (only if MTL enabled)
+    # infer number of species/state classes (only if tasks enabled)
     if mtl_enabled:
         try:
-            num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
-            if num_species_classes <= 1:
-                raise ValueError("Species column has <=1 unique values")
+            if species_enabled:
+                num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
+                if num_species_classes <= 1:
+                    raise ValueError("Species column has <=1 unique values")
+            else:
+                num_species_classes = None
         except Exception as e:
-            logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
-            num_species_classes = 2
+            if species_enabled:
+                logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
+                num_species_classes = 2
+            else:
+                num_species_classes = None
+        try:
+            if state_enabled:
+                num_state_classes = int(len(sorted(full_df["State"].dropna().astype(str).unique().tolist())))
+                if num_state_classes <= 1:
+                    raise ValueError("State column has <=1 unique values")
+            else:
+                num_state_classes = None
+        except Exception as e:
+            if state_enabled:
+                logger.warning(f"Falling back to num_state_classes=2 (reason: {e})")
+                num_state_classes = 2
+            else:
+                num_state_classes = None
     else:
         num_species_classes = None
+        num_state_classes = None
 
     num_folds = int(cfg.get("kfold", {}).get("k", 5))
     even_split = bool(cfg.get("kfold", {}).get("even_split", False))
@@ -171,7 +210,16 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
             predefined_val_df=val_df,
         )
 
-        model = _build_model(cfg, num_species_classes, mtl_enabled)
+        model = _build_model(
+            cfg,
+            num_species_classes,
+            num_state_classes,
+            mtl_enabled,
+            height_enabled,
+            ndvi_enabled,
+            species_enabled,
+            state_enabled,
+        )
 
         checkpoint_cb = ModelCheckpoint(
             dirpath=str(fold_ckpt_dir),
