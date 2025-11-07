@@ -152,6 +152,24 @@ def copy_optional_third_party(repo_root: Path, weights_dir: Path) -> None:
         )
 
 
+def copy_top_level_scripts(repo_root: Path, weights_dir: Path) -> list[Path]:
+    # Copy selected top-level scripts into weights/ for portability
+    script_names = [
+        "infer_and_submit_pt.py",
+        "package_artifacts.py",
+        "train.py",
+        "sanity_check.py",
+    ]
+    copied: list[Path] = []
+    for name in script_names:
+        src = repo_root / name
+        if src.is_file():
+            dst = weights_dir / name
+            shutil.copyfile(str(src), str(dst))
+            copied.append(dst)
+    return copied
+
+
 def main():
     args = parse_args()
     cfg = load_cfg(args.config)
@@ -201,11 +219,11 @@ def main():
             dst_dir.mkdir(parents=True, exist_ok=True)
             dst_path = dst_dir / "infer_head.pt"
             shutil.copyfile(str(chosen), str(dst_path))
-            exported.append(dst_path)
+            exported.append((chosen, dst_path))
 
-        print("Copied per-fold head checkpoints:")
-        for p in exported:
-            print(f" - {p}")
+        print("Copied per-fold head checkpoints (src -> dst):")
+        for src_path, dst_path in exported:
+            print(f" - {src_path} -> {dst_path}")
     else:
         # Single-run export (non-kfold)
         head_dir = ckpt_dir / "head"
@@ -228,14 +246,19 @@ def main():
             raise FileNotFoundError("Failed to determine a head checkpoint to package.")
 
         copied_head = copy_head_to_weights(chosen, weights_dir)
-        print(f"Copied head checkpoint to: {copied_head}")
+        print(f"Copied head checkpoint: {chosen} -> {copied_head}")
 
     # Copy configs and src into weights/
     repo_root = Path(__file__).parent
     copy_tree(repo_root / "configs", weights_dir / "configs")
     copy_tree(repo_root / "src", weights_dir / "src")
     copy_optional_third_party(repo_root, weights_dir)
+    scripts_copied = copy_top_level_scripts(repo_root, weights_dir)
     print(f"Copied configs/ and src/ to: {weights_dir}")
+    if scripts_copied:
+        print("Copied scripts to weights/:")
+        for p in scripts_copied:
+            print(f" - {p}")
 
 
 if __name__ == "__main__":

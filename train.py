@@ -106,6 +106,7 @@ def main():
             std=list(cfg["data"]["normalization"]["std"]),
             train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
             hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
+            augment_cfg=dict(cfg["data"].get("augment", {})),
             shuffle=bool(cfg["data"].get("shuffle", True)),
         )
 
@@ -146,6 +147,7 @@ def main():
                     std=list(cfg["data"]["normalization"]["std"]),
                     train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
                     hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
+                    augment_cfg=dict(cfg["data"].get("augment", {})),
                     shuffle=bool(cfg["data"].get("shuffle", True)),
                     predefined_train_df=train_df,
                     predefined_val_df=val_df,

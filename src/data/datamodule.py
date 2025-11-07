@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -9,6 +9,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 from lightning.pytorch import LightningDataModule
+from src.data.augmentations import build_transforms as build_aug_transforms
 
 
 @dataclass
@@ -17,29 +18,18 @@ class NormalizationSpec:
     std: Sequence[float]
 
 
-def build_transforms(
-    image_size: Union[int, Tuple[int, int]],
-    mean: Sequence[float],
-    std: Sequence[float],
-    train_scale: Tuple[float, float] = (0.8, 1.0),
-    hflip_prob: float = 0.5,
-):
-    train_tf = T.Compose(
-        [
-            T.RandomResizedCrop(image_size, scale=train_scale),
-            T.RandomHorizontalFlip(p=hflip_prob),
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-        ]
-    )
-    val_tf = T.Compose(
-        [
-            T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-        ]
-    )
-    return train_tf, val_tf
+def _merge_augment_cfg(
+    augment_cfg: Optional[Dict],
+    train_scale: Tuple[float, float],
+    hflip_prob: float,
+) -> Dict:
+    base = dict(augment_cfg or {})
+    # Backward-compat keys used in existing configs
+    if "random_resized_crop_scale" not in base:
+        base["random_resized_crop_scale"] = tuple(train_scale)
+    if "horizontal_flip_prob" not in base and "horizontal_flip" not in base:
+        base["horizontal_flip_prob"] = float(hflip_prob)
+    return base
 
 
 class PastureImageDataset(Dataset):
@@ -104,6 +94,7 @@ class PastureDataModule(LightningDataModule):
         std: Sequence[float],
         train_scale: Tuple[float, float] = (0.8, 1.0),
         hflip_prob: float = 0.5,
+        augment_cfg: Optional[Dict] = None,
         shuffle: bool = True,
         prefetch_factor: int = 2,
         predefined_train_df: Optional[pd.DataFrame] = None,
@@ -120,8 +111,9 @@ class PastureDataModule(LightningDataModule):
         self.val_split = float(val_split)
         self.target_order = list(target_order)
         self.shuffle = shuffle
-        self.train_tf, self.val_tf = build_transforms(
-            image_size=image_size, mean=mean, std=std, train_scale=train_scale, hflip_prob=hflip_prob
+        merged_aug = _merge_augment_cfg(augment_cfg=augment_cfg, train_scale=train_scale, hflip_prob=hflip_prob)
+        self.train_tf, self.val_tf = build_aug_transforms(
+            image_size=image_size, mean=mean, std=std, augment_cfg=merged_aug
         )
 
         self.train_df: Optional[pd.DataFrame] = None

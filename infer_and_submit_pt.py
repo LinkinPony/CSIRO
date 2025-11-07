@@ -63,6 +63,7 @@ if _PROJECT_DIR_ABS not in sys.path:
 
 from src.models.head_builder import build_head_layer  # noqa: E402
 from src.models.peft_integration import _import_peft  # noqa: E402
+from src.data.augmentations import build_eval_transform  # noqa: E402
 
 
 # ===== Weights loader (TorchScript supported, state_dict also supported) =====
@@ -141,11 +142,7 @@ class TestImageDataset(Dataset):
 
 
 def build_transforms(image_size: Tuple[int, int], mean: List[float], std: List[float]) -> T.Compose:
-    return T.Compose([
-        T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
-        T.ToTensor(),
-        T.Normalize(mean=mean, std=std),
-    ])
+    return build_eval_transform(image_size=image_size, mean=mean, std=std)
 
 
 def load_state_and_meta(pt_path: str):
