@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.optim import AdamW, Optimizer
-from torch.optim.lr_scheduler import CosineAnnealingLR, _LRScheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, _LRScheduler
 from lightning.pytorch import LightningModule
 from loguru import logger
 
@@ -30,6 +30,8 @@ class BiomassRegressor(LightningModule):
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         scheduler_name: Optional[str] = None,
+        scheduler_warmup_epochs: Optional[int] = None,
+        scheduler_warmup_start_factor: float = 0.1,
         max_epochs: Optional[int] = None,
         loss_weighting: Optional[str] = None,
         num_species_classes: Optional[int] = None,
@@ -328,8 +330,22 @@ class BiomassRegressor(LightningModule):
         optimizer: Optimizer = AdamW(param_groups)
 
         if self.hparams.scheduler_name and self.hparams.scheduler_name.lower() == "cosine":
-            max_epochs = self.hparams.max_epochs or 10
-            scheduler: _LRScheduler = CosineAnnealingLR(optimizer, T_max=max_epochs)
+            max_epochs: int = int(self.hparams.max_epochs or 10)
+            warmup_epochs: int = int(getattr(self.hparams, "scheduler_warmup_epochs", 0) or 0)
+            start_factor: float = float(getattr(self.hparams, "scheduler_warmup_start_factor", 0.1))
+
+            if warmup_epochs > 0:
+                # Linear warmup for the first N epochs, then cosine annealing
+                warmup = LinearLR(optimizer, start_factor=start_factor, total_iters=warmup_epochs)
+                cosine = CosineAnnealingLR(optimizer, T_max=max(1, max_epochs - warmup_epochs))
+                scheduler: _LRScheduler = SequentialLR(
+                    optimizer,
+                    schedulers=[warmup, cosine],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs)
+
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {

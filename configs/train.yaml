@@ -1,5 +1,5 @@
 seed: 42
-version: ndvi-argument-limit-lora
+version: ndvi-argument-1280
 
 data:
   root: data
@@ -78,7 +78,7 @@ model:
   embedding_dim: 1280
   head:
     type: mlp
-    hidden_dims: [640]
+    hidden_dims: [1280]
     activation: relu
     dropout: 0.2
     use_output_softplus: true
@@ -102,7 +102,7 @@ peft:
   lora_alpha: 8
   lora_dropout: 0.05
   init: true
-  last_k_blocks: 4
+  last_k_blocks: 0
   layers_pattern: blocks
   target_modules: [qkv, proj, w1, w2, w3]
   lora_lr: 0.0005
@@ -118,7 +118,8 @@ optimizer:
 
 scheduler:
   name: cosine
-  warmup_epochs: 1
+  warmup_epochs: 0
+  warmup_start_factor: 0.1
 
 kfold:
   enabled: true

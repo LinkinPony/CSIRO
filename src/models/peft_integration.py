@@ -77,15 +77,49 @@ def inject_lora_into_feature_extractor(
     # Compute layer indices: last K of ModuleList named by layers_pattern
     layer_indices = _compute_last_k_indices(backbone, modulelist_name=layers_pattern, last_k=last_k_blocks)
 
+    # If restricting to the last-K blocks, expand target module names to fully-qualified keys
+    # and bypass PEFT's layers_to_transform/layers_pattern filtering, which is fragile for top-level ModuleLists.
+    expanded_target_modules: Optional[List[str]] = None
+    if len(layer_indices) > 0:
+        # Normalize user-provided target_modules to a list
+        base_targets: List[str] = list(target_modules) if isinstance(target_modules, (list, tuple, set)) else [str(target_modules)]
+
+        def _maybe_add(path: str, acc: List[str]) -> None:
+            try:
+                # Verify module exists; skip silently if it does not
+                backbone.get_submodule(path)
+                acc.append(path)
+            except Exception:
+                pass
+
+        fqns: List[str] = []
+        for idx in layer_indices:
+            for t in base_targets:
+                # Attention projections
+                if t in ("qkv", "proj"):
+                    _maybe_add(f"{layers_pattern}.{idx}.attn.{t}", fqns)
+                    continue
+                # FFN projections (SwiGLU or MLP variants)
+                if t in ("w1", "w2", "w3", "fc1", "fc2"):
+                    _maybe_add(f"{layers_pattern}.{idx}.mlp.{t}", fqns)
+                    continue
+                # Fallback: try direct child under the block (least likely, but safe)
+                _maybe_add(f"{layers_pattern}.{idx}.{t}", fqns)
+
+        if len(fqns) > 0:
+            expanded_target_modules = fqns
+
+    # Build LoRA config. If we have expanded fully-qualified targets, use them and disable layer filtering.
     lora_config = LoraConfig(
         r=r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         bias="none",
         use_dora=use_dora,
-        target_modules=list(target_modules) if isinstance(target_modules, (list, tuple)) else target_modules,
-        layers_to_transform=layer_indices if len(layer_indices) > 0 else None,
-        layers_pattern=layers_pattern if len(layer_indices) > 0 else None,
+        target_modules=(expanded_target_modules if expanded_target_modules is not None else (list(target_modules) if isinstance(target_modules, (list, tuple, set)) else target_modules)),
+        # Intentionally bypass PEFT's layer filtering to avoid regex mismatch on top-level ModuleList names
+        layers_to_transform=None,
+        layers_pattern=None,
         init_lora_weights=init_lora_weights,
     )
 

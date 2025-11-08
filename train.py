@@ -210,6 +210,8 @@ def main():
             learning_rate=float(cfg["optimizer"]["lr"]),
             weight_decay=float(cfg["optimizer"]["weight_decay"]),
             scheduler_name=str(cfg.get("scheduler", {}).get("name", "")).lower() or None,
+            scheduler_warmup_epochs=int(cfg.get("scheduler", {}).get("warmup_epochs", 0) or 0),
+            scheduler_warmup_start_factor=float(cfg.get("scheduler", {}).get("warmup_start_factor", 0.1)),
             max_epochs=int(cfg["trainer"]["max_epochs"]),
             loss_weighting=(str(cfg.get("loss", {}).get("weighting", "")).lower() or None),
             num_species_classes=num_species_classes,
