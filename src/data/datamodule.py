@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 from lightning.pytorch import LightningDataModule
 from src.data.augmentations import build_transforms as build_aug_transforms
+from .ndvi_dense import NdviDenseConfig, build_ndvi_dense_dataloader
 
 
 @dataclass
@@ -99,6 +100,17 @@ class PastureDataModule(LightningDataModule):
         prefetch_factor: int = 2,
         predefined_train_df: Optional[pd.DataFrame] = None,
         predefined_val_df: Optional[pd.DataFrame] = None,
+        # Optional NDVI-dense settings
+        ndvi_dense_enabled: bool = False,
+        ndvi_dense_root: Optional[str] = None,
+        ndvi_dense_tile_size: int = 512,
+        ndvi_dense_stride: int = 448,
+        ndvi_dense_batch_size: Optional[int] = None,
+        ndvi_dense_num_workers: Optional[int] = None,
+        ndvi_dense_mean: Optional[Sequence[float]] = None,
+        ndvi_dense_std: Optional[Sequence[float]] = None,
+        ndvi_dense_hflip_prob: float = 0.5,
+        ndvi_dense_vflip_prob: float = 0.0,
     ) -> None:
         super().__init__()
         self.data_root = data_root
@@ -120,6 +132,21 @@ class PastureDataModule(LightningDataModule):
         self.val_df: Optional[pd.DataFrame] = None
         self._predefined_train_df: Optional[pd.DataFrame] = predefined_train_df
         self._predefined_val_df: Optional[pd.DataFrame] = predefined_val_df
+        # NDVI-dense config (optional)
+        self.ndvi_dense_enabled = bool(ndvi_dense_enabled)
+        self._ndvi_cfg: Optional[NdviDenseConfig] = None
+        if self.ndvi_dense_enabled and ndvi_dense_root:
+            self._ndvi_cfg = NdviDenseConfig(
+                root=str(ndvi_dense_root),
+                tile_size=int(ndvi_dense_tile_size),
+                stride=int(ndvi_dense_stride),
+                batch_size=int(ndvi_dense_batch_size if ndvi_dense_batch_size is not None else batch_size),
+                num_workers=int(ndvi_dense_num_workers if ndvi_dense_num_workers is not None else num_workers),
+                mean=list(ndvi_dense_mean) if ndvi_dense_mean is not None else list(mean),
+                std=list(ndvi_dense_std) if ndvi_dense_std is not None else list(std),
+                hflip_prob=float(ndvi_dense_hflip_prob),
+                vflip_prob=float(ndvi_dense_vflip_prob),
+            )
 
     def _read_and_pivot(self) -> pd.DataFrame:
         csv_path = os.path.join(self.data_root, self.train_csv)
@@ -188,7 +215,7 @@ class PastureDataModule(LightningDataModule):
             state_to_idx=state_to_idx,
             transform=self.train_tf,
         )
-        return DataLoader(
+        main_loader = DataLoader(
             ds,
             batch_size=self.batch_size,
             shuffle=self.shuffle,
@@ -197,6 +224,10 @@ class PastureDataModule(LightningDataModule):
             prefetch_factor=self.prefetch_factor,
             persistent_workers=bool(self.num_workers > 0),
         )
+        if self.ndvi_dense_enabled and self._ndvi_cfg is not None:
+            ndvi_loader = build_ndvi_dense_dataloader(self._ndvi_cfg, split="train")
+            return [main_loader, ndvi_loader]  # type: ignore[return-value]
+        return main_loader
 
     def val_dataloader(self) -> DataLoader:
         assert self.val_df is not None
@@ -210,7 +241,7 @@ class PastureDataModule(LightningDataModule):
             state_to_idx=state_to_idx,
             transform=self.val_tf,
         )
-        return DataLoader(
+        main_loader = DataLoader(
             ds,
             batch_size=self.val_batch_size,
             shuffle=False,
@@ -219,6 +250,13 @@ class PastureDataModule(LightningDataModule):
             prefetch_factor=self.prefetch_factor,
             persistent_workers=bool(self.num_workers > 0),
         )
+        if self.ndvi_dense_enabled and self._ndvi_cfg is not None:
+            ndvi_loader = build_ndvi_dense_dataloader(self._ndvi_cfg, split="val")
+            # Lightning supports multiple val loaders by returning a list
+            return [main_loader, ndvi_loader]  # type: ignore[return-value]
+        return main_loader
+
+    
 
     # --- Auxiliary label utilities ---
     def _ensure_species_mapping(self) -> dict:

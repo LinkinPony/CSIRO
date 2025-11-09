@@ -1,5 +1,5 @@
 seed: 42
-version: ndvi-argument-1280
+version: ndvi-dense-ndvi-gradnorm
 
 data:
   root: data
@@ -88,8 +88,13 @@ mtl:
   tasks:
     height: false
     ndvi: true
+    ndvi_dense: true
     species: false
     state: false
+  # Per-step sampling ratio within an epoch (expected proportion).
+  # ndvi_dense: probability to include NDVI-dense loss on a training step.
+  sample_ratio:
+    ndvi_dense: 0.75
 
 train_all:
   enabled: true
@@ -109,7 +114,7 @@ peft:
   lora_weight_decay: 0.0
 
 loss:
-  weighting: uw
+  weighting: gradnorm
 
 optimizer:
   name: adamw
@@ -127,10 +132,14 @@ kfold:
   even_split: false
 
 trainer:
-  max_epochs: 30
+  max_epochs: 35
   accelerator: auto
   devices: 1
   precision: 16-mixed
+  # Control per-epoch steps. Accepts int (absolute batches) or float (fraction).
+  limit_train_batches: 700
+  # With train_all enabled, we default to 1 so that validation uses only the dummy batch.
+  limit_val_batches: 1
   log_every_n_steps: 1
   resume_from: null
   accumulate_grad_batches: 8
@@ -138,7 +147,7 @@ trainer:
   gradient_clip_algorithm: norm
   swa:
     enabled: true
-    swa_lrs: 0.0005
+    swa_lrs: 0.0001
     swa_epoch_start: 0.8
     annealing_epochs: 5
     annealing_strategy: cos
@@ -147,3 +156,18 @@ logging:
   log_dir: outputs
   ckpt_dir: outputs/checkpoints
   use_loguru: true
+
+# Dense NDVI task configuration (tiles from large PNGs under data/NDVI/{carrot,onion}/)
+ndvi_dense:
+  enabled: true
+  root: /media/dl/dataset/Git/CSIRO/data/NDVI
+  tile_size: 512
+  tile_stride: 448
+  batch_size: 1
+  num_workers: 8
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  augment:
+    horizontal_flip_prob: 0.5
+    vertical_flip_prob: 0.0

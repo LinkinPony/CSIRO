@@ -1,4 +1,5 @@
-from typing import Optional
+from typing import Optional, Tuple
+import math
 
 import torch
 from torch import Tensor, nn
@@ -13,7 +14,7 @@ class DinoV3FeatureExtractor(nn.Module):
             parameter.requires_grad = False
         self.backbone.eval()
 
-    def _forward_impl(self, images: Tensor) -> Tensor:
+    def _forward_features_dict(self, images: Tensor):
         # Ensure AMP half inputs match backbone (float32) to avoid dtype mismatch in conv2d
         try:
             backbone_dtype = next(self.backbone.parameters()).dtype
@@ -34,6 +35,10 @@ class DinoV3FeatureExtractor(nn.Module):
                 feats = forward_features(images)
         except Exception:
             feats = self.backbone.forward_features(images)
+        return feats
+
+    def _forward_impl(self, images: Tensor) -> Tensor:
+        feats = self._forward_features_dict(images)
         return feats["x_norm_clstoken"]
 
     def forward(self, images: Tensor) -> Tensor:
@@ -41,6 +46,52 @@ class DinoV3FeatureExtractor(nn.Module):
             with torch.inference_mode():
                 return self._forward_impl(images)
         return self._forward_impl(images)
+
+    def forward_patch_tokens(self, images: Tensor) -> Tuple[Tensor, int]:
+        """
+        Returns:
+            patch_feats: Tensor of shape (B, C, H_p, W_p)
+            patch_stride: int, approximate patch size (input_size / W_p)
+        """
+        # Respect inference_only: allow gradients in training to enable LoRA updates,
+        # but run inference-mode for memory/throughput when not training.
+        if self.inference_only:
+            with torch.inference_mode():
+                return self._forward_patch_tokens_impl(images)
+        return self._forward_patch_tokens_impl(images)
+
+    def _forward_patch_tokens_impl(self, images: Tensor) -> Tuple[Tensor, int]:
+        feats = self._forward_features_dict(images)
+        # Try common keys
+        pt = None
+        for k in ("x_norm_patchtokens", "x_norm_patch_tokens", "x_patch_tokens", "x_tokens"):
+            if isinstance(feats, dict) and k in feats:
+                pt = feats[k]
+                break
+        if pt is None:
+            # Fallback: some implementations return tuple (cls, patches)
+            if isinstance(feats, (list, tuple)) and len(feats) >= 2:
+                pt = feats[1]
+        if pt is None:
+            # As last resort, try to reconstruct from a known attribute
+            raise RuntimeError("Backbone did not return patch tokens in forward_features output")
+        # pt: (B, N, C)
+        if pt.dim() != 3:
+            raise RuntimeError(f"Unexpected patch tokens shape: {tuple(pt.shape)}")
+        B, N, C = pt.shape
+        # Assume square grid
+        side = int(math.sqrt(N))
+        if side * side != N:
+            # Try to fall back to input size if divisible by 16
+            # This assumes square input tiles
+            side = int(round(math.sqrt(N)))
+        if side <= 0:
+            raise RuntimeError(f"Cannot infer patch grid from N={N}")
+        patch_feats = pt.transpose(1, 2).contiguous().view(B, C, side, side)
+        # Approximate stride from input size (square tile assumption)
+        in_h = images.shape[-2]
+        patch_stride = max(1, in_h // side)
+        return patch_feats, patch_stride
 
 
 def load_dinov3_vitl16(

@@ -112,4 +112,30 @@ class HeadCheckpoint(Callback):
         out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}{metrics_suffix}.pt")
         torch.save(state, out_path)
 
+        # Save NDVI dense head separately if present
+        try:
+            ndvi_head = getattr(pl_module, "ndvi_dense_head", None)
+            fe = getattr(pl_module, "feature_extractor", None)
+            if ndvi_head is not None:
+                ndvi_state = {
+                    "state_dict": ndvi_head.state_dict(),
+                    "meta": {
+                        "backbone": getattr(pl_module.hparams, "backbone_name", None) if hasattr(pl_module, "hparams") else None,
+                        "embedding_dim": int(getattr(pl_module.hparams, "embedding_dim", 1024)) if hasattr(pl_module, "hparams") else 1024,
+                        "out_channels": 1,
+                        "head_type": "ndvi_dense_linear",
+                    },
+                }
+                try:
+                    if fe is not None and hasattr(fe, "backbone"):
+                        peft_payload = export_lora_payload_if_any(fe.backbone)
+                        if peft_payload is not None:
+                            ndvi_state["peft"] = peft_payload
+                except Exception:
+                    pass
+                ndvi_path = os.path.join(self.output_dir, f"head-ndvi-epoch{epoch:03d}.pt")
+                torch.save(ndvi_state, ndvi_path)
+        except Exception:
+            pass
+
 

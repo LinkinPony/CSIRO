@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +11,7 @@ from loguru import logger
 from .backbone import build_feature_extractor
 from .peft_integration import inject_lora_into_feature_extractor, get_lora_param_list
 from .head_builder import build_head_layer
+from .dense_heads import NdviDenseHead
 
 
 class BiomassRegressor(LightningModule):
@@ -38,8 +39,10 @@ class BiomassRegressor(LightningModule):
         num_state_classes: Optional[int] = None,
         peft_cfg: Optional[Dict[str, Any]] = None,
         mtl_enabled: bool = True,
+        ndvi_dense_prob: Optional[float] = None,
         enable_height: bool = False,
         enable_ndvi: bool = False,
+        enable_ndvi_dense: bool = False,
         enable_species: bool = False,
         enable_state: bool = False,
     ) -> None:
@@ -104,12 +107,21 @@ class BiomassRegressor(LightningModule):
         # Per-task toggles (gated by global MTL flag)
         self.enable_height = bool(enable_height) and self.mtl_enabled
         self.enable_ndvi = bool(enable_ndvi) and self.mtl_enabled
+        self.enable_ndvi_dense = bool(enable_ndvi_dense) and self.mtl_enabled
         self.enable_species = bool(enable_species) and self.mtl_enabled
         self.enable_state = bool(enable_state) and self.mtl_enabled
+        # Probability to include NDVI-dense step on each training step (approximate per-epoch ratio)
+        if ndvi_dense_prob is None:
+            base_prob = 1.0 if self.enable_ndvi_dense else 0.0
+        else:
+            base_prob = float(ndvi_dense_prob)
+        # clamp to [0,1]
+        self._ndvi_dense_prob: float = float(max(0.0, min(1.0, base_prob)))
 
         # Instantiate only enabled heads
         self.height_head = nn.Linear(bottleneck_dim, 1) if self.enable_height else None  # type: ignore[assignment]
         self.ndvi_head = nn.Linear(bottleneck_dim, 1) if self.enable_ndvi else None  # type: ignore[assignment]
+        self.ndvi_dense_head = NdviDenseHead(in_channels=embedding_dim, out_channels=1, use_batchnorm=True) if self.enable_ndvi_dense else None  # type: ignore[assignment]
         if self.enable_species:
             if num_species_classes is None or int(num_species_classes) <= 1:
                 raise ValueError("num_species_classes must be provided (>1) when species task is enabled")
@@ -130,21 +142,22 @@ class BiomassRegressor(LightningModule):
 
         # Uncertainty Weighting (UW) parameters (optional)
         self.loss_weighting: Optional[str] = (loss_weighting.lower() if loss_weighting else None)
-        # Determine active tasks for UW/equal weighting (always include reg3 if any aux enabled)
-        active_aux: List[str] = []
-        if self.enable_height:
-            active_aux.append("height")
-        if self.enable_ndvi:
-            active_aux.append("ndvi")
-        if self.enable_species:
-            active_aux.append("species")
-        if self.enable_state:
-            active_aux.append("state")
-        self._uw_task_names: List[str] = ["reg3", *active_aux] if len(active_aux) > 0 else ["reg3"]
-        if self.mtl_enabled and len(active_aux) > 0 and self.loss_weighting == "uw":
-            self.uw_logvars = nn.Parameter(torch.zeros(len(self._uw_task_names)))
-        else:
-            self.uw_logvars = None
+        # Per-task UW parameters (dynamic per batch to avoid size mismatch)
+        self._uw_task_params: Optional[nn.ParameterDict] = None
+        if self.mtl_enabled and self.loss_weighting == "uw":
+            task_names: List[str] = ["reg3"]
+            if self.enable_height:
+                task_names.append("height")
+            if self.enable_ndvi:
+                task_names.append("ndvi")
+            if self.enable_species:
+                task_names.append("species")
+            if self.enable_state:
+                task_names.append("state")
+            if self.enable_ndvi_dense:
+                task_names.append("ndvi_dense")
+            pdict = nn.ParameterDict({name: nn.Parameter(torch.zeros(1)) for name in task_names})
+            self._uw_task_params = pdict
 
         # buffers for epoch-wise metrics on validation set
         self._val_preds: list[Tensor] = []
@@ -159,7 +172,93 @@ class BiomassRegressor(LightningModule):
             out = self.out_softplus(out)
         return out
 
+    def _uw_sum(self, named_losses: List[Tuple[str, Tensor]]) -> Tensor:
+        if self.loss_weighting != "uw" or self._uw_task_params is None or len(named_losses) == 0:
+            return torch.stack([loss for _, loss in named_losses]).mean()
+        total = 0.0
+        for name, loss in named_losses:
+            s = self._uw_task_params.get(name, None)
+            if s is None:
+                # If this task wasn't registered at init, fall back to equal weighting
+                total = total + loss
+            else:
+                total = total + 0.5 * (torch.exp(-s) * loss + s)
+        # Normalize by number of tasks for scale stability
+        return total if len(named_losses) == 1 else (total / len(named_losses))
+
+    def _log_uw_parameters(self, stage: str) -> None:
+        """
+        Log UW parameters per task:
+          - {stage}_uw_logvar_{task}: s (log variance)
+          - {stage}_uw_sigma_{task}: sigma = exp(0.5 * s)
+        """
+        if self.loss_weighting != "uw" or self._uw_task_params is None:
+            return
+        for name, s_param in self._uw_task_params.items():
+            try:
+                s = s_param.detach()
+            except Exception:
+                s = s_param
+            sigma = torch.exp(0.5 * s)
+            # Ensure scalar logging
+            self.log(f"{stage}_uw_logvar_{name}", s.squeeze(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
+            self.log(f"{stage}_uw_sigma_{name}", sigma.squeeze(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
+
+    def _shared_step_ndvi_dense(self, batch: Any, stage: str) -> Dict[str, Tensor]:
+        images: Tensor = batch["image"]
+        y_map: Tensor = batch["ndvi_dense"]  # (B,1,H,W)
+        mask: Tensor = batch.get("ndvi_mask", torch.ones_like(y_map, dtype=torch.bool))
+        # Extract patch grid features
+        patch_feats, _ = self.feature_extractor.forward_patch_tokens(images)
+        pred_lowres = self.ndvi_dense_head(patch_feats)  # type: ignore[operator]
+        # Upsample to image/tile size
+        pred = F.interpolate(pred_lowres, size=(y_map.shape[-2], y_map.shape[-1]), mode="bilinear", align_corners=False)
+        # Masked L1 loss
+        valid = mask.to(dtype=torch.bool)
+        denom = valid.sum().clamp_min(1)
+        l1 = (torch.abs(pred - y_map) * valid).sum() / denom
+        self.log(f"{stage}_loss_ndvi_dense", l1, on_step=False, on_epoch=True, prog_bar=(stage != "train"))
+        # Secondary metric: RMSE
+        rmse = torch.sqrt(((pred - y_map) ** 2 * valid).sum() / denom)
+        self.log(f"{stage}_rmse_ndvi_dense", rmse, on_step=False, on_epoch=True, prog_bar=False)
+        total = self._uw_sum([("ndvi_dense", l1)])
+        self.log(f"{stage}_loss", total, on_step=False, on_epoch=True, prog_bar=True)
+        return {"loss": total}
+
     def _shared_step(self, batch: Any, stage: str) -> Dict[str, Tensor]:
+        # When multiple dataloaders are used, Lightning may deliver a list/tuple of batches
+        # For alternating training, process only ONE sub-batch per step to avoid holding multiple graphs.
+        if isinstance(batch, (list, tuple)):
+            # Flatten potential nested structures
+            flat_batches: List[Any] = []
+            for sub in batch:
+                if isinstance(sub, (list, tuple)):
+                    for sb in sub:
+                        flat_batches.append(sb)
+                else:
+                    flat_batches.append(sub)
+            # Decide whether to use NDVI-dense this step (train only)
+            use_ndvi_dense = False
+            if stage == "train" and self.enable_ndvi_dense:
+                try:
+                    use_ndvi_dense = bool(torch.rand(()) < self._ndvi_dense_prob)
+                except Exception:
+                    use_ndvi_dense = False
+            # Select one sub-batch according to the decision
+            selected: Optional[Any] = None
+            if use_ndvi_dense:
+                selected = next((x for x in flat_batches if isinstance(x, dict) and ("ndvi_dense" in x)), None)
+            else:
+                selected = next((x for x in flat_batches if isinstance(x, dict) and ("ndvi_dense" not in x)), None)
+            # Fallback: pick any dict-like batch if preferred type not found
+            if selected is None:
+                selected = next((x for x in flat_batches if isinstance(x, dict)), flat_batches[0])
+            return self._shared_step(selected, stage)
+
+        # NDVI dense dataset path
+        if "ndvi_dense" in batch:
+            return self._shared_step_ndvi_dense(batch, stage)
+
         # batch is a dict from the dataset
         images: Tensor = batch["image"]
         y_reg3: Tensor = batch["y_reg3"]  # (B,3)
@@ -209,7 +308,7 @@ class BiomassRegressor(LightningModule):
         self.log(f"{stage}_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
 
         # Collect losses in consistent order for UW/equal weighting
-        losses: List[Tensor] = [loss_reg3]
+        named_losses: List[Tuple[str, Tensor]] = [("reg3", loss_reg3)]
         mae_reg3 = F.l1_loss(pred_reg3, y_reg3)
         self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
         with torch.no_grad():
@@ -223,43 +322,30 @@ class BiomassRegressor(LightningModule):
             self.log(f"{stage}_mse_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
             mae_height = F.l1_loss(pred_height, y_height)  # type: ignore[arg-type]
             self.log(f"{stage}_mae_height", mae_height, on_step=False, on_epoch=True, prog_bar=False)
-            losses.append(loss_height)
+            named_losses.append(("height", loss_height))
         if self.enable_ndvi:
             loss_ndvi = F.mse_loss(pred_ndvi, y_ndvi)  # type: ignore[arg-type]
             self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             mae_ndvi = F.l1_loss(pred_ndvi, y_ndvi)  # type: ignore[arg-type]
             self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
-            losses.append(loss_ndvi)
+            named_losses.append(("ndvi", loss_ndvi))
         if self.enable_species and logits_species is not None:
             loss_species = F.cross_entropy(logits_species, y_species)
             self.log(f"{stage}_loss_species", loss_species, on_step=False, on_epoch=True, prog_bar=False)
             with torch.no_grad():
                 acc_species = (logits_species.argmax(dim=-1) == y_species).float().mean()
             self.log(f"{stage}_acc_species", acc_species, on_step=False, on_epoch=True, prog_bar=False)
-            losses.append(loss_species)
+            named_losses.append(("species", loss_species))
         if self.enable_state and logits_state is not None:
             loss_state = F.cross_entropy(logits_state, y_state)
             self.log(f"{stage}_loss_state", loss_state, on_step=False, on_epoch=True, prog_bar=False)
             with torch.no_grad():
                 acc_state = (logits_state.argmax(dim=-1) == y_state).float().mean()
             self.log(f"{stage}_acc_state", acc_state, on_step=False, on_epoch=True, prog_bar=False)
-            losses.append(loss_state)
+            named_losses.append(("state", loss_state))
 
-        # UW over active tasks or equal weighting
-        if self.mtl_enabled and len(losses) > 1 and self.loss_weighting == "uw":
-            s = self.uw_logvars  # type: ignore[operator]
-            losses_vec = torch.stack(losses)
-            total_loss = 0.5 * torch.sum(torch.exp(-s) * losses_vec + s)
-            with torch.no_grad():
-                w_eff = 0.5 * torch.exp(-s)
-                sigma = torch.exp(0.5 * s)
-                for i, name in enumerate(self._uw_task_names):
-                    self.log(f"{stage}_uw_w_{name}", w_eff[i], on_step=False, on_epoch=True, prog_bar=False)
-                    self.log(f"{stage}_uw_logvar_{name}", s[i], on_step=False, on_epoch=True, prog_bar=False)
-                    self.log(f"{stage}_uw_sigma_{name}", sigma[i], on_step=False, on_epoch=True, prog_bar=False)
-        else:
-            total_loss = torch.stack(losses).mean()
+        total_loss = self._uw_sum(named_losses)
 
         # overall metrics for backward-compat
         mae = F.l1_loss(pred_reg3, y_reg3)
@@ -275,19 +361,50 @@ class BiomassRegressor(LightningModule):
             "targets": y_reg3,
         }
 
-    def training_step(self, batch: Any, batch_idx: int):
+    def training_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         return self._shared_step(batch, stage="train")["loss"]
 
-    def validation_step(self, batch: Any, batch_idx: int):
+    # Guard optimizer stepping to avoid AMP GradScaler assertion when no grads were produced
+    def optimizer_step(
+        self,
+        epoch: int,
+        batch_idx: int,
+        optimizer: Optimizer,
+        optimizer_closure,
+        **kwargs: Any,
+    ) -> None:
+        # Run closure to compute backward
+        closure_out = optimizer_closure()
+        # Check if any parameter has gradients; if not, skip stepping
+        has_grad = False
+        for group in optimizer.param_groups:
+            for p in group.get("params", []):
+                if getattr(p, "grad", None) is not None:
+                    has_grad = True
+                    break
+            if has_grad:
+                break
+        if not has_grad:
+            # No gradients this step (e.g., auxiliary-only step got skipped); avoid scaler.step assertion
+            return
+        # Proceed with default stepping
+        optimizer.step(closure=optimizer_closure)
+        optimizer.zero_grad(set_to_none=True)
+
+    def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         out = self._shared_step(batch, stage="val")
-        self._val_preds.append(out["preds"].detach().float().cpu())
-        self._val_targets.append(out["targets"].detach().float().cpu())
+        # Only aggregate main regression predictions for val_r2
+        if "preds" in out and "targets" in out:
+            self._val_preds.append(out["preds"].detach().float().cpu())
+            self._val_targets.append(out["targets"].detach().float().cpu())
 
     def on_validation_epoch_start(self) -> None:
         self._val_preds.clear()
         self._val_targets.clear()
 
     def on_validation_epoch_end(self) -> None:
+        # Always log UW parameters for validation epoch
+        self._log_uw_parameters("val")
         if len(self._val_preds) == 0:
             return
         preds = torch.cat(self._val_preds, dim=0)
@@ -298,6 +415,10 @@ class BiomassRegressor(LightningModule):
         ss_tot = torch.sum((targets - mean_t) ** 2)
         r2 = 1.0 - (ss_res / (ss_tot + 1e-8))
         self.log("val_r2", r2, on_step=False, on_epoch=True, prog_bar=True)
+
+    def on_train_epoch_end(self) -> None:
+        # Log UW parameters for training epoch
+        self._log_uw_parameters("train")
 
     def configure_optimizers(self):
         # Separate parameter groups: LoRA adapters (smaller LR) and the rest (head, optionally others)

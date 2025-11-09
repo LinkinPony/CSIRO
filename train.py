@@ -108,6 +108,17 @@ def main():
             hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
             augment_cfg=dict(cfg["data"].get("augment", {})),
             shuffle=bool(cfg["data"].get("shuffle", True)),
+            # NDVI dense (optional)
+            ndvi_dense_enabled=bool(cfg.get("ndvi_dense", {}).get("enabled", False)),
+            ndvi_dense_root=str(cfg.get("ndvi_dense", {}).get("root", "")) if cfg.get("ndvi_dense", {}).get("root", None) is not None else None,
+            ndvi_dense_tile_size=int(cfg.get("ndvi_dense", {}).get("tile_size", 512)),
+            ndvi_dense_stride=int(cfg.get("ndvi_dense", {}).get("tile_stride", cfg.get("ndvi_dense", {}).get("stride", 448))),
+            ndvi_dense_batch_size=int(cfg.get("ndvi_dense", {}).get("batch_size", cfg["data"]["batch_size"])),
+            ndvi_dense_num_workers=int(cfg.get("ndvi_dense", {}).get("num_workers", cfg["data"]["num_workers"])),
+            ndvi_dense_mean=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("mean", cfg["data"]["normalization"]["mean"])),
+            ndvi_dense_std=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("std", cfg["data"]["normalization"]["std"])),
+            ndvi_dense_hflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("horizontal_flip_prob", cfg["data"]["augment"]["horizontal_flip_prob"])),
+            ndvi_dense_vflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("vertical_flip_prob", 0.0)),
         )
 
         # MTL toggle: when disabled, train only reg3 task
@@ -151,6 +162,17 @@ def main():
                     shuffle=bool(cfg["data"].get("shuffle", True)),
                     predefined_train_df=train_df,
                     predefined_val_df=val_df,
+                    # Ensure NDVI dense remains enabled under train_all mode
+                    ndvi_dense_enabled=bool(cfg.get("ndvi_dense", {}).get("enabled", False)),
+                    ndvi_dense_root=str(cfg.get("ndvi_dense", {}).get("root", "")) if cfg.get("ndvi_dense", {}).get("root", None) is not None else None,
+                    ndvi_dense_tile_size=int(cfg.get("ndvi_dense", {}).get("tile_size", 512)),
+                    ndvi_dense_stride=int(cfg.get("ndvi_dense", {}).get("tile_stride", cfg.get("ndvi_dense", {}).get("stride", 448))),
+                    ndvi_dense_batch_size=int(cfg.get("ndvi_dense", {}).get("batch_size", cfg["data"]["batch_size"])),
+                    ndvi_dense_num_workers=int(cfg.get("ndvi_dense", {}).get("num_workers", cfg["data"]["num_workers"])),
+                    ndvi_dense_mean=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("mean", cfg["data"]["normalization"]["mean"])),
+                    ndvi_dense_std=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("std", cfg["data"]["normalization"]["std"])),
+                    ndvi_dense_hflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("horizontal_flip_prob", cfg["data"]["augment"]["horizontal_flip_prob"])),
+                    ndvi_dense_vflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("vertical_flip_prob", 0.0)),
                 )
             except Exception as e:
                 logger.warning(f"Constructing train_all splits failed: {e}")
@@ -160,6 +182,7 @@ def main():
         tasks_cfg = cfg.get("mtl", {}).get("tasks", {})
         height_enabled = bool(tasks_cfg.get("height", False)) and mtl_enabled
         ndvi_enabled = bool(tasks_cfg.get("ndvi", False)) and mtl_enabled
+        ndvi_dense_enabled = bool(tasks_cfg.get("ndvi_dense", False)) and mtl_enabled
         species_enabled = bool(tasks_cfg.get("species", False)) and mtl_enabled
         state_enabled = bool(tasks_cfg.get("state", False)) and mtl_enabled
 
@@ -217,8 +240,11 @@ def main():
             num_species_classes=num_species_classes,
             num_state_classes=num_state_classes,
             mtl_enabled=mtl_enabled,
+            # Task sampling ratio: probability to include NDVI-dense on a training step
+            ndvi_dense_prob=float(cfg.get("mtl", {}).get("sample_ratio", {}).get("ndvi_dense", 1.0 if ndvi_dense_enabled else 0.0)),
             enable_height=height_enabled,
             enable_ndvi=ndvi_enabled,
+            enable_ndvi_dense=ndvi_dense_enabled,
             enable_species=species_enabled,
             enable_state=state_enabled,
             peft_cfg=dict(cfg.get("peft", {})),
@@ -228,7 +254,7 @@ def main():
             dirpath=str(ckpt_dir),
             filename="best",
             auto_insert_metric_name=False,
-            monitor="val_loss",
+            monitor="val_loss/dataloader_idx_0",
             mode="min",
             save_top_k=1,
             save_last=True,
@@ -262,6 +288,8 @@ def main():
             accelerator=str(cfg["trainer"]["accelerator"]),
             devices=cfg["trainer"]["devices"],
             precision=cfg["trainer"]["precision"],
+            limit_train_batches=cfg["trainer"].get("limit_train_batches", 1.0),
+            limit_val_batches=(cfg["trainer"].get("limit_val_batches", 1 if train_all_enabled else 1.0)),
             callbacks=callbacks,
             logger=[csv_logger, tb_logger],
             log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
