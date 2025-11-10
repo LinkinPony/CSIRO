@@ -79,7 +79,8 @@ class BiomassRegressor(LightningModule):
         hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
         act_name = head_activation
         layers: List[nn.Module] = []
-        in_dim = embedding_dim
+        # Backbone feature now returns CLS concat mean(patch) → 2 * embedding_dim
+        in_dim = embedding_dim * 2
         if dropout and dropout > 0:
             layers.append(nn.Dropout(dropout))
         def _act():

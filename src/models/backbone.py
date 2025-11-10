@@ -39,7 +39,27 @@ class DinoV3FeatureExtractor(nn.Module):
 
     def _forward_impl(self, images: Tensor) -> Tensor:
         feats = self._forward_features_dict(images)
-        return feats["x_norm_clstoken"]
+        # CLS token (B, C)
+        cls = feats.get("x_norm_clstoken", None)
+        if cls is None:
+            raise RuntimeError("Backbone did not return 'x_norm_clstoken' in forward_features output")
+        # Patch tokens (B, N, C), try common keys and fallbacks
+        pt = None
+        for k in ("x_norm_patchtokens", "x_norm_patch_tokens", "x_patch_tokens", "x_tokens"):
+            if isinstance(feats, dict) and k in feats:
+                pt = feats[k]
+                break
+        if pt is None and isinstance(feats, (list, tuple)) and len(feats) >= 2:
+            # Fallback: some implementations return tuple (cls, patches)
+            pt = feats[1]
+        if pt is None:
+            raise RuntimeError("Backbone did not return patch tokens in forward_features output")
+        if pt.dim() != 3:
+            raise RuntimeError(f"Unexpected patch tokens shape: {tuple(pt.shape)}")
+        # Mean over patch tokens (B, C)
+        patch_mean = pt.mean(dim=1)
+        # Concatenate CLS with mean patch token -> (B, 2C)
+        return torch.cat([cls, patch_mean], dim=-1)
 
     def forward(self, images: Tensor) -> Tensor:
         if self.inference_only:

@@ -1,5 +1,5 @@
 seed: 42
-version: ndvi-dense-ndvi-gradnorm
+version: ndvi-dense-cls-patch
 
 data:
   root: data
@@ -114,7 +114,7 @@ peft:
   lora_weight_decay: 0.0
 
 loss:
-  weighting: gradnorm
+  weighting: uw
 
 optimizer:
   name: adamw

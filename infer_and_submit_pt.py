@@ -192,7 +192,23 @@ class DinoV3FeatureExtractor(nn.Module):
                 feats = forward_features(images)
         except Exception:
             feats = self.backbone.forward_features(images)
-        return feats["x_norm_clstoken"]
+        # Build CLS + mean(patch) features
+        cls = feats.get("x_norm_clstoken", None)
+        if cls is None:
+            raise RuntimeError("Backbone did not return 'x_norm_clstoken' in forward_features output")
+        pt = None
+        for k in ("x_norm_patchtokens", "x_norm_patch_tokens", "x_patch_tokens", "x_tokens"):
+            if isinstance(feats, dict) and k in feats:
+                pt = feats[k]
+                break
+        if pt is None and isinstance(feats, (list, tuple)) and len(feats) >= 2:
+            pt = feats[1]
+        if pt is None:
+            raise RuntimeError("Backbone did not return patch tokens in forward_features output")
+        if pt.dim() != 3:
+            raise RuntimeError(f"Unexpected patch tokens shape: {tuple(pt.shape)}")
+        patch_mean = pt.mean(dim=1)
+        return torch.cat([cls, patch_mean], dim=-1)
 
 
 class OfflineRegressor(nn.Module):

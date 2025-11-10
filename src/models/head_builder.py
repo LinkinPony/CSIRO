@@ -24,7 +24,8 @@ def build_head_layer(
 ) -> nn.Sequential:
     hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
     layers: List[nn.Module] = []
-    in_dim = embedding_dim
+    # Feature extractor provides CLS concat mean(patch) → 2 * embedding_dim
+    in_dim = embedding_dim * 2
     act = _build_activation(head_activation)
 
     if dropout and dropout > 0:
