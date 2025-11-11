@@ -1,5 +1,5 @@
 seed: 42
-version: ndvi-dense-cls-patch
+version: ndvi-dense-shift-target
 
 data:
   root: data
@@ -11,7 +11,7 @@ data:
   prefetch_factor: 4
   val_split: 0.1
   shuffle: true
-  target_order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
+  target_order: [Dry_Green_g, Dry_Total_g, Dry_Clover_g]
   augment:
     random_resized_crop_scale: [0.8, 1.0]
     horizontal_flip_prob: 0.5

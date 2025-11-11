@@ -337,8 +337,8 @@ def predict_for_images(
             outputs = model(images)
             outputs = outputs.detach().cpu().float().tolist()
             for rel_path, vec in zip(rel_paths, outputs):
-                dc, dd, dg = float(vec[0]), float(vec[1]), float(vec[2])
-                preds[rel_path] = (dc, dd, dg)
+                v0, v1, v2 = float(vec[0]), float(vec[1]), float(vec[2])
+                preds[rel_path] = (v0, v1, v2)
     return preds
 
 
@@ -468,8 +468,8 @@ def main():
     # Build mapping from image path to base predictions
     image_to_base_preds: Dict[str, Tuple[float, float, float]] = {}
     for rel_path, vec in zip(rels_in_order, avg_preds):
-        dc, dd, dg = float(vec[0]), float(vec[1]), float(vec[2])
-        image_to_base_preds[rel_path] = (dc, dd, dg)
+        v0, v1, v2 = float(vec[0]), float(vec[1]), float(vec[2])
+        image_to_base_preds[rel_path] = (v0, v1, v2)
 
     # Build submission
     rows = []
@@ -477,17 +477,37 @@ def main():
         sample_id = str(r["sample_id"])  # e.g., IDxxxx__Dry_Clover_g
         rel_path = str(r["image_path"])  # e.g., test/IDxxxx.jpg
         target_name = str(r["target_name"])  # one of 5
-        dc, dd, dg = image_to_base_preds.get(rel_path, (0.0, 0.0, 0.0))
-        if target_name == target_bases[0]:  # Dry_Clover_g
-            value = dc
-        elif target_name == target_bases[1]:  # Dry_Dead_g
-            value = dd
-        elif target_name == target_bases[2]:  # Dry_Green_g
-            value = dg
+        v0, v1, v2 = image_to_base_preds.get(rel_path, (0.0, 0.0, 0.0))
+        # Map base predictions by configured order
+        base_map: Dict[str, float] = {}
+        try:
+            base_map[target_bases[0]] = v0
+            base_map[target_bases[1]] = v1
+            base_map[target_bases[2]] = v2
+        except Exception:
+            base_map = {}
+        # Direct base prediction if target matches any base
+        if target_name in base_map:
+            value = base_map[target_name]
         elif target_name == "GDM_g":
-            value = dc + dg
+            # GDM_g = Dry_Clover_g + Dry_Green_g
+            value = base_map.get("Dry_Clover_g", 0.0) + base_map.get("Dry_Green_g", 0.0)
         elif target_name == "Dry_Total_g":
-            value = dc + dd + dg
+            # Prefer direct prediction if present; else sum of components when available
+            if "Dry_Total_g" in base_map:
+                value = base_map["Dry_Total_g"]
+            else:
+                value = base_map.get("Dry_Clover_g", 0.0) + base_map.get("Dry_Dead_g", 0.0) + base_map.get("Dry_Green_g", 0.0)
+        elif target_name == "Dry_Dead_g":
+            # Dry_Dead_g = Dry_Total_g - Dry_Clover_g - Dry_Green_g
+            total = base_map.get("Dry_Total_g", None)
+            clover = base_map.get("Dry_Clover_g", 0.0)
+            green = base_map.get("Dry_Green_g", 0.0)
+            if total is None:
+                # Fallback: if no direct total, but individual base dead present (legacy case)
+                value = base_map.get("Dry_Dead_g", 0.0)
+            else:
+                value = total - clover - green
         else:
             value = 0.0
         rows.append((sample_id, float(value)))

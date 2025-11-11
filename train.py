@@ -250,6 +250,9 @@ def main():
             peft_cfg=dict(cfg.get("peft", {})),
         )
 
+        head_ckpt_dir = ckpt_dir / "head"
+        callbacks = []
+        # Lightweight Lightning checkpoint (last + best) to preserve full training state, excluding backbone weights
         checkpoint_cb = ModelCheckpoint(
             dirpath=str(ckpt_dir),
             filename="best",
@@ -259,13 +262,9 @@ def main():
             save_top_k=1,
             save_last=True,
         )
-
-        head_ckpt_dir = ckpt_dir / "head"
-        callbacks = [
-            checkpoint_cb,
-            LearningRateMonitor(logging_interval="epoch"),
-            HeadCheckpoint(output_dir=str(head_ckpt_dir)),
-        ]
+        callbacks.append(checkpoint_cb)
+        callbacks.append(LearningRateMonitor(logging_interval="epoch"))
+        callbacks.append(HeadCheckpoint(output_dir=str(head_ckpt_dir)))
 
         # Optional SWA to stabilize small-batch updates (match k-fold behavior)
         swa_cfg = cfg.get("trainer", {}).get("swa", {})
@@ -296,6 +295,7 @@ def main():
             accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
             gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
             gradient_clip_algorithm=str(cfg["trainer"].get("gradient_clip_algorithm", "norm")),
+            enable_checkpointing=True,
         )
 
         last_ckpt = ckpt_dir / "last.ckpt"
