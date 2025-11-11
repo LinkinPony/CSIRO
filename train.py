@@ -240,14 +240,15 @@ def main():
             num_species_classes=num_species_classes,
             num_state_classes=num_state_classes,
             mtl_enabled=mtl_enabled,
-            # Task sampling ratio: probability to include NDVI-dense on a training step
-            ndvi_dense_prob=float(cfg.get("mtl", {}).get("sample_ratio", {}).get("ndvi_dense", 1.0 if ndvi_dense_enabled else 0.0)),
             enable_height=height_enabled,
             enable_ndvi=ndvi_enabled,
             enable_ndvi_dense=ndvi_dense_enabled,
             enable_species=species_enabled,
             enable_state=state_enabled,
             peft_cfg=dict(cfg.get("peft", {})),
+            manual_grad_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
+            manual_grad_clip_algorithm=str(cfg["trainer"].get("gradient_clip_algorithm", "norm")),
+            manual_accumulate_steps=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
         )
 
         checkpoint_cb = ModelCheckpoint(
@@ -293,8 +294,9 @@ def main():
             callbacks=callbacks,
             logger=[csv_logger, tb_logger],
             log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
-            accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
-            gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
+            # Manual optimization does not support automatic gradient accumulation
+            accumulate_grad_batches=1,
+            gradient_clip_val=0.0,
             gradient_clip_algorithm=str(cfg["trainer"].get("gradient_clip_algorithm", "norm")),
         )
 

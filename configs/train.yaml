@@ -1,5 +1,5 @@
 seed: 42
-version: ndvi-dense-cls-patch
+version: ndvi-dense-aggregate-loss-larger-dropout
 
 data:
   root: data
@@ -80,7 +80,7 @@ model:
     type: mlp
     hidden_dims: [1280]
     activation: relu
-    dropout: 0.2
+    dropout: 0.5
     use_output_softplus: true
 
 mtl:
@@ -91,10 +91,6 @@ mtl:
     ndvi_dense: true
     species: false
     state: false
-  # Per-step sampling ratio within an epoch (expected proportion).
-  # ndvi_dense: probability to include NDVI-dense loss on a training step.
-  sample_ratio:
-    ndvi_dense: 0.75
 
 train_all:
   enabled: true
@@ -105,7 +101,7 @@ peft:
   use_dora: true
   r: 8
   lora_alpha: 8
-  lora_dropout: 0.05
+  lora_dropout: 0.10
   init: true
   last_k_blocks: 0
   layers_pattern: blocks
@@ -170,4 +166,4 @@ ndvi_dense:
     std: [0.229, 0.224, 0.225]
   augment:
     horizontal_flip_prob: 0.5
-    vertical_flip_prob: 0.0
+    vertical_flip_prob: 0.5

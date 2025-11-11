@@ -39,12 +39,14 @@ class BiomassRegressor(LightningModule):
         num_state_classes: Optional[int] = None,
         peft_cfg: Optional[Dict[str, Any]] = None,
         mtl_enabled: bool = True,
-        ndvi_dense_prob: Optional[float] = None,
         enable_height: bool = False,
         enable_ndvi: bool = False,
         enable_ndvi_dense: bool = False,
         enable_species: bool = False,
         enable_state: bool = False,
+        manual_grad_clip_val: Optional[float] = None,
+        manual_grad_clip_algorithm: str = "norm",
+        manual_accumulate_steps: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -111,13 +113,13 @@ class BiomassRegressor(LightningModule):
         self.enable_ndvi_dense = bool(enable_ndvi_dense) and self.mtl_enabled
         self.enable_species = bool(enable_species) and self.mtl_enabled
         self.enable_state = bool(enable_state) and self.mtl_enabled
-        # Probability to include NDVI-dense step on each training step (approximate per-epoch ratio)
-        if ndvi_dense_prob is None:
-            base_prob = 1.0 if self.enable_ndvi_dense else 0.0
-        else:
-            base_prob = float(ndvi_dense_prob)
-        # clamp to [0,1]
-        self._ndvi_dense_prob: float = float(max(0.0, min(1.0, base_prob)))
+
+        # Manual gradient clipping config (used in manual optimization)
+        self._manual_grad_clip_val: float = float(manual_grad_clip_val if manual_grad_clip_val is not None else 0.0)
+        self._manual_grad_clip_algorithm: str = str(manual_grad_clip_algorithm or "norm")
+        # Manual accumulation steps (used because Trainer-level accumulation is unsupported in manual opt)
+        self._manual_accumulate_steps: int = int(manual_accumulate_steps if manual_accumulate_steps is not None else 1)
+        self._accumulated_steps: int = 0
 
         # Instantiate only enabled heads
         self.height_head = nn.Linear(bottleneck_dim, 1) if self.enable_height else None  # type: ignore[assignment]
@@ -145,6 +147,8 @@ class BiomassRegressor(LightningModule):
         self.loss_weighting: Optional[str] = (loss_weighting.lower() if loss_weighting else None)
         # Per-task UW parameters (dynamic per batch to avoid size mismatch)
         self._uw_task_params: Optional[nn.ParameterDict] = None
+        # Enable manual optimization for sequential micro-steps
+        self.automatic_optimization = False
         if self.mtl_enabled and self.loss_weighting == "uw":
             task_names: List[str] = ["reg3"]
             if self.enable_height:
@@ -205,7 +209,11 @@ class BiomassRegressor(LightningModule):
             self.log(f"{stage}_uw_logvar_{name}", s.squeeze(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
             self.log(f"{stage}_uw_sigma_{name}", sigma.squeeze(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
-    def _shared_step_ndvi_dense(self, batch: Any, stage: str) -> Dict[str, Tensor]:
+    def _compute_ndvi_dense_loss(self, batch: Any, stage: str) -> Tensor:
+        """
+        Compute masked L1 loss for NDVI-dense task on a dense batch.
+        Returns the scalar loss (without applying UW here).
+        """
         images: Tensor = batch["image"]
         y_map: Tensor = batch["ndvi_dense"]  # (B,1,H,W)
         mask: Tensor = batch.get("ndvi_mask", torch.ones_like(y_map, dtype=torch.bool))
@@ -222,13 +230,31 @@ class BiomassRegressor(LightningModule):
         # Secondary metric: RMSE
         rmse = torch.sqrt(((pred - y_map) ** 2 * valid).sum() / denom)
         self.log(f"{stage}_rmse_ndvi_dense", rmse, on_step=False, on_epoch=True, prog_bar=False)
+        return l1
+
+    def _shared_step_ndvi_dense(self, batch: Any, stage: str) -> Dict[str, Tensor]:
+        l1 = self._compute_ndvi_dense_loss(batch, stage)
         total = self._uw_sum([("ndvi_dense", l1)])
         self.log(f"{stage}_loss", total, on_step=False, on_epoch=True, prog_bar=True)
         return {"loss": total}
 
+    def _uw_scale_loss(self, task_name: str, base_loss: Tensor, num_tasks: int) -> Tensor:
+        """
+        Build the per-task loss term consistent with _uw_sum aggregation, scaled by 1/num_tasks.
+        For UW: 0.5 * (exp(-s) * loss + s); For equal weights: loss
+        Then, if multiple tasks, divide by num_tasks.
+        """
+        avg_factor = 1.0 if num_tasks <= 1 else (1.0 / float(num_tasks))
+        if self.loss_weighting == "uw" and self._uw_task_params is not None:
+            s = self._uw_task_params.get(task_name, None)
+            if s is not None:
+                return avg_factor * (0.5 * (torch.exp(-s) * base_loss + s))
+        # Equal weighting fallback
+        return avg_factor * base_loss
+
     def _shared_step(self, batch: Any, stage: str) -> Dict[str, Tensor]:
         # When multiple dataloaders are used, Lightning may deliver a list/tuple of batches
-        # For alternating training, process only ONE sub-batch per step to avoid holding multiple graphs.
+        # Here we aggregate losses from both main and ndvi_dense sub-batches in the same step.
         if isinstance(batch, (list, tuple)):
             # Flatten potential nested structures
             flat_batches: List[Any] = []
@@ -238,23 +264,96 @@ class BiomassRegressor(LightningModule):
                         flat_batches.append(sb)
                 else:
                     flat_batches.append(sub)
-            # Decide whether to use NDVI-dense this step (train only)
-            use_ndvi_dense = False
-            if stage == "train" and self.enable_ndvi_dense:
-                try:
-                    use_ndvi_dense = bool(torch.rand(()) < self._ndvi_dense_prob)
-                except Exception:
-                    use_ndvi_dense = False
-            # Select one sub-batch according to the decision
-            selected: Optional[Any] = None
-            if use_ndvi_dense:
-                selected = next((x for x in flat_batches if isinstance(x, dict) and ("ndvi_dense" in x)), None)
-            else:
-                selected = next((x for x in flat_batches if isinstance(x, dict) and ("ndvi_dense" not in x)), None)
-            # Fallback: pick any dict-like batch if preferred type not found
-            if selected is None:
-                selected = next((x for x in flat_batches if isinstance(x, dict)), flat_batches[0])
-            return self._shared_step(selected, stage)
+            # Identify main and ndvi_dense sub-batches
+            main_batch: Optional[Dict[str, Tensor]] = next((x for x in flat_batches if isinstance(x, dict) and ("ndvi_dense" not in x)), None)  # type: ignore[assignment]
+            ndvi_dense_batch: Optional[Dict[str, Tensor]] = next((x for x in flat_batches if isinstance(x, dict) and ("ndvi_dense" in x)), None)  # type: ignore[assignment]
+            # If neither found, fallback to processing the first dict batch
+            if main_batch is None and ndvi_dense_batch is None:
+                any_batch = next((x for x in flat_batches if isinstance(x, dict)), None)
+                return self._shared_step(any_batch, stage)  # type: ignore[arg-type]
+            # If only one exists, process it via existing paths
+            if main_batch is None:
+                return self._shared_step_ndvi_dense(ndvi_dense_batch, stage)  # type: ignore[arg-type]
+            if ndvi_dense_batch is None:
+                return self._shared_step(main_batch, stage)  # Recurse into single-path handling
+            # Otherwise, compute both paths and combine via UW
+            # --- Main path (reg3 + optional ndvi/height/species/state) ---
+            images: Tensor = main_batch["image"]
+            y_reg3: Tensor = main_batch["y_reg3"]  # (B,3)
+            y_height: Tensor = main_batch["y_height"]  # (B,1)
+            y_ndvi: Tensor = main_batch["y_ndvi"]  # (B,1)
+            y_species: Tensor = main_batch["y_species"]  # (B,)
+            y_state: Tensor = main_batch["y_state"]  # (B,)
+
+            features = self.feature_extractor(images)
+            z = self.shared_bottleneck(features)
+            pred_reg3 = self.reg_head(z)
+            if self.out_softplus is not None:
+                pred_reg3 = self.out_softplus(pred_reg3)
+
+            loss_reg3 = F.mse_loss(pred_reg3, y_reg3)
+            self.log(f"{stage}_loss_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            mae_reg3 = F.l1_loss(pred_reg3, y_reg3)
+            self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            with torch.no_grad():
+                per_dim_mse = torch.mean((pred_reg3 - y_reg3) ** 2, dim=0)
+                for i in range(per_dim_mse.shape[0]):
+                    self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
+
+            named_losses: List[Tuple[str, Tensor]] = [("reg3", loss_reg3)]
+
+            pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
+            pred_ndvi = self.ndvi_head(z) if self.enable_ndvi else None  # type: ignore[assignment]
+            logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
+            logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
+
+            if self.enable_height and pred_height is not None:
+                loss_height = F.mse_loss(pred_height, y_height)
+                self.log(f"{stage}_loss_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
+                self.log(f"{stage}_mse_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
+                mae_height = F.l1_loss(pred_height, y_height)
+                self.log(f"{stage}_mae_height", mae_height, on_step=False, on_epoch=True, prog_bar=False)
+                named_losses.append(("height", loss_height))
+            if self.enable_ndvi and pred_ndvi is not None:
+                loss_ndvi = F.mse_loss(pred_ndvi, y_ndvi)
+                self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                mae_ndvi = F.l1_loss(pred_ndvi, y_ndvi)
+                self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                named_losses.append(("ndvi", loss_ndvi))
+            if self.enable_species and logits_species is not None:
+                loss_species = F.cross_entropy(logits_species, y_species)
+                self.log(f"{stage}_loss_species", loss_species, on_step=False, on_epoch=True, prog_bar=False)
+                with torch.no_grad():
+                    acc_species = (logits_species.argmax(dim=-1) == y_species).float().mean()
+                self.log(f"{stage}_acc_species", acc_species, on_step=False, on_epoch=True, prog_bar=False)
+                named_losses.append(("species", loss_species))
+            if self.enable_state and logits_state is not None:
+                loss_state = F.cross_entropy(logits_state, y_state)
+                self.log(f"{stage}_loss_state", loss_state, on_step=False, on_epoch=True, prog_bar=False)
+                with torch.no_grad():
+                    acc_state = (logits_state.argmax(dim=-1) == y_state).float().mean()
+                self.log(f"{stage}_acc_state", acc_state, on_step=False, on_epoch=True, prog_bar=False)
+                named_losses.append(("state", loss_state))
+
+            # --- NDVI-dense path ---
+            if self.enable_ndvi_dense:
+                l1_dense = self._compute_ndvi_dense_loss(ndvi_dense_batch, stage)  # type: ignore[arg-type]
+                named_losses.append(("ndvi_dense", l1_dense))
+
+            total_loss = self._uw_sum(named_losses)
+            self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+            # Backward-compat overall metrics on main regression
+            self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            return {
+                "loss": total_loss,
+                "mae": mae_reg3,
+                "mse": loss_reg3,
+                "preds": pred_reg3,
+                "targets": y_reg3,
+            }
 
         # NDVI dense dataset path
         if "ndvi_dense" in batch:
@@ -363,7 +462,123 @@ class BiomassRegressor(LightningModule):
         }
 
     def training_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
-        return self._shared_step(batch, stage="train")["loss"]
+        """
+        Manual optimization: sequential micro-steps with UW-equivalent backward to reduce peak memory.
+        Targets UW over: reg3, ndvi, ndvi_dense (if enabled/present).
+        """
+        optimizer: Optimizer = self.optimizers()  # type: ignore[assignment]
+        total_log_terms: List[Tuple[str, Tensor]] = []
+
+        if isinstance(batch, (list, tuple)):
+            # Flatten nested
+            flat_batches: List[Any] = []
+            for sub in batch:
+                if isinstance(sub, (list, tuple)):
+                    for sb in sub:
+                        flat_batches.append(sb)
+                else:
+                    flat_batches.append(sub)
+            main_batch: Optional[Dict[str, Tensor]] = next((x for x in flat_batches if isinstance(x, dict) and ("ndvi_dense" not in x)), None)  # type: ignore[assignment]
+            ndvi_dense_batch: Optional[Dict[str, Tensor]] = next((x for x in flat_batches if isinstance(x, dict) and ("ndvi_dense" in x)), None)  # type: ignore[assignment]
+
+            # Determine included tasks
+            include_reg3 = main_batch is not None
+            include_ndvi = include_reg3 and self.enable_ndvi
+            include_ndvi_dense = (ndvi_dense_batch is not None) and self.enable_ndvi_dense
+            num_tasks = int(include_reg3) + int(include_ndvi) + int(include_ndvi_dense)
+            if num_tasks == 0:
+                return {"loss": torch.tensor(0.0, device=self.device)}
+
+            # Shared forward for reg3 and ndvi (single feature/bottleneck pass)
+            if include_reg3 and main_batch is not None:
+                images: Tensor = main_batch["image"]
+                y_reg3: Tensor = main_batch["y_reg3"]
+                features = self.feature_extractor(images)
+                z = self.shared_bottleneck(features)
+                # reg3
+                pred_reg3 = self.reg_head(z)
+                if self.out_softplus is not None:
+                    pred_reg3 = self.out_softplus(pred_reg3)
+                loss_reg3 = F.mse_loss(pred_reg3, y_reg3)
+                self.log("train_loss_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+                self.log("train_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+                mae_reg3 = F.l1_loss(pred_reg3, y_reg3)
+                self.log("train_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+                total_log_terms.append(("reg3", loss_reg3.detach()))
+                # ndvi (if enabled) using same z; build combined UW-scaled loss and backprop once
+                comb_micro: Tensor = self._uw_scale_loss("reg3", loss_reg3, num_tasks)
+                if include_ndvi:
+                    y_ndvi: Tensor = main_batch["y_ndvi"]
+                    pred_ndvi = self.ndvi_head(z)  # type: ignore[operator]
+                    loss_ndvi = F.mse_loss(pred_ndvi, y_ndvi)  # type: ignore[arg-type]
+                    self.log("train_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                    self.log("train_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                    mae_ndvi = F.l1_loss(pred_ndvi, y_ndvi)  # type: ignore[arg-type]
+                    self.log("train_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                    total_log_terms.append(("ndvi", loss_ndvi.detach()))
+                    comb_micro = comb_micro + self._uw_scale_loss("ndvi", loss_ndvi, num_tasks)
+                self.manual_backward(comb_micro)
+
+            # ndvi-dense micro-step
+            if include_ndvi_dense and ndvi_dense_batch is not None:
+                l1_dense = self._compute_ndvi_dense_loss(ndvi_dense_batch, stage="train")
+                total_log_terms.append(("ndvi_dense", l1_dense.detach()))
+                micro = self._uw_scale_loss("ndvi_dense", l1_dense, num_tasks)
+                self.manual_backward(micro)
+
+        else:
+            # Single main batch path: reg3 (+ optional ndvi)
+            images: Tensor = batch["image"]
+            y_reg3: Tensor = batch["y_reg3"]
+            include_reg3 = True
+            include_ndvi = self.enable_ndvi
+            num_tasks = int(include_reg3) + int(include_ndvi)
+
+            # Shared forward for reg3 and ndvi
+            features = self.feature_extractor(images)
+            z = self.shared_bottleneck(features)
+            # reg3
+            pred_reg3 = self.reg_head(z)
+            if self.out_softplus is not None:
+                pred_reg3 = self.out_softplus(pred_reg3)
+            loss_reg3 = F.mse_loss(pred_reg3, y_reg3)
+            self.log("train_loss_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log("train_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            mae_reg3 = F.l1_loss(pred_reg3, y_reg3)
+            self.log("train_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            total_log_terms.append(("reg3", loss_reg3.detach()))
+            comb_micro2: Tensor = self._uw_scale_loss("reg3", loss_reg3, num_tasks)
+            if include_ndvi:
+                y_ndvi: Tensor = batch["y_ndvi"]
+                pred_ndvi = self.ndvi_head(z)  # type: ignore[operator]
+                loss_ndvi = F.mse_loss(pred_ndvi, y_ndvi)  # type: ignore[arg-type]
+                self.log("train_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                self.log("train_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                mae_ndvi = F.l1_loss(pred_ndvi, y_ndvi)  # type: ignore[arg-type]
+                self.log("train_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                total_log_terms.append(("ndvi", loss_ndvi.detach()))
+                comb_micro2 = comb_micro2 + self._uw_scale_loss("ndvi", loss_ndvi, num_tasks)
+            self.manual_backward(comb_micro2)
+
+        # Manual gradient clipping and stepping according to manual accumulation
+        self._accumulated_steps += 1
+        if self._accumulated_steps % max(1, self._manual_accumulate_steps) == 0:
+            try:
+                clip_val = float(self._manual_grad_clip_val or 0.0)
+                clip_algo = str(self._manual_grad_clip_algorithm or "norm")
+                if clip_val and clip_val > 0:
+                    self.clip_gradients(optimizer, gradient_clip_val=clip_val, gradient_clip_algorithm=str(clip_algo))
+            except Exception:
+                pass
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        # Compose logging-friendly total (no-grad) consistent with _uw_sum
+        if len(total_log_terms) > 0:
+            total_log = self._uw_sum(total_log_terms)  # type: ignore[arg-type]
+            self.log("train_loss", total_log, on_step=False, on_epoch=True, prog_bar=True)
+            return {"loss": total_log}
+        return {"loss": torch.tensor(0.0, device=self.device)}
 
     # Guard optimizer stepping to avoid AMP GradScaler assertion when no grads were produced
     def optimizer_step(
@@ -420,6 +635,20 @@ class BiomassRegressor(LightningModule):
     def on_train_epoch_end(self) -> None:
         # Log UW parameters for training epoch
         self._log_uw_parameters("train")
+        # Manually step LR scheduler in manual optimization mode (epoch-based)
+        try:
+            scheds = self.lr_schedulers()
+        except Exception:
+            scheds = None
+        if scheds is not None:
+            try:
+                if isinstance(scheds, (list, tuple)):
+                    for sch in scheds:
+                        sch.step()
+                else:
+                    scheds.step()
+            except Exception:
+                pass
 
     def configure_optimizers(self):
         # Separate parameter groups: LoRA adapters (smaller LR) and the rest (head, optionally others)
