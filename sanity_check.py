@@ -211,6 +211,8 @@ def build_feature_extractor_offline(dinov3_source_dir: str, dino_weights_path: s
     try:
         if backbone_name == "dinov3_vith16plus":
             from dinov3.hub.backbones import dinov3_vith16plus as _make_backbone  # type: ignore
+        elif backbone_name == "dinov3_vit7b16":
+            from dinov3.hub.backbones import dinov3_vit7b16 as _make_backbone  # type: ignore
         elif backbone_name == "dinov3_vitl16":
             from dinov3.hub.backbones import dinov3_vitl16 as _make_backbone  # type: ignore
         else:

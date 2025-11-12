@@ -373,6 +373,8 @@ def main():
         backbone_name = str(cfg["model"]["backbone"]).strip()
         if backbone_name == "dinov3_vith16plus":
             from dinov3.hub.backbones import dinov3_vith16plus as _make_backbone  # type: ignore
+        elif backbone_name == "dinov3_vit7b16":
+            from dinov3.hub.backbones import dinov3_vit7b16 as _make_backbone  # type: ignore
         elif backbone_name == "dinov3_vitl16":
             from dinov3.hub.backbones import dinov3_vitl16 as _make_backbone  # type: ignore
         else:

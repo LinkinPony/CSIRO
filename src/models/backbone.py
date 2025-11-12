@@ -208,6 +208,33 @@ def build_feature_extractor(
             weights_url=weights_url if not weights_path else None,
             weights_path=weights_path,
         )
+    elif backbone_name == "dinov3_vit7b16":
+        # Prefer explicit offline weights if provided; else allow URL or default hub
+        if weights_path:
+            model = torch.hub.load(
+                repo_or_dir="facebookresearch/dinov3",
+                model="dinov3_vit7b16",
+                pretrained=False,
+            )
+            state = torch.load(weights_path, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            model.load_state_dict(state, strict=False)
+            backbone = model
+        elif weights_url:
+            backbone = torch.hub.load(
+                repo_or_dir="facebookresearch/dinov3",
+                model="dinov3_vit7b16",
+                pretrained=use_pretrained,
+                weights=weights_url,
+                check_hash=False,
+            )
+        else:
+            backbone = torch.hub.load(
+                repo_or_dir="facebookresearch/dinov3",
+                model="dinov3_vit7b16",
+                pretrained=use_pretrained,
+            )
     else:
         raise ValueError(f"Unsupported backbone: {backbone_name}")
     return DinoV3FeatureExtractor(backbone)
