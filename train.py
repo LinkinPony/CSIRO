@@ -92,6 +92,26 @@ def main():
         run_kfold(cfg, log_dir, ckpt_dir)
     else:
         # Regular single-split training
+        # Resolve dataset area (m^2) from config for unit conversion g <-> g/m^2
+        ds_name = str(cfg["data"].get("dataset", "csiro"))
+        ds_map = dict(cfg["data"].get("datasets", {}))
+        ds_info = dict(ds_map.get(ds_name, {}))
+        try:
+            width_m = float(ds_info.get("width_m", ds_info.get("width", 1.0)))
+        except Exception:
+            width_m = 1.0
+        try:
+            length_m = float(ds_info.get("length_m", ds_info.get("length", 1.0)))
+        except Exception:
+            length_m = 1.0
+        try:
+            area_m2 = float(ds_info.get("area_m2", width_m * length_m))
+        except Exception:
+            area_m2 = max(1.0, width_m * length_m if (width_m > 0.0 and length_m > 0.0) else 1.0)
+        if not (area_m2 > 0.0):
+            area_m2 = 1.0
+        log_scale_targets_cfg = bool(cfg["model"].get("log_scale_targets", False))
+
         dm = PastureDataModule(
             data_root=cfg["data"]["root"],
             train_csv=cfg["data"]["train_csv"],
@@ -105,6 +125,9 @@ def main():
             mean=list(cfg["data"]["normalization"]["mean"]),
             std=list(cfg["data"]["normalization"]["std"]),
             train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
+            sample_area_m2=float(area_m2),
+            zscore_output_path=str(log_dir / "z_score.json"),
+            log_scale_targets=log_scale_targets_cfg,
             hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
             augment_cfg=dict(cfg["data"].get("augment", {})),
             shuffle=bool(cfg["data"].get("shuffle", True)),
@@ -157,6 +180,9 @@ def main():
                     mean=list(cfg["data"]["normalization"]["mean"]),
                     std=list(cfg["data"]["normalization"]["std"]),
                     train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
+                    sample_area_m2=float(area_m2),
+                    zscore_output_path=str(log_dir / "z_score.json"),
+                    log_scale_targets=log_scale_targets_cfg,
                     hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
                     augment_cfg=dict(cfg["data"].get("augment", {})),
                     shuffle=bool(cfg["data"].get("shuffle", True)),
@@ -218,6 +244,12 @@ def main():
             num_species_classes = None
             num_state_classes = None
 
+        # Ensure z-score stats are computed before model init
+        try:
+            dm.setup()
+        except Exception:
+            pass
+
         model = BiomassRegressor(
             backbone_name=str(cfg["model"]["backbone"]),
             embedding_dim=int(cfg["model"]["embedding_dim"]),
@@ -227,6 +259,11 @@ def main():
             head_activation=str(cfg["model"]["head"].get("activation", "relu")),
             use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
             log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
+            area_m2=float(area_m2),
+            reg3_zscore_mean=list(dm.reg3_zscore_mean or []) if hasattr(dm, "reg3_zscore_mean") else None,
+            reg3_zscore_std=list(dm.reg3_zscore_std or []) if hasattr(dm, "reg3_zscore_std") else None,
+            ndvi_zscore_mean=float(dm.ndvi_zscore_mean) if getattr(dm, "ndvi_zscore_mean", None) is not None else None,
+            ndvi_zscore_std=float(dm.ndvi_zscore_std) if getattr(dm, "ndvi_zscore_std", None) is not None else None,
             uw_learning_rate=float(cfg.get("optimizer", {}).get("uw_lr", cfg["optimizer"]["lr"])),
             uw_weight_decay=float(cfg.get("optimizer", {}).get("uw_weight_decay", cfg["optimizer"]["weight_decay"])),
             pretrained=bool(cfg["model"].get("pretrained", True)),

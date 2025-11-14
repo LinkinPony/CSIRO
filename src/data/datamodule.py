@@ -39,6 +39,11 @@ class PastureImageDataset(Dataset):
         records: pd.DataFrame,
         root_dir: str,
         target_order: Sequence[str],
+        area_m2: float = 1.0,
+        reg3_mean: Optional[Sequence[float]] = None,
+        reg3_std: Optional[Sequence[float]] = None,
+        ndvi_mean: Optional[float] = None,
+        ndvi_std: Optional[float] = None,
         species_to_idx: Optional[dict] = None,
         state_to_idx: Optional[dict] = None,
         transform: Optional[T.Compose] = None,
@@ -46,6 +51,12 @@ class PastureImageDataset(Dataset):
         self.records = records.reset_index(drop=True)
         self.root_dir = root_dir
         self.target_order = list(target_order)
+        self.area_m2 = float(area_m2) if area_m2 is not None else 1.0
+        # z-score params
+        self._reg3_mean = torch.tensor(list(reg3_mean), dtype=torch.float32) if reg3_mean is not None else None
+        self._reg3_std = torch.tensor(list(reg3_std), dtype=torch.float32) if reg3_std is not None else None
+        self._ndvi_mean = float(ndvi_mean) if ndvi_mean is not None else None
+        self._ndvi_std = float(ndvi_std) if ndvi_std is not None else None
         self.species_to_idx = dict(species_to_idx or {})
         self.state_to_idx = dict(state_to_idx or {})
         self.transform = transform
@@ -60,11 +71,24 @@ class PastureImageDataset(Dataset):
         if self.transform is not None:
             image = self.transform(image)
         # main regression targets (triple)
-        y_reg3 = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
+        y_reg3_g = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
+        # Convert grams to grams per square meter if a valid area is provided
+        y_reg3_g_m2 = y_reg3_g / float(self.area_m2) if self.area_m2 > 0.0 else y_reg3_g
+        # Apply z-score if provided
+        if self._reg3_mean is not None and self._reg3_std is not None:
+            safe_std = torch.clamp(self._reg3_std, min=1e-8)
+            y_reg3 = (y_reg3_g_m2 - self._reg3_mean) / safe_std
+        else:
+            y_reg3 = y_reg3_g_m2
         # auxiliary regression target: height
         y_height = torch.tensor([float(row.get("Height_Ave_cm", 0.0))], dtype=torch.float32)
         # auxiliary regression target: Pre_GSHH_NDVI
-        y_ndvi = torch.tensor([float(row.get("Pre_GSHH_NDVI", 0.0))], dtype=torch.float32)
+        y_ndvi_raw = torch.tensor([float(row.get("Pre_GSHH_NDVI", 0.0))], dtype=torch.float32)
+        if self._ndvi_mean is not None and self._ndvi_std is not None:
+            ndvi_std = max(1e-8, float(self._ndvi_std))
+            y_ndvi = (y_ndvi_raw - float(self._ndvi_mean)) / ndvi_std
+        else:
+            y_ndvi = y_ndvi_raw
         # auxiliary classification target: species index
         species = str(row.get("Species", ""))
         if self.species_to_idx and species in self.species_to_idx:
@@ -77,7 +101,16 @@ class PastureImageDataset(Dataset):
             y_state = torch.tensor(int(self.state_to_idx[state]), dtype=torch.long)
         else:
             y_state = torch.tensor(0, dtype=torch.long)
-        return {"image": image, "y_reg3": y_reg3, "y_height": y_height, "y_ndvi": y_ndvi, "y_species": y_species, "y_state": y_state}
+        return {
+            "image": image,
+            "y_reg3": y_reg3,             # normalized (if stats provided)
+            "y_reg3_g_m2": y_reg3_g_m2,   # original g/m^2
+            "y_reg3_g": y_reg3_g,         # original grams
+            "y_height": y_height,
+            "y_ndvi": y_ndvi,             # normalized (if stats provided)
+            "y_species": y_species,
+            "y_state": y_state,
+        }
 
 
 class PastureDataModule(LightningDataModule):
@@ -94,6 +127,9 @@ class PastureDataModule(LightningDataModule):
         mean: Sequence[float],
         std: Sequence[float],
         train_scale: Tuple[float, float] = (0.8, 1.0),
+        sample_area_m2: float = 1.0,
+        zscore_output_path: Optional[str] = None,
+        log_scale_targets: bool = False,
         hflip_prob: float = 0.5,
         augment_cfg: Optional[Dict] = None,
         shuffle: bool = True,
@@ -123,6 +159,9 @@ class PastureDataModule(LightningDataModule):
         self.val_split = float(val_split)
         self.target_order = list(target_order)
         self.shuffle = shuffle
+        self.sample_area_m2 = float(sample_area_m2) if sample_area_m2 is not None else 1.0
+        self._zscore_output_path: Optional[str] = str(zscore_output_path) if zscore_output_path else None
+        self._log_scale_targets: bool = bool(log_scale_targets)
         merged_aug = _merge_augment_cfg(augment_cfg=augment_cfg, train_scale=train_scale, hflip_prob=hflip_prob)
         self.train_tf, self.val_tf = build_aug_transforms(
             image_size=image_size, mean=mean, std=std, augment_cfg=merged_aug
@@ -147,6 +186,11 @@ class PastureDataModule(LightningDataModule):
                 hflip_prob=float(ndvi_dense_hflip_prob),
                 vflip_prob=float(ndvi_dense_vflip_prob),
             )
+        # z-score stats (computed in setup)
+        self._reg3_mean: Optional[List[float]] = None
+        self._reg3_std: Optional[List[float]] = None
+        self._ndvi_mean: Optional[float] = None
+        self._ndvi_std: Optional[float] = None
 
     def _read_and_pivot(self) -> pd.DataFrame:
         csv_path = os.path.join(self.data_root, self.train_csv)
@@ -188,6 +232,8 @@ class PastureDataModule(LightningDataModule):
         if self._predefined_train_df is not None and self._predefined_val_df is not None:
             self.train_df = self._predefined_train_df.reset_index(drop=True)
             self.val_df = self._predefined_val_df.reset_index(drop=True)
+            self._compute_and_store_zscore_stats()
+            self._maybe_save_zscore_stats()
             return
 
         merged = self._read_and_pivot()
@@ -199,6 +245,8 @@ class PastureDataModule(LightningDataModule):
         train_idx = indices[n_val:]
         self.train_df = merged.iloc[train_idx].reset_index(drop=True)
         self.val_df = merged.iloc[val_idx].reset_index(drop=True)
+        self._compute_and_store_zscore_stats()
+        self._maybe_save_zscore_stats()
 
     def build_full_dataframe(self) -> pd.DataFrame:
         return self._read_and_pivot()
@@ -211,6 +259,11 @@ class PastureDataModule(LightningDataModule):
             records=self.train_df,
             root_dir=self.data_root,
             target_order=self.target_order,
+            area_m2=self.sample_area_m2,
+            reg3_mean=self._reg3_mean,
+            reg3_std=self._reg3_std,
+            ndvi_mean=self._ndvi_mean,
+            ndvi_std=self._ndvi_std,
             species_to_idx=species_to_idx,
             state_to_idx=state_to_idx,
             transform=self.train_tf,
@@ -230,6 +283,8 @@ class PastureDataModule(LightningDataModule):
                 split="train",
                 transform=self.train_tf,
                 reg3_dim=len(self.target_order),
+                ndvi_mean=self._ndvi_mean,
+                ndvi_std=self._ndvi_std,
             )
             return [main_loader, ndvi_loader]  # type: ignore[return-value]
         return main_loader
@@ -242,6 +297,11 @@ class PastureDataModule(LightningDataModule):
             records=self.val_df,
             root_dir=self.data_root,
             target_order=self.target_order,
+            area_m2=self.sample_area_m2,
+            reg3_mean=self._reg3_mean,
+            reg3_std=self._reg3_std,
+            ndvi_mean=self._ndvi_mean,
+            ndvi_std=self._ndvi_std,
             species_to_idx=species_to_idx,
             state_to_idx=state_to_idx,
             transform=self.val_tf,
@@ -261,6 +321,8 @@ class PastureDataModule(LightningDataModule):
                 split="val",
                 transform=self.val_tf,
                 reg3_dim=len(self.target_order),
+                ndvi_mean=self._ndvi_mean,
+                ndvi_std=self._ndvi_std,
             )
             # Lightning supports multiple val loaders by returning a list
             return [main_loader, ndvi_loader]  # type: ignore[return-value]
@@ -295,4 +357,71 @@ class PastureDataModule(LightningDataModule):
         mapping = self._ensure_state_mapping()
         return int(len(mapping))
 
+    # --- z-score helpers ---
+    def _compute_and_store_zscore_stats(self) -> None:
+        if self.train_df is None:
+            return
+        reg_means: List[float] = []
+        reg_stds: List[float] = []
+        area = float(self.sample_area_m2 if self.sample_area_m2 > 0.0 else 1.0)
+        for t in self.target_order:
+            vals = self.train_df[t].astype(float).to_numpy()
+            vals = vals / area
+            if self._log_scale_targets:
+                vals = np.log1p(np.clip(vals, a_min=0.0, a_max=None))
+            mu = float(np.mean(vals)) if vals.size > 0 else 0.0
+            sigma = float(np.std(vals)) if vals.size > 1 else 1.0
+            if not np.isfinite(sigma) or sigma <= 0.0:
+                sigma = 1.0
+            reg_means.append(mu)
+            reg_stds.append(sigma)
+        self._reg3_mean = reg_means
+        self._reg3_std = reg_stds
+        try:
+            ndvi_vals = self.train_df["Pre_GSHH_NDVI"].astype(float).to_numpy()
+            ndvi_mu = float(np.mean(ndvi_vals)) if ndvi_vals.size > 0 else 0.0
+            ndvi_sigma = float(np.std(ndvi_vals)) if ndvi_vals.size > 1 else 1.0
+            if not np.isfinite(ndvi_sigma) or ndvi_sigma <= 0.0:
+                ndvi_sigma = 1.0
+        except Exception:
+            ndvi_mu, ndvi_sigma = 0.0, 1.0
+        self._ndvi_mean = ndvi_mu
+        self._ndvi_std = ndvi_sigma
 
+    def _maybe_save_zscore_stats(self) -> None:
+        if not self._zscore_output_path:
+            return
+        try:
+            out_dir = os.path.dirname(self._zscore_output_path)
+            if out_dir and not os.path.isdir(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+            import json
+            payload = {
+                "reg3": {"mean": list(self._reg3_mean or [0.0, 0.0, 0.0]), "std": list(self._reg3_std or [1.0, 1.0, 1.0])},
+                "ndvi": {"mean": float(self._ndvi_mean if self._ndvi_mean is not None else 0.0), "std": float(self._ndvi_std if self._ndvi_std is not None else 1.0)},
+                "meta": {
+                    "area_m2": float(self.sample_area_m2),
+                    "log_scale_targets": bool(self._log_scale_targets),
+                    "target_order": list(self.target_order),
+                },
+            }
+            with open(self._zscore_output_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception:
+            pass
+
+    @property
+    def reg3_zscore_mean(self) -> Optional[List[float]]:
+        return self._reg3_mean
+
+    @property
+    def reg3_zscore_std(self) -> Optional[List[float]]:
+        return self._reg3_std
+
+    @property
+    def ndvi_zscore_mean(self) -> Optional[float]:
+        return self._ndvi_mean
+
+    @property
+    def ndvi_zscore_std(self) -> Optional[float]:
+        return self._ndvi_std

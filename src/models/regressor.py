@@ -25,6 +25,12 @@ class BiomassRegressor(LightningModule):
         head_activation: str = "relu",
         use_output_softplus: bool = True,
         log_scale_targets: bool = False,
+        # Normalization and scaling
+        area_m2: float = 1.0,
+        reg3_zscore_mean: Optional[List[float]] = None,
+        reg3_zscore_std: Optional[List[float]] = None,
+        ndvi_zscore_mean: Optional[float] = None,
+        ndvi_zscore_std: Optional[float] = None,
         pretrained: bool = True,
         weights_url: Optional[str] = None,
         weights_path: Optional[str] = None,
@@ -146,8 +152,15 @@ class BiomassRegressor(LightningModule):
             self.state_head = None
         # Log-scale control applies only to main reg3 outputs
         self.log_scale_targets: bool = bool(log_scale_targets)
-        # Softplus is disabled for reg3 when predicting in log-domain
-        self.out_softplus = nn.Softplus() if (use_output_softplus and (not self.log_scale_targets)) else None
+        # Per-task z-score params
+        self._area_m2: float = float(max(1e-12, area_m2))
+        self._reg3_mean: Optional[Tensor] = torch.tensor(reg3_zscore_mean, dtype=torch.float32) if reg3_zscore_mean is not None else None
+        self._reg3_std: Optional[Tensor] = torch.tensor(reg3_zscore_std, dtype=torch.float32) if reg3_zscore_std is not None else None
+        self._ndvi_mean: Optional[float] = float(ndvi_zscore_mean) if ndvi_zscore_mean is not None else None
+        self._ndvi_std: Optional[float] = float(ndvi_zscore_std) if ndvi_zscore_std is not None else None
+        self._use_reg3_zscore: bool = (self._reg3_mean is not None and self._reg3_std is not None)
+        # Softplus is disabled for reg3 when predicting in log-domain or when using z-score
+        self.out_softplus = nn.Softplus() if (use_output_softplus and (not self.log_scale_targets) and (not self._use_reg3_zscore)) else None
         # Optional overrides for UW optimizer hyperparameters
         self._uw_learning_rate: Optional[float] = float(uw_learning_rate) if uw_learning_rate is not None else None
         self._uw_weight_decay: Optional[float] = float(uw_weight_decay) if uw_weight_decay is not None else None
@@ -177,17 +190,28 @@ class BiomassRegressor(LightningModule):
         self._cutmix_main = CutMixBatchAugment.from_cfg(cutmix_cfg)
 
     def forward(self, images: Tensor) -> Tensor:
-        # Return only main 3-d regression prediction (for compatibility and inference)
+        # Return main 3-d regression prediction in original grams (g)
         features = self.feature_extractor(images)
         z = self.shared_bottleneck(features)
         out = self.reg_head(z)
         if self.out_softplus is not None:
             out = self.out_softplus(out)
-        # In log-scale mode, convert to original scale for external consumers
+        # Invert normalization and scaling to grams
+        out_g = self._invert_reg3_to_grams(out)
+        return out_g
+
+    def _invert_reg3_to_g_per_m2(self, vals: Tensor) -> Tensor:
+        x = vals
+        if self._use_reg3_zscore and self._reg3_mean is not None and self._reg3_std is not None:
+            safe_std = torch.clamp(self._reg3_std.to(x.device, dtype=x.dtype), min=1e-8)
+            x = x * safe_std + self._reg3_mean.to(x.device, dtype=x.dtype)
         if self.log_scale_targets:
-            out = torch.expm1(out)
-            out = torch.clamp(out, min=0.0)
-        return out
+            x = torch.expm1(x).clamp_min(0.0)
+        return x
+
+    def _invert_reg3_to_grams(self, vals: Tensor) -> Tensor:
+        gm2 = self._invert_reg3_to_g_per_m2(vals)
+        return gm2 * float(self._area_m2)
 
     def _uw_sum(self, named_losses: List[Tuple[str, Tensor]]) -> Tensor:
         if self.loss_weighting != "uw" or self._uw_task_params is None or len(named_losses) == 0:
@@ -282,12 +306,8 @@ class BiomassRegressor(LightningModule):
             self.log(f"{stage}_loss", total_ndvi, on_step=False, on_epoch=True, prog_bar=True)
             return {"loss": total_ndvi}
 
-        # Targets: keep original for metrics; transform to log for optimization if enabled
-        y_reg3_orig: Tensor = batch["y_reg3"]  # (B,3)
-        if self.log_scale_targets:
-            y_reg3 = torch.log1p(torch.clamp(y_reg3_orig, min=0.0))
-        else:
-            y_reg3 = y_reg3_orig
+        # y_reg3 provided by dataset is already in normalized domain (z-score on g/m^2 when enabled)
+        y_reg3: Tensor = batch["y_reg3"]  # (B,3)
         y_height: Tensor = batch["y_height"]  # (B,1)
         y_ndvi: Tensor = batch["y_ndvi"]  # (B,1)
         y_species: Tensor = batch["y_species"]  # (B,)
@@ -313,13 +333,17 @@ class BiomassRegressor(LightningModule):
             self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
             self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
-            # For external metrics (e.g., epoch-end R^2), return original-scale preds/targets
-            if self.log_scale_targets:
-                preds_out = torch.expm1(pred_reg3).clamp_min(0.0)
-                targets_out = y_reg3_orig
-            else:
-                preds_out = pred_reg3
-                targets_out = y_reg3
+            # For external metrics (e.g., epoch-end R^2), return original-scale grams
+            preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
+            targets_out = batch.get("y_reg3_g", None)
+            if targets_out is None:
+                # Fallback: invert from g/m^2 stored if present
+                y_gm2 = batch.get("y_reg3_g_m2", None)
+                if y_gm2 is not None:
+                    targets_out = y_gm2 * float(self._area_m2)
+                else:
+                    # Last resort: invert from normalized y (approximate)
+                    targets_out = self._invert_reg3_to_grams(y_reg3.detach())
             return {
                 "loss": total_loss,
                 "mae": mae_reg3,
@@ -384,13 +408,15 @@ class BiomassRegressor(LightningModule):
         self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"{stage}_mae", mae, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_mse", mse, on_step=False, on_epoch=True, prog_bar=False)
-        # For external validation epoch R^2, return original-scale values
-        if self.log_scale_targets:
-            preds_out = torch.expm1(pred_reg3).clamp_min(0.0)
-            targets_out = y_reg3_orig
-        else:
-            preds_out = pred_reg3
-            targets_out = y_reg3
+        # For external validation epoch R^2, return original-scale grams
+        preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
+        targets_out = batch.get("y_reg3_g", None)
+        if targets_out is None:
+            y_gm2 = batch.get("y_reg3_g_m2", None)
+            if y_gm2 is not None:
+                targets_out = y_gm2 * float(self._area_m2)
+            else:
+                targets_out = self._invert_reg3_to_grams(y_reg3.detach())
         return {
             "loss": total_loss,
             "mae": mae,

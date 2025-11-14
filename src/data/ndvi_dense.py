@@ -227,12 +227,16 @@ class NdviDenseAsScalarDataset(Dataset):
         split: str = "train",
         transform: Optional[T.Compose] = None,
         reg3_dim: int = 3,
+        ndvi_mean: Optional[float] = None,
+        ndvi_std: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
         self.split = str(split).lower()
         self.transform = transform
         self.reg3_dim = int(reg3_dim)
+        self._ndvi_mean = float(ndvi_mean) if ndvi_mean is not None else None
+        self._ndvi_std = float(ndvi_std) if ndvi_std is not None else None
         # Build index over tiles
         self._pairs: List[Tuple[str, str]] = _scan_pairs(cfg.root)
         self._index: List[Tuple[int, Tuple[int, int, int, int]]] = []
@@ -265,6 +269,10 @@ class NdviDenseAsScalarDataset(Dataset):
         valid_mask = torch.isfinite(ndvi_t) & (ndvi_t >= -1.0) & (ndvi_t <= 1.0)
         denom = valid_mask.sum().clamp_min(1)
         y_ndvi_scalar = (ndvi_t[valid_mask].sum() / denom).to(torch.float32).unsqueeze(0)  # (1,)
+        # Apply z-score if provided
+        if self._ndvi_mean is not None and self._ndvi_std is not None:
+            ndvi_std = max(1e-8, float(self._ndvi_std))
+            y_ndvi_scalar = (y_ndvi_scalar - float(self._ndvi_mean)) / ndvi_std
 
         # Apply main dataset transforms to image
         if self.transform is not None:
@@ -300,8 +308,10 @@ def build_ndvi_scalar_dataloader(
     split: str,
     transform: Optional[T.Compose],
     reg3_dim: int = 3,
+    ndvi_mean: Optional[float] = None,
+    ndvi_std: Optional[float] = None,
 ) -> DataLoader:
-    ds = NdviDenseAsScalarDataset(cfg=cfg, split=split, transform=transform, reg3_dim=reg3_dim)
+    ds = NdviDenseAsScalarDataset(cfg=cfg, split=split, transform=transform, reg3_dim=reg3_dim, ndvi_mean=ndvi_mean, ndvi_std=ndvi_std)
     is_train = str(split).lower() == "train"
     return DataLoader(
         ds,

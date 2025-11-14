@@ -1,9 +1,15 @@
 seed: 42
-version: baseline
+version: baseline-ndvi-lora-r4
 
 data:
   root: data
   train_csv: train.csv
+  # Dataset selection and per-dataset physical area (meters)
+  dataset: csiro
+  datasets:
+    csiro:
+      width_m: 0.7
+      length_m: 0.3
   image_size: [960, 480]
   batch_size: 1
   val_batch_size: 1
@@ -94,7 +100,7 @@ mtl:
   enabled: true
   tasks:
     height: false
-    ndvi: false
+    ndvi: true
     ndvi_dense: false
     species: false
     state: false
@@ -110,8 +116,8 @@ peft:
   enabled: true
   method: lora
   use_dora: true
-  r: 8
-  lora_alpha: 8
+  r: 4
+  lora_alpha: 4
   lora_dropout: 0.05
   init: true
   last_k_blocks: 0

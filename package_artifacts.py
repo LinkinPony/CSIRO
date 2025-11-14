@@ -191,6 +191,7 @@ def main():
         exported = []
         for fold_idx in range(k):
             fold_ckpt_head_dir = ckpt_dir / f"fold_{fold_idx}" / "head"
+            fold_log_dir = log_dir / f"fold_{fold_idx}"
             head_files = list_head_checkpoints(fold_ckpt_head_dir)
             if not head_files:
                 raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
@@ -220,6 +221,13 @@ def main():
             dst_path = dst_dir / "infer_head.pt"
             shutil.copyfile(str(chosen), str(dst_path))
             exported.append((chosen, dst_path))
+            # Copy z_score.json for this fold if present
+            zsrc = fold_log_dir / "z_score.json"
+            if zsrc.is_file():
+                try:
+                    shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                except Exception:
+                    pass
 
         print("Copied per-fold head checkpoints (src -> dst):")
         for src_path, dst_path in exported:
@@ -247,6 +255,13 @@ def main():
 
         copied_head = copy_head_to_weights(chosen, weights_dir)
         print(f"Copied head checkpoint: {chosen} -> {copied_head}")
+        # Copy z_score.json from run log dir if present
+        zsrc = log_dir / "z_score.json"
+        if zsrc.is_file():
+            try:
+                shutil.copyfile(str(zsrc), str(weights_dir / "z_score.json"))
+            except Exception:
+                pass
 
     # Copy configs and src into weights/
     repo_root = Path(__file__).parent

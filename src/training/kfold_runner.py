@@ -24,6 +24,12 @@ def _build_model(
     ndvi_enabled: bool,
     species_enabled: bool,
     state_enabled: bool,
+    *,
+    area_m2: float,
+    reg3_zscore_mean: list[float] | None,
+    reg3_zscore_std: list[float] | None,
+    ndvi_zscore_mean: float | None,
+    ndvi_zscore_std: float | None,
 ) -> BiomassRegressor:
     return BiomassRegressor(
         backbone_name=str(cfg["model"]["backbone"]),
@@ -34,6 +40,11 @@ def _build_model(
         head_activation=str(cfg["model"]["head"].get("activation", "relu")),
         use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
         log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
+        area_m2=float(area_m2),
+        reg3_zscore_mean=list(reg3_zscore_mean or []) if reg3_zscore_mean is not None else None,
+        reg3_zscore_std=list(reg3_zscore_std or []) if reg3_zscore_std is not None else None,
+        ndvi_zscore_mean=float(ndvi_zscore_mean) if ndvi_zscore_mean is not None else None,
+        ndvi_zscore_std=float(ndvi_zscore_std) if ndvi_zscore_std is not None else None,
         uw_learning_rate=float(cfg.get("optimizer", {}).get("uw_lr", cfg["optimizer"]["lr"])),
         uw_weight_decay=float(cfg.get("optimizer", {}).get("uw_weight_decay", cfg["optimizer"]["weight_decay"])),
         pretrained=bool(cfg["model"].get("pretrained", True)),
@@ -70,6 +81,26 @@ def _parse_image_size(value):
 
 def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
     # Build once to get the full dataframe and other settings
+    ds_name = str(cfg["data"].get("dataset", "csiro"))
+    ds_map = dict(cfg["data"].get("datasets", {}))
+    ds_info = dict(ds_map.get(ds_name, {}))
+    try:
+        width_m = float(ds_info.get("width_m", ds_info.get("width", 1.0)))
+    except Exception:
+        width_m = 1.0
+    try:
+        length_m = float(ds_info.get("length_m", ds_info.get("length", 1.0)))
+    except Exception:
+        length_m = 1.0
+    try:
+        area_m2 = float(ds_info.get("area_m2", width_m * length_m))
+    except Exception:
+        area_m2 = max(1.0, width_m * length_m if (width_m > 0.0 and length_m > 0.0) else 1.0)
+    if not (area_m2 > 0.0):
+        area_m2 = 1.0
+
+    log_scale_targets_cfg = bool(cfg["model"].get("log_scale_targets", False))
+
     base_dm = PastureDataModule(
         data_root=cfg["data"]["root"],
         train_csv=cfg["data"]["train_csv"],
@@ -83,6 +114,9 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
         mean=list(cfg["data"]["normalization"]["mean"]),
         std=list(cfg["data"]["normalization"]["std"]),
         train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
+        sample_area_m2=float(area_m2),
+        zscore_output_path=str(log_dir / "z_score.json"),
+        log_scale_targets=log_scale_targets_cfg,
         hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
         shuffle=bool(cfg["data"].get("shuffle", True)),
     )
@@ -207,11 +241,20 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
             mean=list(cfg["data"]["normalization"]["mean"]),
             std=list(cfg["data"]["normalization"]["std"]),
             train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
+            sample_area_m2=float(area_m2),
+            zscore_output_path=str(fold_log_dir / "z_score.json"),
+            log_scale_targets=log_scale_targets_cfg,
             hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
             shuffle=bool(cfg["data"].get("shuffle", True)),
             predefined_train_df=train_df,
             predefined_val_df=val_df,
         )
+
+        # Ensure z-score stats computed
+        try:
+            dm.setup()
+        except Exception:
+            pass
 
         model = _build_model(
             cfg,
@@ -222,6 +265,11 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
             ndvi_enabled,
             species_enabled,
             state_enabled,
+            area_m2=float(area_m2),
+            reg3_zscore_mean=list(dm.reg3_zscore_mean or []) if hasattr(dm, "reg3_zscore_mean") else None,
+            reg3_zscore_std=list(dm.reg3_zscore_std or []) if hasattr(dm, "reg3_zscore_std") else None,
+            ndvi_zscore_mean=float(dm.ndvi_zscore_mean) if getattr(dm, "ndvi_zscore_mean", None) is not None else None,
+            ndvi_zscore_std=float(dm.ndvi_zscore_std) if getattr(dm, "ndvi_zscore_std", None) is not None else None,
         )
 
         # Lightweight Lightning checkpoint (last + best) to preserve full training state, excluding backbone weights

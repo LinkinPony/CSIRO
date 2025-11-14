@@ -270,6 +270,33 @@ def discover_head_weight_paths(path: str) -> List[str]:
     raise FileNotFoundError(f"Cannot find head weights at: {path}")
 
 
+def _load_zscore_json_for_head(head_pt_path: str) -> Optional[dict]:
+    """
+    Try to locate z_score.json for a given head.
+    Priority:
+      1) Same directory as head .pt (e.g., weights/head/fold_i/z_score.json)
+      2) Parent of head directory (e.g., weights/head/z_score.json)
+      3) Parent of head parent (e.g., weights/z_score.json)
+    """
+    import json
+    candidates: List[str] = []
+    d = os.path.dirname(head_pt_path)
+    candidates.append(os.path.join(d, "z_score.json"))
+    parent = os.path.dirname(d)
+    if parent and parent != d:
+        candidates.append(os.path.join(parent, "z_score.json"))
+        gp = os.path.dirname(parent)
+        if gp and gp not in (parent, d):
+            candidates.append(os.path.join(gp, "z_score.json"))
+    for c in candidates:
+        if os.path.isfile(c):
+            try:
+                with open(c, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                continue
+    return None
+
 def extract_features_for_images(
     feature_extractor: nn.Module,
     dataset_root: str,
@@ -351,6 +378,24 @@ def main():
     mean = list(cfg["data"]["normalization"]["mean"])  # e.g., [0.485, 0.456, 0.406]
     std = list(cfg["data"]["normalization"]["std"])    # e.g., [0.229, 0.224, 0.225]
     target_bases = list(cfg["data"]["target_order"])    # e.g., [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
+    # Dataset area (m^2) to convert g/m^2 (model output) back to grams for submission
+    ds_name = str(cfg["data"].get("dataset", "csiro"))
+    ds_map = dict(cfg["data"].get("datasets", {}))
+    ds_info = dict(ds_map.get(ds_name, {}))
+    try:
+        width_m = float(ds_info.get("width_m", ds_info.get("width", 1.0)))
+    except Exception:
+        width_m = 1.0
+    try:
+        length_m = float(ds_info.get("length_m", ds_info.get("length", 1.0)))
+    except Exception:
+        length_m = 1.0
+    try:
+        area_m2 = float(ds_info.get("area_m2", width_m * length_m))
+    except Exception:
+        area_m2 = max(1.0, width_m * length_m if (width_m > 0.0 and length_m > 0.0) else 1.0)
+    if not (area_m2 > 0.0):
+        area_m2 = 1.0
     batch_size = int(cfg["data"].get("batch_size", 32))
     num_workers = int(cfg["data"].get("num_workers", 4))
 
@@ -452,7 +497,18 @@ def main():
         # Decide log-scale and effective Softplus for reg3
         log_scale_cfg = bool(cfg["model"].get("log_scale_targets", False))
         log_scale_meta = bool(meta.get("log_scale_targets", log_scale_cfg)) if isinstance(meta, dict) else log_scale_cfg
-        use_softplus_eff = bool(cfg["model"]["head"].get("use_output_softplus", True)) and (not log_scale_meta)
+        # Load z-score for this head (optional)
+        zscore = _load_zscore_json_for_head(head_pt)
+        reg3_mean = None
+        reg3_std = None
+        if isinstance(zscore, dict) and "reg3" in zscore:
+            try:
+                reg3_mean = torch.tensor(zscore["reg3"]["mean"], dtype=torch.float32)
+                reg3_std = torch.tensor(zscore["reg3"]["std"], dtype=torch.float32).clamp_min(1e-8)
+            except Exception:
+                reg3_mean, reg3_std = None, None
+        zscore_enabled = reg3_mean is not None and reg3_std is not None
+        use_softplus_eff = bool(cfg["model"]["head"].get("use_output_softplus", True)) and (not log_scale_meta) and (not zscore_enabled)
         head_module = build_head_layer(
             embedding_dim=int(cfg["model"]["embedding_dim"]),
             num_outputs=3,
@@ -463,16 +519,19 @@ def main():
         )
         head_module.load_state_dict(state, strict=True)
         preds = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
-        # Convert from log-scale to original scale only at the final output if needed
+        # Invert z-score, then log-scale if applicable, then convert to grams
+        if zscore_enabled:
+            preds = preds * reg3_std + reg3_mean  # type: ignore[operator]
         if log_scale_meta:
-            preds = torch.expm1(preds)
-            preds = torch.clamp(preds, min=0.0)
+            preds = torch.expm1(preds).clamp_min(0.0)
         preds_sum += preds
         num_heads += 1
 
     if num_heads == 0:
         raise RuntimeError("No valid head weights found for inference.")
-    avg_preds = (preds_sum / float(num_heads)).tolist()
+    avg_preds = (preds_sum / float(num_heads))
+    # Convert g/m^2 to grams expected by submission format
+    avg_preds = (avg_preds * float(area_m2)).tolist()
 
     # Build mapping from image path to base predictions
     image_to_base_preds: Dict[str, Tuple[float, float, float]] = {}
