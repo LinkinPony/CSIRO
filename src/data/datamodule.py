@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 from lightning.pytorch import LightningDataModule
 from src.data.augmentations import build_transforms as build_aug_transforms
-from .ndvi_dense import NdviDenseConfig, build_ndvi_dense_dataloader
+from .ndvi_dense import NdviDenseConfig, build_ndvi_scalar_dataloader
 
 
 @dataclass
@@ -225,7 +225,12 @@ class PastureDataModule(LightningDataModule):
             persistent_workers=bool(self.num_workers > 0),
         )
         if self.ndvi_dense_enabled and self._ndvi_cfg is not None:
-            ndvi_loader = build_ndvi_dense_dataloader(self._ndvi_cfg, split="train")
+            ndvi_loader = build_ndvi_scalar_dataloader(
+                self._ndvi_cfg,
+                split="train",
+                transform=self.train_tf,
+                reg3_dim=len(self.target_order),
+            )
             return [main_loader, ndvi_loader]  # type: ignore[return-value]
         return main_loader
 
@@ -251,7 +256,12 @@ class PastureDataModule(LightningDataModule):
             persistent_workers=bool(self.num_workers > 0),
         )
         if self.ndvi_dense_enabled and self._ndvi_cfg is not None:
-            ndvi_loader = build_ndvi_dense_dataloader(self._ndvi_cfg, split="val")
+            ndvi_loader = build_ndvi_scalar_dataloader(
+                self._ndvi_cfg,
+                split="val",
+                transform=self.val_tf,
+                reg3_dim=len(self.target_order),
+            )
             # Lightning supports multiple val loaders by returning a list
             return [main_loader, ndvi_loader]  # type: ignore[return-value]
         return main_loader

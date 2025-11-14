@@ -215,3 +215,102 @@ def build_ndvi_dense_dataloader(cfg: NdviDenseConfig, split: str = "train") -> D
 
 
 
+class NdviDenseAsScalarDataset(Dataset):
+    """
+    NDVI-dense tiles dataset that converts the dense NDVI map to a scalar label
+    by averaging valid pixels, and applies the same image transforms as the main
+    regression dataset.
+    """
+    def __init__(
+        self,
+        cfg: NdviDenseConfig,
+        split: str = "train",
+        transform: Optional[T.Compose] = None,
+        reg3_dim: int = 3,
+    ) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.split = str(split).lower()
+        self.transform = transform
+        self.reg3_dim = int(reg3_dim)
+        # Build index over tiles
+        self._pairs: List[Tuple[str, str]] = _scan_pairs(cfg.root)
+        self._index: List[Tuple[int, Tuple[int, int, int, int]]] = []
+        for idx, (rgb_p, ndvi_p) in enumerate(self._pairs):
+            try:
+                with Image.open(rgb_p) as img:
+                    w, h = img.size
+            except Exception:
+                with Image.open(ndvi_p) as img:
+                    w, h = img.size
+            boxes = _compute_tiles(w, h, cfg.tile_size, cfg.stride)
+            for box in boxes:
+                self._index.append((idx, box))
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        pair_idx, (x1, y1, x2, y2) = self._index[index]
+        rgb_path, ndvi_path = self._pairs[pair_idx]
+        with Image.open(rgb_path) as im_rgb:
+            rgb = im_rgb.convert("RGB").crop((x1, y1, x2, y2))
+        with Image.open(ndvi_path) as im_ndvi:
+            ndvi = im_ndvi.convert("L").crop((x1, y1, x2, y2))
+
+        # Compute scalar NDVI label from dense map (mean over valid pixels)
+        ndvi_np = np.array(ndvi)
+        ndvi_f = _to_ndvi_float(ndvi_np)
+        ndvi_t = torch.from_numpy(ndvi_f).unsqueeze(0)  # 1 x H x W
+        valid_mask = torch.isfinite(ndvi_t) & (ndvi_t >= -1.0) & (ndvi_t <= 1.0)
+        denom = valid_mask.sum().clamp_min(1)
+        y_ndvi_scalar = (ndvi_t[valid_mask].sum() / denom).to(torch.float32).unsqueeze(0)  # (1,)
+
+        # Apply main dataset transforms to image
+        if self.transform is not None:
+            rgb = self.transform(rgb)
+        else:
+            rgb = T.ToTensor()(rgb)
+
+        # Placeholder targets to satisfy CutMix/main collate
+        y_reg3 = torch.zeros((self.reg3_dim,), dtype=torch.float32)
+        y_height = torch.zeros((1,), dtype=torch.float32)
+        y_species = torch.tensor(0, dtype=torch.long)
+        y_state = torch.tensor(0, dtype=torch.long)
+
+        return {
+            "image": rgb,
+            "y_reg3": y_reg3,
+            "y_height": y_height,
+            "y_ndvi": y_ndvi_scalar,
+            "y_species": y_species,
+            "y_state": y_state,
+            "ndvi_only": True,
+            "task": "ndvi_only",
+            "meta": {
+                "rgb_path": rgb_path,
+                "ndvi_path": ndvi_path,
+                "box": (x1, y1, x2, y2),
+            },
+        }
+
+
+def build_ndvi_scalar_dataloader(
+    cfg: NdviDenseConfig,
+    split: str,
+    transform: Optional[T.Compose],
+    reg3_dim: int = 3,
+) -> DataLoader:
+    ds = NdviDenseAsScalarDataset(cfg=cfg, split=split, transform=transform, reg3_dim=reg3_dim)
+    is_train = str(split).lower() == "train"
+    return DataLoader(
+        ds,
+        batch_size=int(cfg.batch_size),
+        shuffle=is_train,
+        num_workers=int(cfg.num_workers),
+        pin_memory=True,
+        persistent_workers=bool(cfg.num_workers > 0),
+        drop_last=is_train,
+    )
+
+

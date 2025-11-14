@@ -45,13 +45,14 @@ class HeadCheckpoint(Callback):
         state_dict_to_save: Dict[str, Any]
         try:
             # Prefer composing a fresh head module to ensure compatibility with inference script
+            use_output_softplus_eff = bool(getattr(pl_module.hparams, "use_output_softplus", True)) and not bool(getattr(pl_module.hparams, "log_scale_targets", False))
             head_module = build_head_layer(
                 embedding_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)),
                 num_outputs=int(getattr(pl_module.hparams, "num_outputs", 3)),
                 head_hidden_dims=list(getattr(pl_module.hparams, "head_hidden_dims", [])),
                 head_activation=str(getattr(pl_module.hparams, "head_activation", "relu")),
                 dropout=float(getattr(pl_module.hparams, "dropout", 0.0)),
-                use_output_softplus=bool(getattr(pl_module.hparams, "use_output_softplus", True)),
+                use_output_softplus=use_output_softplus_eff,
             )
 
             # copy weights: from pl_module.shared_bottleneck + pl_module.reg_head -> head_module linears
@@ -88,7 +89,8 @@ class HeadCheckpoint(Callback):
                 "head_hidden_dims": list(getattr(pl_module.hparams, "head_hidden_dims", [])) if hasattr(pl_module, "hparams") else [],
                 "head_activation": getattr(pl_module.hparams, "head_activation", "relu") if hasattr(pl_module, "hparams") else "relu",
                 "head_dropout": float(getattr(pl_module.hparams, "dropout", 0.0)) if hasattr(pl_module, "hparams") else 0.0,
-                "use_output_softplus": bool(getattr(pl_module.hparams, "use_output_softplus", True)) if hasattr(pl_module, "hparams") else True,
+                "use_output_softplus": (bool(getattr(pl_module.hparams, "use_output_softplus", True)) and not bool(getattr(pl_module.hparams, "log_scale_targets", False))) if hasattr(pl_module, "hparams") else True,
+                "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,
             },
         }
         # Optionally bundle LoRA adapter payload alongside the head (to preserve the two-inputs rule at inference)

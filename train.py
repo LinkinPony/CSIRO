@@ -226,6 +226,9 @@ def main():
             head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
             head_activation=str(cfg["model"]["head"].get("activation", "relu")),
             use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
+            log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
+            uw_learning_rate=float(cfg.get("optimizer", {}).get("uw_lr", cfg["optimizer"]["lr"])),
+            uw_weight_decay=float(cfg.get("optimizer", {}).get("uw_weight_decay", cfg["optimizer"]["weight_decay"])),
             pretrained=bool(cfg["model"].get("pretrained", True)),
             weights_url=cfg["model"].get("weights_url", None),
             weights_path=cfg["model"].get("weights_path", None),
@@ -248,6 +251,14 @@ def main():
             enable_species=species_enabled,
             enable_state=state_enabled,
             peft_cfg=dict(cfg.get("peft", {})),
+            # CutMix configs
+            cutmix_cfg=dict(cfg.get("data", {}).get("augment", {}).get("cutmix", {})),
+            ndvi_dense_cutmix_cfg=dict(
+                cfg.get("ndvi_dense", {}).get("augment", {}).get(
+                    "cutmix",
+                    cfg.get("data", {}).get("augment", {}).get("cutmix", {}),
+                )
+            ),
         )
 
         head_ckpt_dir = ckpt_dir / "head"

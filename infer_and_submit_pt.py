@@ -447,17 +447,26 @@ def main():
     preds_sum = torch.zeros((features_cpu.shape[0], 3), dtype=torch.float32)
     num_heads = 0
     for head_pt in head_weight_paths:
+        # Read head state and meta (to detect log-scale setting if bundled)
+        state, meta, _peft = load_head_state(head_pt)
+        # Decide log-scale and effective Softplus for reg3
+        log_scale_cfg = bool(cfg["model"].get("log_scale_targets", False))
+        log_scale_meta = bool(meta.get("log_scale_targets", log_scale_cfg)) if isinstance(meta, dict) else log_scale_cfg
+        use_softplus_eff = bool(cfg["model"]["head"].get("use_output_softplus", True)) and (not log_scale_meta)
         head_module = build_head_layer(
             embedding_dim=int(cfg["model"]["embedding_dim"]),
             num_outputs=3,
             head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
             head_activation=str(cfg["model"]["head"].get("activation", "relu")),
             dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
-            use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
+            use_output_softplus=use_softplus_eff,
         )
-        state, _, _ = load_head_state(head_pt)
         head_module.load_state_dict(state, strict=True)
         preds = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
+        # Convert from log-scale to original scale only at the final output if needed
+        if log_scale_meta:
+            preds = torch.expm1(preds)
+            preds = torch.clamp(preds, min=0.0)
         preds_sum += preds
         num_heads += 1
 

@@ -1,5 +1,5 @@
 seed: 42
-version: ndvi-dense-shift-target
+version: baseline
 
 data:
   root: data
@@ -60,6 +60,12 @@ data:
       scale: [0.02, 0.1]
       ratio: [0.3, 3.3]
       value: random
+    cutmix:
+      enabled: true
+      prob: 0.5
+      alpha: 0.5
+      # minmax: [0.3, 0.7]  # optional clamp for bbox size; comment to disable
+      use_prev_for_bsz1: true
     no_augment_prob: 0.3
   normalization:
     mean: [0.485, 0.456, 0.406]
@@ -76,6 +82,7 @@ model:
   pretrained: true
   freeze_backbone: true
   embedding_dim: 1280
+  log_scale_targets: false
   head:
     type: mlp
     hidden_dims: [1280]
@@ -87,14 +94,14 @@ mtl:
   enabled: true
   tasks:
     height: false
-    ndvi: true
-    ndvi_dense: true
+    ndvi: false
+    ndvi_dense: false
     species: false
     state: false
   # Per-step sampling ratio within an epoch (expected proportion).
   # ndvi_dense: probability to include NDVI-dense loss on a training step.
   sample_ratio:
-    ndvi_dense: 0.75
+    ndvi_dense: 0.0
 
 train_all:
   enabled: true
@@ -120,6 +127,8 @@ optimizer:
   name: adamw
   lr: 0.001
   weight_decay: 0.01
+  uw_lr: 0.01
+  uw_weight_decay: 0.0
 
 scheduler:
   name: cosine
@@ -132,12 +141,12 @@ kfold:
   even_split: false
 
 trainer:
-  max_epochs: 35
+  max_epochs: 30
   accelerator: auto
   devices: 1
   precision: 16-mixed
   # Control per-epoch steps. Accepts int (absolute batches) or float (fraction).
-  limit_train_batches: 700
+  limit_train_batches: 350
   # With train_all enabled, we default to 1 so that validation uses only the dummy batch.
   limit_val_batches: 1
   log_every_n_steps: 1
@@ -161,7 +170,7 @@ logging:
 ndvi_dense:
   enabled: true
   root: /media/dl/dataset/Git/CSIRO/data/NDVI
-  tile_size: 512
+  tile_size: 640
   tile_stride: 448
   batch_size: 1
   num_workers: 8
@@ -170,4 +179,10 @@ ndvi_dense:
     std: [0.229, 0.224, 0.225]
   augment:
     horizontal_flip_prob: 0.5
+    # Optional per-task CutMix (falls back to data.augment.cutmix if omitted)
+    cutmix:
+      enabled: true
+      prob: 0.5
+      alpha: 0.3
+      use_prev_for_bsz1: true
     vertical_flip_prob: 0.0
