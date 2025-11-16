@@ -302,7 +302,7 @@ def main():
             enable_species=species_enabled,
             enable_state=state_enabled,
             peft_cfg=dict(cfg.get("peft", {})),
-            # CutMix configs
+            # CutMix / C-Mixup configs
             cutmix_cfg=dict(cfg.get("data", {}).get("augment", {}).get("cutmix", {})),
             ndvi_dense_cutmix_cfg=dict(
                 cfg.get("ndvi_dense", {}).get("augment", {}).get(
@@ -310,6 +310,7 @@ def main():
                     cfg.get("data", {}).get("augment", {}).get("cutmix", {}),
                 )
             ),
+            cmixup_cfg=dict(cfg.get("data", {}).get("augment", {}).get("cmixup", {})),
         )
 
         head_ckpt_dir = ckpt_dir / "head"

@@ -211,3 +211,187 @@ class CutMixBatchAugment:
         return batch
 
 
+@dataclass
+class CMixupConfig:
+    """
+    Configuration for C-Mixup (label-distribution aware mixup for regression),
+    adapted from the official C-Mixup implementation.
+    """
+
+    enabled: bool = False
+    # Per-batch probability to apply C-Mixup
+    prob: float = 1.0
+    # Beta(alpha, alpha) distribution parameter for mix coefficient
+    alpha: float = 1.0
+    # Gaussian kernel bandwidth in label space (on the chosen label tensor)
+    bandwidth: float = 1.0
+    # Label key to use for KDE / mixing (default: main regression targets)
+    label_key: str = "y_reg3"
+
+    @staticmethod
+    def from_dict(d: Optional[Dict[str, Any]]) -> "CMixupConfig":
+        if d is None:
+            return CMixupConfig(enabled=False)
+        return CMixupConfig(
+            enabled=bool(d.get("enabled", False)),
+            prob=float(d.get("prob", 1.0)),
+            alpha=float(d.get("alpha", 1.0)),
+            bandwidth=float(d.get("bandwidth", 1.0)),
+            label_key=str(d.get("label_key", "y_reg3")),
+        )
+
+
+class CMixupBatchAugment:
+    """
+    Batch-level C-Mixup for regression tasks.
+
+    For a batch of labels Y in R^{B x D}, we construct, for each sample i,
+    a label-conditional sampling distribution over the batch via a
+    Gaussian kernel in label space (following the spirit of C-Mixup),
+    then sample a partner j ~ p(j | i) and mix:
+
+        x_mix = lam * x_i + (1 - lam) * x_j
+        y_mix = lam * y_i + (1 - lam) * y_j
+
+    This operates purely in-batch (no global pre-computation), which keeps
+    the integration lightweight while preserving the core idea of
+    label-distribution-aware mixup.
+    """
+
+    def __init__(self, cfg: CMixupConfig) -> None:
+        self.cfg = cfg
+
+    @staticmethod
+    def from_cfg(d: Optional[Dict[str, Any]]) -> Optional["CMixupBatchAugment"]:
+        cfg = CMixupConfig.from_dict(d)
+        if not cfg.enabled:
+            return None
+        return CMixupBatchAugment(cfg)
+
+    def _compute_kde_probs(self, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-sample KDE-based sampling probabilities over the batch.
+
+        Args:
+            labels: (B, D) tensor of regression labels (no grad required).
+
+        Returns:
+            mix_probs: (B, B) tensor where mix_probs[i] is a probability
+                       distribution over partner indices for sample i.
+        """
+        if labels.ndim != 2:
+            labels = labels.view(labels.size(0), -1)
+        bsz, dim = labels.shape
+        if bsz < 2:
+            # Nothing to mix
+            return torch.zeros((bsz, bsz), device=labels.device, dtype=labels.dtype)
+        h = float(self.cfg.bandwidth)
+        if not torch.isfinite(torch.tensor(h)) or h <= 0.0:
+            h = 1.0
+        two_h2 = 2.0 * (h ** 2)
+
+        mix_probs = labels.new_zeros((bsz, bsz))
+        for i in range(bsz):
+            # Gaussian kernel centered at labels[i]
+            diff = labels - labels[i].view(1, dim)
+            dist2 = (diff * diff).sum(dim=-1)  # (B,)
+            scores = torch.exp(-dist2 / two_h2)
+            # Avoid degenerate all-zero scores
+            scores_sum = scores.sum()
+            if scores_sum <= 0:
+                probs = torch.full_like(scores, 1.0 / float(bsz))
+            else:
+                probs = scores / scores_sum
+            mix_probs[i] = probs
+        return mix_probs
+
+    def apply_main_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Apply C-Mixup to the main regression batch.
+
+        Expected keys in batch (when not NDVI-only):
+          - "image": (B,C,H,W)
+          - label_key (default "y_reg3"): (B, D_reg)
+          - Optionally "y_height", "y_ndvi" (regression scalars) which will also be mixed.
+
+        NDVI-only scalar batches (with "ndvi_only" == True) are left untouched.
+        """
+        if not self.cfg.enabled or self.cfg.prob <= 0.0:
+            return batch
+        # Skip NDVI-only scalar batches
+        if bool(batch.get("ndvi_only", False)):
+            return batch
+        if torch.rand(()) > self.cfg.prob:
+            return batch
+
+        if "image" not in batch:
+            return batch
+        if self.cfg.label_key not in batch:
+            return batch
+
+        images: torch.Tensor = batch["image"]
+        labels: torch.Tensor = batch[self.cfg.label_key]
+        if not torch.is_tensor(images) or not torch.is_tensor(labels):
+            return batch
+        if images.size(0) != labels.size(0):
+            return batch
+
+        bsz = images.size(0)
+        if bsz < 2:
+            return batch
+
+        # Detach labels for KDE computation (no gradients needed)
+        labels_detached = labels.detach()
+        if labels_detached.ndim == 1:
+            labels_detached = labels_detached.view(bsz, 1)
+        mix_probs = self._compute_kde_probs(labels_detached)
+
+        # Sample partner indices j ~ p(j | i) for each i
+        # mix_probs is (B,B) with rows being distributions
+        try:
+            idx2 = torch.multinomial(mix_probs, num_samples=1).squeeze(-1)  # (B,)
+        except RuntimeError:
+            # Fallback to uniform random pairing if anything goes wrong
+            idx2 = torch.randint(low=0, high=bsz, size=(bsz,), device=images.device)
+
+        # Sample global mix coefficient from Beta(alpha, alpha)
+        lam = 1.0
+        if self.cfg.alpha > 0.0:
+            lam = float(torch.distributions.Beta(self.cfg.alpha, self.cfg.alpha).sample().item())
+        lam = float(max(0.0, min(1.0, lam)))
+
+        # Mix images
+        images2 = images[idx2]
+        batch["image"] = lam * images + (1.0 - lam) * images2
+
+        # Mix main regression targets and auxiliary scalar regressions
+        def _mix_tensor_key(key: str) -> None:
+            if key not in batch:
+                return
+            t = batch[key]
+            if not torch.is_tensor(t):
+                return
+            if t.size(0) != bsz:
+                return
+            t2 = t[idx2]
+            # Broadcast lam over trailing dims
+            while t.dim() > 1 and t.shape[1] != 1:
+                break
+            lam_t = torch.tensor(lam, dtype=t.dtype, device=t.device)
+            batch[key] = lam_t * t + (1.0 - lam_t) * t2
+
+        # Main normalized regression targets
+        _mix_tensor_key(self.cfg.label_key)
+        # Auxiliary scalar regressions (if present)
+        _mix_tensor_key("y_height")
+        _mix_tensor_key("y_ndvi")
+
+        # To keep validation metrics consistent, drop original-scale targets if present;
+        # downstream code will fall back to inverting from normalized labels.
+        for k in ("y_reg3_g", "y_reg3_g_m2"):
+            if k in batch:
+                batch.pop(k, None)
+
+        return batch
+
+

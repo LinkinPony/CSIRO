@@ -11,7 +11,7 @@ from loguru import logger
 from .backbone import build_feature_extractor
 from .peft_integration import inject_lora_into_feature_extractor, get_lora_param_list
 from .head_builder import build_head_layer
-from src.training.cutmix import CutMixBatchAugment
+from src.training.cutmix import CutMixBatchAugment, CMixupBatchAugment
 
 
 class BiomassRegressor(LightningModule):
@@ -54,9 +54,10 @@ class BiomassRegressor(LightningModule):
         enable_ndvi_dense: bool = False,
         enable_species: bool = False,
         enable_state: bool = False,
-        # CutMix configs (batch-level augmentation)
+        # CutMix / C-Mixup configs (batch-level augmentation)
         cutmix_cfg: Optional[Dict[str, Any]] = None,
         ndvi_dense_cutmix_cfg: Optional[Dict[str, Any]] = None,
+        cmixup_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -192,7 +193,8 @@ class BiomassRegressor(LightningModule):
         self._val_preds: list[Tensor] = []
         self._val_targets: list[Tensor] = []
 
-        # --- CutMix batch-level augmentation ---
+        # --- Batch-level augmentations (C-Mixup, CutMix) ---
+        self._cmixup_main = CMixupBatchAugment.from_cfg(cmixup_cfg)
         self._cutmix_main = CutMixBatchAugment.from_cfg(cutmix_cfg)
 
     def _forward_reg3_logits(self, z: Tensor) -> Tensor:
@@ -292,12 +294,18 @@ class BiomassRegressor(LightningModule):
             return self._shared_step(selected, stage)
 
         # batch is a dict from the dataset
-        # Optional CutMix for main regression tasks (train only)
-        if stage == "train" and self._cutmix_main is not None:
-            try:
-                batch = self._cutmix_main.apply_main_batch(batch)  # type: ignore[assignment]
-            except Exception:
-                pass
+        # Optional C-Mixup then CutMix for main regression tasks (train only)
+        if stage == "train":
+            if self._cmixup_main is not None:
+                try:
+                    batch = self._cmixup_main.apply_main_batch(batch)  # type: ignore[assignment]
+                except Exception:
+                    pass
+            if self._cutmix_main is not None:
+                try:
+                    batch = self._cutmix_main.apply_main_batch(batch)  # type: ignore[assignment]
+                except Exception:
+                    pass
         images: Tensor = batch["image"]
         is_ndvi_only: bool = bool(batch.get("ndvi_only", False))
 
@@ -312,6 +320,23 @@ class BiomassRegressor(LightningModule):
                 self.log(f"{stage}_loss", zero, on_step=False, on_epoch=True, prog_bar=True)
                 return {"loss": zero}
             y_ndvi_only: Tensor = batch["y_ndvi"]  # (B,1)
+            # Log NDVI supervision count for this batch / epoch (scalar NDVI-only branch)
+            ndvi_count_batch = torch.tensor(
+                float(y_ndvi_only.shape[0]),
+                device=y_ndvi_only.device,
+                dtype=y_ndvi_only.dtype,
+            )
+            # Per-batch NDVI supervised sample count
+            self.log(f"{stage}_ndvi_batch_count", ndvi_count_batch, on_step=True, on_epoch=False, prog_bar=False)
+            # Per-epoch total NDVI supervised sample count
+            self.log(
+                f"{stage}_ndvi_epoch_count",
+                ndvi_count_batch,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                reduce_fx="sum",
+            )
             pred_ndvi_only = self.ndvi_head(z)
             loss_ndvi_only = F.mse_loss(pred_ndvi_only, y_ndvi_only)
             self.log(f"{stage}_loss_ndvi", loss_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
@@ -416,9 +441,27 @@ class BiomassRegressor(LightningModule):
             diff2_ndvi = (diff_ndvi * diff_ndvi) * m_nd
             mask_sum_ndvi = m_nd.sum().clamp_min(0.0)
 
+            # Log NDVI supervision count for this batch / epoch (main multi-task branch)
+            # mask_sum_ndvi is the number of supervised NDVI positions (typically equals batch size).
+            self.log(f"{stage}_ndvi_batch_count", mask_sum_ndvi, on_step=True, on_epoch=False, prog_bar=False)
+            self.log(
+                f"{stage}_ndvi_epoch_count",
+                mask_sum_ndvi,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                reduce_fx="sum",
+            )
+
             if mask_sum_ndvi > 0:
                 loss_ndvi = diff2_ndvi.sum() / mask_sum_ndvi
                 mae_ndvi = (diff_ndvi.abs() * m_nd).sum() / mask_sum_ndvi
+            else:
+                # No valid NDVI supervision in this batch; use zero loss to keep graph consistent.
+                zero = diff2_ndvi.sum() * 0.0
+                loss_ndvi = zero
+                mae_ndvi = zero
+
             self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
