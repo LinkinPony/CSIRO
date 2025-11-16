@@ -6,11 +6,12 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
 import torchvision.transforms as T
 from lightning.pytorch import LightningDataModule
 from src.data.augmentations import build_transforms as build_aug_transforms
 from .ndvi_dense import NdviDenseConfig, build_ndvi_scalar_dataloader
+from .irish_glass_clover import IrishGlassCloverDataset
 
 
 @dataclass
@@ -72,6 +73,7 @@ class PastureImageDataset(Dataset):
             image = self.transform(image)
         # main regression targets (triple)
         y_reg3_g = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
+        reg3_mask = torch.ones_like(y_reg3_g, dtype=torch.float32)
         # Convert grams to grams per square meter if a valid area is provided
         y_reg3_g_m2 = y_reg3_g / float(self.area_m2) if self.area_m2 > 0.0 else y_reg3_g
         # Apply z-score if provided
@@ -89,6 +91,7 @@ class PastureImageDataset(Dataset):
             y_ndvi = (y_ndvi_raw - float(self._ndvi_mean)) / ndvi_std
         else:
             y_ndvi = y_ndvi_raw
+        ndvi_mask = torch.ones((1,), dtype=torch.float32)
         # auxiliary classification target: species index
         species = str(row.get("Species", ""))
         if self.species_to_idx and species in self.species_to_idx:
@@ -106,8 +109,10 @@ class PastureImageDataset(Dataset):
             "y_reg3": y_reg3,             # normalized (if stats provided)
             "y_reg3_g_m2": y_reg3_g_m2,   # original g/m^2
             "y_reg3_g": y_reg3_g,         # original grams
+            "reg3_mask": reg3_mask,       # all ones for CSIRO dataset
             "y_height": y_height,
             "y_ndvi": y_ndvi,             # normalized (if stats provided)
+            "ndvi_mask": ndvi_mask,       # 1 => NDVI supervised
             "y_species": y_species,
             "y_state": y_state,
         }
@@ -147,6 +152,12 @@ class PastureDataModule(LightningDataModule):
         ndvi_dense_std: Optional[Sequence[float]] = None,
         ndvi_dense_hflip_prob: float = 0.5,
         ndvi_dense_vflip_prob: float = 0.0,
+        # Optional Irish Glass Clover mixed dataset
+        irish_enabled: bool = False,
+        irish_root: Optional[str] = None,
+        irish_csv: Optional[str] = None,
+        irish_image_dir: str = "images",
+        irish_image_size: Optional[Union[int, Tuple[int, int]]] = None,
     ) -> None:
         super().__init__()
         self.data_root = data_root
@@ -185,6 +196,20 @@ class PastureDataModule(LightningDataModule):
                 std=list(ndvi_dense_std) if ndvi_dense_std is not None else list(std),
                 hflip_prob=float(ndvi_dense_hflip_prob),
                 vflip_prob=float(ndvi_dense_vflip_prob),
+            )
+        # Irish Glass Clover mixed dataset config
+        self.irish_enabled: bool = bool(irish_enabled)
+        self.irish_root: Optional[str] = str(irish_root) if irish_root else None
+        self.irish_csv: Optional[str] = str(irish_csv) if irish_csv else None
+        self.irish_image_dir: str = str(irish_image_dir or "images")
+        self.irish_image_size: Optional[Union[int, Tuple[int, int]]] = irish_image_size
+        self.irish_train_tf: Optional[T.Compose] = None
+        if self.irish_enabled and self.irish_root and self.irish_csv:
+            # Reuse the same augment cfg as CSIRO, but allow a different image_size
+            irish_size = self.irish_image_size if self.irish_image_size is not None else image_size
+            merged_aug_irish = _merge_augment_cfg(augment_cfg=augment_cfg, train_scale=train_scale, hflip_prob=hflip_prob)
+            self.irish_train_tf, _ = build_aug_transforms(
+                image_size=irish_size, mean=mean, std=std, augment_cfg=merged_aug_irish
             )
         # z-score stats (computed in setup)
         self._reg3_mean: Optional[List[float]] = None
@@ -255,7 +280,9 @@ class PastureDataModule(LightningDataModule):
         assert self.train_df is not None
         species_to_idx = self._ensure_species_mapping()
         state_to_idx = self._ensure_state_mapping()
-        ds = PastureImageDataset(
+        main_datasets: List[Dataset] = []
+
+        csiro_ds = PastureImageDataset(
             records=self.train_df,
             root_dir=self.data_root,
             target_order=self.target_order,
@@ -268,8 +295,34 @@ class PastureDataModule(LightningDataModule):
             state_to_idx=state_to_idx,
             transform=self.train_tf,
         )
+        main_datasets.append(csiro_ds)
+
+        # Optional Irish Glass Clover dataset mixed into the main regression stream
+        if self.irish_enabled and self.irish_root and self.irish_csv and self.irish_train_tf is not None:
+            irish_csv_path = os.path.join(self.irish_root, self.irish_csv)
+            try:
+                irish_ds = IrishGlassCloverDataset(
+                    csv_path=irish_csv_path,
+                    root_dir=self.irish_root,
+                    image_subdir=self.irish_image_dir,
+                    target_order=self.target_order,
+                    reg3_mean=self._reg3_mean,
+                    reg3_std=self._reg3_std,
+                    log_scale_targets=self._log_scale_targets,
+                    transform=self.irish_train_tf,
+                )
+                main_datasets.append(irish_ds)
+            except Exception:
+                # If anything goes wrong, fall back to CSIRO-only training
+                pass
+
+        if len(main_datasets) == 1:
+            main_ds: Dataset = main_datasets[0]
+        else:
+            main_ds = ConcatDataset(main_datasets)
+
         main_loader = DataLoader(
-            ds,
+            main_ds,
             batch_size=self.batch_size,
             shuffle=self.shuffle,
             num_workers=self.num_workers,

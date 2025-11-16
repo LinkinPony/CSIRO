@@ -16,3 +16,6 @@
 [submodule "third_party/peft"]
 	path = third_party/peft
 	url = git@github.com:huggingface/peft.git
+[submodule "third_party/c-mixup"]
+	path = third_party/c-mixup
+	url = git@github.com:huaxiuyao/C-Mixup.git

@@ -578,7 +578,9 @@ def main():
                 value = total - clover - green
         else:
             value = 0.0
-        rows.append((sample_id, float(value)))
+        # Clamp final physical predictions to be non-negative for submission
+        value = max(0.0, float(value))
+        rows.append((sample_id, value))
 
     out_dir = os.path.dirname(os.path.abspath(OUTPUT_SUBMISSION_PATH))
     if out_dir and not os.path.isdir(out_dir):

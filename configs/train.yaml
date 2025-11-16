@@ -1,6 +1,5 @@
 seed: 42
-version: baseline-ndvi-lora-r4
-
+version: baseline-lora-r4-extra-dataset-no-ndvi
 data:
   root: data
   train_csv: train.csv
@@ -147,12 +146,12 @@ kfold:
   even_split: false
 
 trainer:
-  max_epochs: 30
+  max_epochs: 15
   accelerator: auto
   devices: 1
   precision: 16-mixed
   # Control per-epoch steps. Accepts int (absolute batches) or float (fraction).
-  limit_train_batches: 350
+  limit_train_batches: 900
   # With train_all enabled, we default to 1 so that validation uses only the dummy batch.
   limit_val_batches: 1
   log_every_n_steps: 1
@@ -174,7 +173,7 @@ logging:
 
 # Dense NDVI task configuration (tiles from large PNGs under data/NDVI/{carrot,onion}/)
 ndvi_dense:
-  enabled: true
+  enabled: false
   root: /media/dl/dataset/Git/CSIRO/data/NDVI
   tile_size: 640
   tile_stride: 448
@@ -192,3 +191,13 @@ ndvi_dense:
       alpha: 0.3
       use_prev_for_bsz1: true
     vertical_flip_prob: 0.0
+
+irish_glass_clover:
+  enabled: true
+  # Root directory containing data.csv and images/ for the Irish Glass Clover dataset
+  root: data/irish_glass_clover
+  csv: data.csv
+  image_dir: images
+  # Separate image size for this dataset (H, W). Augmentation config is reused from `data.augment`.
+  # You can adjust this to match the native resolution of the Irish images.
+  image_size: [640, 640]

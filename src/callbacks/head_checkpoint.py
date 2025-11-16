@@ -55,30 +55,67 @@ class HeadCheckpoint(Callback):
                 use_output_softplus=use_output_softplus_eff,
             )
 
-            # copy weights: from pl_module.shared_bottleneck + pl_module.reg_head -> head_module linears
             def collect_linears(m: nn.Module):
                 return [mod for mod in m.modules() if isinstance(mod, nn.Linear)]
 
-            src_linears = []
-            if hasattr(pl_module, "shared_bottleneck") and hasattr(pl_module, "reg_head"):
-                src_linears.extend(collect_linears(pl_module.shared_bottleneck))
-                src_linears.append(pl_module.reg_head)
-            else:
-                # fallback to legacy single head
-                src_linears = collect_linears(pl_module.head)
+            # New-style model: shared_bottleneck + reg3_heads (three independent 1-d heads)
+            if hasattr(pl_module, "shared_bottleneck") and hasattr(pl_module, "reg3_heads"):
+                bottleneck_linears = collect_linears(pl_module.shared_bottleneck)
+                tgt_linears = collect_linears(head_module)
+                if len(tgt_linears) != len(bottleneck_linears) + 1:
+                    raise RuntimeError("Mismatch in linear layers between bottleneck and inference head")
 
-            tgt_linears = collect_linears(head_module)
-            if len(src_linears) != len(tgt_linears):
-                raise RuntimeError("Mismatch in linear layers between source heads and inference head")
-            for s, t in zip(src_linears, tgt_linears):
+                # Copy shared bottleneck linear layers 1:1
+                for s, t in zip(bottleneck_linears, tgt_linears[:-1]):
+                    with torch.no_grad():
+                        t.weight.copy_(s.weight.data)
+                        if t.bias is not None and s.bias is not None:
+                            t.bias.copy_(s.bias.data)
+
+                # Aggregate final layer from three scalar heads into a single Linear(out_features=3)
+                final_linear = tgt_linears[-1]
+                reg3_heads = list(getattr(pl_module, "reg3_heads"))
+                if final_linear.out_features != len(reg3_heads):
+                    raise RuntimeError("Final inference head out_features does not match number of reg3 heads")
                 with torch.no_grad():
-                    t.weight.copy_(s.weight.data)
-                    if t.bias is not None and s.bias is not None:
-                        t.bias.copy_(s.bias.data)
-            state_dict_to_save = head_module.state_dict()
+                    for idx, h in enumerate(reg3_heads):
+                        if not isinstance(h, nn.Linear) or h.out_features != 1:
+                            raise RuntimeError("reg3_heads must contain nn.Linear modules with out_features=1")
+                        final_linear.weight[idx : idx + 1, :].copy_(h.weight.data)
+                        if final_linear.bias is not None and h.bias is not None:
+                            final_linear.bias[idx] = h.bias.data[0]
+                state_dict_to_save = head_module.state_dict()
+
+            else:
+                # Legacy path: shared_bottleneck + single reg_head or a monolithic pl_module.head
+                src_linears = []
+                if hasattr(pl_module, "shared_bottleneck") and hasattr(pl_module, "reg_head"):
+                    src_linears.extend(collect_linears(pl_module.shared_bottleneck))
+                    src_linears.append(pl_module.reg_head)
+                else:
+                    # fallback to legacy single head
+                    src_linears = collect_linears(pl_module.head)
+
+                tgt_linears = collect_linears(head_module)
+                if len(src_linears) != len(tgt_linears):
+                    raise RuntimeError("Mismatch in linear layers between source heads and inference head")
+                for s, t in zip(src_linears, tgt_linears):
+                    with torch.no_grad():
+                        t.weight.copy_(s.weight.data)
+                        if t.bias is not None and s.bias is not None:
+                            t.bias.copy_(s.bias.data)
+                state_dict_to_save = head_module.state_dict()
         except Exception:
-            # ultimate fallback: try existing pl_module.head
-            state_dict_to_save = getattr(pl_module, "head").state_dict()
+            # ultimate fallback: try existing pl_module.head if present, otherwise fall back to composed head_module
+            head_attr = getattr(pl_module, "head", None)
+            if head_attr is not None:
+                state_dict_to_save = head_attr.state_dict()
+            else:
+                # if a composed head_module exists, use it; otherwise re-raise
+                if "head_module" in locals():
+                    state_dict_to_save = head_module.state_dict()
+                else:
+                    raise
 
         state: Dict[str, Any] = {
             "state_dict": state_dict_to_save,

@@ -114,7 +114,13 @@ class BiomassRegressor(LightningModule):
 
         # Task heads
         bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
-        self.reg_head = nn.Linear(bottleneck_dim, num_outputs)  # main 3-d regression
+        # Main reg3 heads: three independent 1-d regressors (one per biomass target)
+        self.num_outputs: int = int(num_outputs)
+        if self.num_outputs < 1:
+            raise ValueError("num_outputs must be >= 1 for reg3 head")
+        self.reg3_heads = nn.ModuleList(
+            [nn.Linear(bottleneck_dim, 1) for _ in range(self.num_outputs)]
+        )
 
         self.mtl_enabled: bool = bool(mtl_enabled)
         # Per-task toggles (gated by global MTL flag)
@@ -189,11 +195,21 @@ class BiomassRegressor(LightningModule):
         # --- CutMix batch-level augmentation ---
         self._cutmix_main = CutMixBatchAugment.from_cfg(cutmix_cfg)
 
+    def _forward_reg3_logits(self, z: Tensor) -> Tensor:
+        """
+        Compute main reg3 prediction in normalized domain (g/m^2 or z-score),
+        by aggregating three independent scalar heads into a (B, num_outputs) tensor.
+        """
+        preds: List[Tensor] = []
+        for head in self.reg3_heads:
+            preds.append(head(z))
+        return torch.cat(preds, dim=-1)
+
     def forward(self, images: Tensor) -> Tensor:
         # Return main 3-d regression prediction in original grams (g)
         features = self.feature_extractor(images)
         z = self.shared_bottleneck(features)
-        out = self.reg_head(z)
+        out = self._forward_reg3_logits(z)
         if self.out_softplus is not None:
             out = self.out_softplus(out)
         # Invert normalization and scaling to grams
@@ -308,24 +324,34 @@ class BiomassRegressor(LightningModule):
 
         # y_reg3 provided by dataset is already in normalized domain (z-score on g/m^2 when enabled)
         y_reg3: Tensor = batch["y_reg3"]  # (B,3)
+        reg3_mask: Optional[Tensor] = batch.get("reg3_mask", None)
         y_height: Tensor = batch["y_height"]  # (B,1)
         y_ndvi: Tensor = batch["y_ndvi"]  # (B,1)
         y_species: Tensor = batch["y_species"]  # (B,)
         y_state: Tensor = batch["y_state"]  # (B,)
 
-        pred_reg3 = self.reg_head(z)
+        pred_reg3 = self._forward_reg3_logits(z)
         if self.out_softplus is not None:
             pred_reg3 = self.out_softplus(pred_reg3)
 
+        # Optional per-dimension supervision mask for reg3 (to support partial targets)
+        if reg3_mask is not None:
+            mask = reg3_mask.to(device=y_reg3.device, dtype=y_reg3.dtype)
+        else:
+            mask = torch.ones_like(y_reg3, dtype=y_reg3.dtype, device=y_reg3.device)
+        diff_reg3 = pred_reg3 - y_reg3
+        diff2_reg3 = (diff_reg3 * diff_reg3) * mask
+        mask_sum_reg3 = mask.sum().clamp_min(1.0)
         # If MTL is disabled, optimize only the main regression task
-        loss_reg3 = F.mse_loss(pred_reg3, y_reg3)
+        loss_reg3 = diff2_reg3.sum() / mask_sum_reg3
         if (not self.mtl_enabled) or (self.enable_height is False and self.enable_ndvi is False and self.enable_species is False and self.enable_state is False):
             self.log(f"{stage}_loss_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
-            mae_reg3 = F.l1_loss(pred_reg3, y_reg3)
+            mae_reg3 = (diff_reg3.abs() * mask).sum() / mask_sum_reg3
             self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
             with torch.no_grad():
-                per_dim_mse = torch.mean((pred_reg3 - y_reg3) ** 2, dim=0)
+                per_dim_den = mask.sum(dim=0).clamp_min(1.0)
+                per_dim_mse = diff2_reg3.sum(dim=0) / per_dim_den
                 for i in range(per_dim_mse.shape[0]):
                     self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
 
@@ -364,10 +390,11 @@ class BiomassRegressor(LightningModule):
 
         # Collect losses in consistent order for UW/equal weighting
         named_losses: List[Tuple[str, Tensor]] = [("reg3", loss_reg3)]
-        mae_reg3 = F.l1_loss(pred_reg3, y_reg3)
+        mae_reg3 = (diff_reg3.abs() * mask).sum() / mask_sum_reg3
         self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
         with torch.no_grad():
-            per_dim_mse = torch.mean((pred_reg3 - y_reg3) ** 2, dim=0)
+            per_dim_den = mask.sum(dim=0).clamp_min(1.0)
+            per_dim_mse = diff2_reg3.sum(dim=0) / per_dim_den
             for i in range(per_dim_mse.shape[0]):
                 self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
 
@@ -379,10 +406,21 @@ class BiomassRegressor(LightningModule):
             self.log(f"{stage}_mae_height", mae_height, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("height", loss_height))
         if self.enable_ndvi:
-            loss_ndvi = F.mse_loss(pred_ndvi, y_ndvi)  # type: ignore[arg-type]
+            ndvi_mask: Optional[Tensor] = batch.get("ndvi_mask", None)
+            if ndvi_mask is not None:
+                m_nd = ndvi_mask.to(device=y_ndvi.device, dtype=y_ndvi.dtype)  # type: ignore[arg-type]
+            else:
+                m_nd = torch.ones_like(y_ndvi, dtype=y_ndvi.dtype, device=y_ndvi.device)  # type: ignore[arg-type]
+
+            diff_ndvi = pred_ndvi - y_ndvi  # type: ignore[operator]
+            diff2_ndvi = (diff_ndvi * diff_ndvi) * m_nd
+            mask_sum_ndvi = m_nd.sum().clamp_min(0.0)
+
+            if mask_sum_ndvi > 0:
+                loss_ndvi = diff2_ndvi.sum() / mask_sum_ndvi
+                mae_ndvi = (diff_ndvi.abs() * m_nd).sum() / mask_sum_ndvi
             self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
-            mae_ndvi = F.l1_loss(pred_ndvi, y_ndvi)  # type: ignore[arg-type]
             self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("ndvi", loss_ndvi))
         if self.enable_species and logits_species is not None:

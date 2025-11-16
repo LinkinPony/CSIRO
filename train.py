@@ -112,6 +112,7 @@ def main():
             area_m2 = 1.0
         log_scale_targets_cfg = bool(cfg["model"].get("log_scale_targets", False))
 
+        irish_cfg = cfg.get("irish_glass_clover", {})
         dm = PastureDataModule(
             data_root=cfg["data"]["root"],
             train_csv=cfg["data"]["train_csv"],
@@ -142,6 +143,12 @@ def main():
             ndvi_dense_std=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("std", cfg["data"]["normalization"]["std"])),
             ndvi_dense_hflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("horizontal_flip_prob", cfg["data"]["augment"]["horizontal_flip_prob"])),
             ndvi_dense_vflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("vertical_flip_prob", 0.0)),
+            # Irish Glass Clover (optional mixed dataset)
+            irish_enabled=bool(irish_cfg.get("enabled", False)),
+            irish_root=str(irish_cfg.get("root", "")) if irish_cfg.get("root", None) is not None else None,
+            irish_csv=str(irish_cfg.get("csv", "data.csv")) if irish_cfg.get("csv", None) is not None else None,
+            irish_image_dir=str(irish_cfg.get("image_dir", "images")),
+            irish_image_size=_parse_image_size(irish_cfg.get("image_size", cfg["data"]["image_size"])) if irish_cfg.get("image_size", None) is not None else None,
         )
 
         # MTL toggle: when disabled, train only reg3 task
@@ -167,6 +174,7 @@ def main():
                 val_df = pd.concat([dummy_val], ignore_index=True)
                 train_df = full_df.reset_index(drop=True)
                 # Recreate datamodule with predefined splits
+                irish_cfg = cfg.get("irish_glass_clover", {})
                 dm = PastureDataModule(
                     data_root=cfg["data"]["root"],
                     train_csv=cfg["data"]["train_csv"],
@@ -199,6 +207,12 @@ def main():
                     ndvi_dense_std=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("std", cfg["data"]["normalization"]["std"])),
                     ndvi_dense_hflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("horizontal_flip_prob", cfg["data"]["augment"]["horizontal_flip_prob"])),
                     ndvi_dense_vflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("vertical_flip_prob", 0.0)),
+                    # Irish Glass Clover (optional mixed dataset)
+                    irish_enabled=bool(irish_cfg.get("enabled", False)),
+                    irish_root=str(irish_cfg.get("root", "")) if irish_cfg.get("root", None) is not None else None,
+                    irish_csv=str(irish_cfg.get("csv", "data.csv")) if irish_cfg.get("csv", None) is not None else None,
+                    irish_image_dir=str(irish_cfg.get("image_dir", "images")),
+                    irish_image_size=_parse_image_size(irish_cfg.get("image_size", cfg["data"]["image_size"])) if irish_cfg.get("image_size", None) is not None else None,
                 )
             except Exception as e:
                 logger.warning(f"Constructing train_all splits failed: {e}")
@@ -300,12 +314,16 @@ def main():
 
         head_ckpt_dir = ckpt_dir / "head"
         callbacks = []
-        # Lightweight Lightning checkpoint (last + best) to preserve full training state, excluding backbone weights
+        # Lightweight Lightning checkpoint (last + best) to preserve full training state, excluding backbone weights.
+        # When multiple val dataloaders are used (NDVI-dense enabled), Lightning logs metrics with
+        # the suffix `/dataloader_idx_0`. Otherwise, it logs plain `val_loss`.
+        use_multi_val = bool(cfg.get("ndvi_dense", {}).get("enabled", False))
+        monitor_metric = "val_loss/dataloader_idx_0" if use_multi_val else "val_loss"
         checkpoint_cb = ModelCheckpoint(
             dirpath=str(ckpt_dir),
             filename="best",
             auto_insert_metric_name=False,
-            monitor="val_loss/dataloader_idx_0",
+            monitor=monitor_metric,
             mode="min",
             save_top_k=1,
             save_last=True,

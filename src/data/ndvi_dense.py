@@ -282,6 +282,7 @@ class NdviDenseAsScalarDataset(Dataset):
 
         # Placeholder targets to satisfy CutMix/main collate
         y_reg3 = torch.zeros((self.reg3_dim,), dtype=torch.float32)
+        reg3_mask = torch.zeros((self.reg3_dim,), dtype=torch.float32)
         y_height = torch.zeros((1,), dtype=torch.float32)
         y_species = torch.tensor(0, dtype=torch.long)
         y_state = torch.tensor(0, dtype=torch.long)
@@ -289,6 +290,7 @@ class NdviDenseAsScalarDataset(Dataset):
         return {
             "image": rgb,
             "y_reg3": y_reg3,
+            "reg3_mask": reg3_mask,
             "y_height": y_height,
             "y_ndvi": y_ndvi_scalar,
             "y_species": y_species,
