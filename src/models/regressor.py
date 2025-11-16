@@ -58,6 +58,14 @@ class BiomassRegressor(LightningModule):
         cutmix_cfg: Optional[Dict[str, Any]] = None,
         ndvi_dense_cutmix_cfg: Optional[Dict[str, Any]] = None,
         cmixup_cfg: Optional[Dict[str, Any]] = None,
+        # MIR (tile-based multi-instance regression) configuration
+        mir_enabled: bool = False,
+        mir_attn_hidden_dim: int = 256,
+        mir_num_heads: int = 1,
+        mir_token_normalize: str = "none",
+        mir_instance_dropout: float = 0.0,
+        mir_tiling_cfg: Optional[Dict[str, Any]] = None,
+        mir_stage1_epochs: int = 0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -69,7 +77,8 @@ class BiomassRegressor(LightningModule):
             weights_path=weights_path,
         )
         # Optionally inject LoRA into the frozen backbone
-        if peft_cfg and bool(peft_cfg.get("enabled", False)):
+        self._peft_enabled: bool = bool(peft_cfg and peft_cfg.get("enabled", False))
+        if self._peft_enabled:
             try:
                 # Allow gradient flow for adapters only
                 feature_extractor.inference_only = False
@@ -197,6 +206,57 @@ class BiomassRegressor(LightningModule):
         self._cmixup_main = CMixupBatchAugment.from_cfg(cmixup_cfg)
         self._cutmix_main = CutMixBatchAugment.from_cfg(cutmix_cfg)
 
+        # --- MIR (tile-based multi-instance regression) configuration ---
+        self.mir_enabled: bool = bool(mir_enabled)
+        self._mir_stage1_epochs: int = max(0, int(mir_stage1_epochs))
+        self._mir_attn_hidden_dim: int = int(mir_attn_hidden_dim)
+        self._mir_num_heads: int = max(1, int(mir_num_heads))
+        self._mir_token_normalize: str = str(mir_token_normalize or "none").lower()
+        self._mir_instance_dropout: float = float(max(0.0, min(1.0, mir_instance_dropout)))
+
+        # Per-dataset tiling config, keyed by dataset_id (e.g., "csiro", "irish_glass_clover").
+        # YAML uses [W, H]; here we normalize to dicts with (tile_h, tile_w, stride_h, stride_w, max_tiles).
+        self._mir_tiling_cfg: Dict[str, Dict[str, Any]] = {}
+        if mir_tiling_cfg:
+            try:
+                for ds_name, tcfg in mir_tiling_cfg.items():
+                    if tcfg is None:
+                        continue
+                    size = tcfg.get("tile_size", None)
+                    if size is None or len(size) != 2:
+                        continue
+                    stride = tcfg.get("tile_stride", size)
+                    if stride is None or len(stride) != 2:
+                        stride = size
+                    # YAML is [W, H]; convert to (H, W)
+                    tile_w, tile_h = int(size[0]), int(size[1])
+                    stride_w, stride_h = int(stride[0]), int(stride[1])
+                    max_tiles = tcfg.get("max_tiles_per_image", None)
+                    max_tiles_int = int(max_tiles) if max_tiles is not None else None
+                    if max_tiles_int is not None and max_tiles_int <= 0:
+                        max_tiles_int = None
+                    self._mir_tiling_cfg[str(ds_name)] = {
+                        "tile_h": max(1, tile_h),
+                        "tile_w": max(1, tile_w),
+                        "stride_h": max(1, stride_h),
+                        "stride_w": max(1, stride_w),
+                        "max_tiles": max_tiles_int,
+                    }
+            except Exception:
+                # If anything goes wrong, fall back to empty tiling config.
+                self._mir_tiling_cfg = {}
+
+        # Attention parameters for MIR pooling (operate on 2*embedding_dim tile features)
+        in_dim_mir = embedding_dim * 2
+        if self.mir_enabled:
+            self._mir_ln = nn.LayerNorm(in_dim_mir)
+            self._mir_attn_proj = nn.Linear(in_dim_mir, self._mir_attn_hidden_dim)
+            self._mir_attn_out = nn.Linear(self._mir_attn_hidden_dim, self._mir_num_heads)
+        else:
+            self._mir_ln = None  # type: ignore[assignment]
+            self._mir_attn_proj = None  # type: ignore[assignment]
+            self._mir_attn_out = None  # type: ignore[assignment]
+
     def _forward_reg3_logits(self, z: Tensor) -> Tensor:
         """
         Compute main reg3 prediction in normalized domain (g/m^2 or z-score),
@@ -209,7 +269,10 @@ class BiomassRegressor(LightningModule):
 
     def forward(self, images: Tensor) -> Tensor:
         # Return main 3-d regression prediction in original grams (g)
-        features = self.feature_extractor(images)
+        if self.mir_enabled:
+            features = self._extract_mir_bag_features(images, dataset_ids=None)
+        else:
+            features = self.feature_extractor(images)
         z = self.shared_bottleneck(features)
         out = self._forward_reg3_logits(z)
         if self.out_softplus is not None:
@@ -263,6 +326,267 @@ class BiomassRegressor(LightningModule):
             self.log(f"{stage}_uw_logvar_{name}", s.squeeze(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
             self.log(f"{stage}_uw_sigma_{name}", sigma.squeeze(), on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
+    # --- MIR / LoRA stage helpers ---
+    def _mir_in_stage1(self) -> bool:
+        """
+        Returns True during the first stage of MIR training (before LoRA fine-tuning).
+        Controlled by mir_stage1_epochs in the config.
+        """
+        if not (self.mir_enabled and self._mir_stage1_epochs > 0):
+            return False
+        try:
+            cur_epoch = int(getattr(self, "current_epoch", 0))
+        except Exception:
+            cur_epoch = 0
+        return cur_epoch < self._mir_stage1_epochs
+
+    def on_train_epoch_start(self) -> None:  # type: ignore[override]
+        """
+        Two-stage training in a single run:
+          - Stage 1 (epoch < mir_stage1_epochs): MIR head is trained with full tiles; LoRA params are frozen.
+          - Stage 2 (epoch >= mir_stage1_epochs): LoRA params are unfrozen and trained together with MIR/MLP.
+        Also logs the stage and transitions explicitly.
+        """
+        super().on_train_epoch_start()
+        # Determine current MIR stage
+        in_stage1 = self._mir_in_stage1()
+
+        # Log stage information (only when MIR is enabled)
+        if self.mir_enabled:
+            try:
+                cur_epoch = int(getattr(self, "current_epoch", 0))
+            except Exception:
+                cur_epoch = 0
+            prev = getattr(self, "_mir_prev_stage1_flag", None)
+            if prev is None:
+                # First epoch
+                if in_stage1:
+                    logger.info(
+                        f"[MIR] Epoch {cur_epoch}: Stage 1 (frozen LoRA, all tiles, ignore max_tiles_per_image & instance_dropout)."
+                    )
+                else:
+                    logger.info(
+                        f"[MIR] Epoch {cur_epoch}: Stage 2 (LoRA trainable, max_tiles_per_image & instance_dropout active if configured)."
+                    )
+            elif prev and not in_stage1:
+                # Stage 1 -> Stage 2 transition
+                logger.info(
+                    f"[MIR] Switching to Stage 2 at epoch {cur_epoch}: enabling LoRA training and applying max_tiles_per_image / instance_dropout."
+                )
+            elif (not prev) and in_stage1:
+                # Unexpected Stage 2 -> Stage 1 transition (should not normally happen)
+                logger.info(
+                    f"[MIR] Switched back to Stage 1 at epoch {cur_epoch}: freezing LoRA and using all tiles."
+                )
+            self._mir_prev_stage1_flag = in_stage1
+
+        # If no LoRA is configured, nothing to freeze/unfreeze
+        if not self._peft_enabled:
+            return
+        # Freeze LoRA parameters in stage 1, unfreeze afterwards.
+        try:
+            backbone = getattr(self.feature_extractor, "backbone", None)
+        except Exception:
+            backbone = None
+        if backbone is None:
+            return
+        try:
+            lora_params = get_lora_param_list(backbone)
+        except Exception:
+            lora_params = []
+        for p in lora_params:
+            p.requires_grad = not in_stage1
+
+    def _get_mir_tiling_for_dataset(self, dataset_id: Any) -> Optional[Dict[str, Any]]:
+        if not self.mir_enabled or not self._mir_tiling_cfg:
+            return None
+        try:
+            key = str(dataset_id) if dataset_id is not None else "csiro"
+        except Exception:
+            key = "csiro"
+        cfg = self._mir_tiling_cfg.get(key, None)
+        if cfg is None:
+            # Fallback to csiro if defined
+            cfg = self._mir_tiling_cfg.get("csiro", None)
+        return cfg
+
+    def _build_mir_tiles(self, images: Tensor, dataset_ids: Optional[Any]) -> Tuple[Tensor, Tensor]:
+        """
+        Build tiled crops for MIR.
+
+        Args:
+            images: (B, C, H, W)
+            dataset_ids: optional sequence/list of per-sample identifiers (e.g., "csiro", "irish_glass_clover").
+
+        Returns:
+            tiles: (N_total, C, Th, Tw)
+            owners: (N_total,) long tensor mapping each tile to its originating sample index in [0, B-1].
+        """
+        B, C, H, W = images.shape
+        device = images.device
+        tiles: list[Tensor] = []
+        owners: list[Tensor] = []
+
+        ds_ids_seq: Optional[list[Any]] = None
+        if dataset_ids is not None:
+            if isinstance(dataset_ids, (list, tuple)):
+                ds_ids_seq = list(dataset_ids)
+            else:
+                # Fallback: wrap scalar / tensor into list with repetition if needed
+                try:
+                    ds_ids_seq = [dataset_ids for _ in range(B)]
+                except Exception:
+                    ds_ids_seq = None
+
+        for i in range(B):
+            img = images[i : i + 1]  # (1, C, H, W)
+            ds_id = None
+            if ds_ids_seq is not None and i < len(ds_ids_seq):
+                ds_id = ds_ids_seq[i]
+            tcfg = self._get_mir_tiling_for_dataset(ds_id)
+            if tcfg is None:
+                # Fallback: treat full image as a single tile
+                tiles.append(img)
+                owners.append(torch.full((1,), i, dtype=torch.long, device=device))
+                continue
+
+            tile_h = int(tcfg.get("tile_h", H))
+            tile_w = int(tcfg.get("tile_w", W))
+            stride_h = int(tcfg.get("stride_h", tile_h))
+            stride_w = int(tcfg.get("stride_w", tile_w))
+            max_tiles = tcfg.get("max_tiles", None)
+
+            tile_h = max(1, min(tile_h, H))
+            tile_w = max(1, min(tile_w, W))
+            stride_h = max(1, stride_h)
+            stride_w = max(1, stride_w)
+
+            positions: list[Tuple[int, int]] = []
+            y = 0
+            while y + tile_h <= H:
+                x = 0
+                while x + tile_w <= W:
+                    positions.append((y, x))
+                    x += stride_w
+                y += stride_h
+
+            if not positions:
+                # As a safety fallback, use the full image
+                tiles.append(img)
+                owners.append(torch.full((1,), i, dtype=torch.long, device=device))
+                continue
+
+            # Apply max_tiles_per_image only in LoRA-enabled second stage training.
+            if (
+                max_tiles is not None
+                and len(positions) > max_tiles
+                and self._peft_enabled
+                and self.training
+                and (not self._mir_in_stage1())
+            ):
+                # Randomly sample a subset of tile positions for this image.
+                perm = torch.randperm(len(positions), device=device)
+                keep_idx = perm[:max_tiles].tolist()
+                positions = [positions[j] for j in keep_idx]
+
+            for (yy, xx) in positions:
+                tiles.append(img[..., yy : yy + tile_h, xx : xx + tile_w])
+                owners.append(torch.full((1,), i, dtype=torch.long, device=device))
+
+        if not tiles:
+            # Degenerate fallback: treat each image as a single tile
+            owners_tensor = torch.arange(B, dtype=torch.long, device=device)
+            return images, owners_tensor
+
+        tiles_tensor = torch.cat(tiles, dim=0)
+        owners_tensor = torch.cat(owners, dim=0)
+        return tiles_tensor, owners_tensor
+
+    def _mir_pool(self, tile_feats: Tensor, tile_to_image: Tensor) -> Tensor:
+        """
+        Attention-based MIR pooling over tile features.
+
+        Args:
+            tile_feats: (N_total, D) tensor of tile-level features.
+            tile_to_image: (N_total,) long tensor mapping each tile to its sample index.
+
+        Returns:
+            bag_feats: (B, D) tensor of per-sample aggregated features.
+        """
+        if tile_feats.numel() == 0 or tile_feats.dim() != 2:
+            return tile_feats
+        N, D = tile_feats.shape
+        B = int(tile_to_image.max().item()) + 1 if tile_to_image.numel() > 0 else 0
+        if B <= 0:
+            return tile_feats.new_zeros((0, D))
+
+        h = tile_feats
+        if self._mir_token_normalize == "layernorm" and self._mir_ln is not None:
+            h = self._mir_ln(h)
+        elif self._mir_token_normalize == "l2":
+            h = F.normalize(h, p=2.0, dim=-1)
+
+        # Projection to attention hidden space and per-head scores
+        if self._mir_attn_proj is None or self._mir_attn_out is None:
+            return h.view(B, -1, D).mean(dim=1)
+
+        u = torch.tanh(self._mir_attn_proj(h))  # (N, H_dim)
+        scores = self._mir_attn_out(u)  # (N, num_heads)
+
+        bag_feats = tile_feats.new_zeros((B, D))
+        num_heads = scores.shape[1]
+
+        for b in range(B):
+            mask = (tile_to_image == b)
+            idx = mask.nonzero(as_tuple=False).squeeze(-1)
+            if idx.numel() == 0:
+                continue
+
+            # Instance dropout during training: randomly drop some tiles but keep at least one.
+            # Only used in LoRA-enabled second stage; MIR pretraining uses all tiles.
+            if (
+                self.training
+                and self._peft_enabled
+                and (not self._mir_in_stage1())
+                and self._mir_instance_dropout > 0.0
+                and idx.numel() > 1
+            ):
+                keep_mask = torch.rand(idx.shape[0], device=idx.device) > self._mir_instance_dropout
+                if not bool(keep_mask.any()):
+                    # Ensure at least one tile remains
+                    keep_mask[torch.randint(low=0, high=idx.shape[0], size=(1,), device=idx.device)] = True
+                idx = idx[keep_mask]
+
+            h_b = h[idx]  # (T_b, D)
+            scores_b = scores[idx]  # (T_b, num_heads)
+
+            if h_b.shape[0] == 0:
+                continue
+
+            head_outputs: list[Tensor] = []
+            for k in range(num_heads):
+                attn_raw = scores_b[:, k]  # (T_b,)
+                attn = F.softmax(attn_raw, dim=0)
+                head_outputs.append(torch.sum(attn.unsqueeze(-1) * h_b, dim=0))
+
+            # Average outputs from all heads to keep dimensionality D
+            bag_feats[b] = torch.stack(head_outputs, dim=0).mean(dim=0)
+
+        return bag_feats
+
+    def _extract_mir_bag_features(self, images: Tensor, dataset_ids: Optional[Any]) -> Tensor:
+        """
+        Construct tile bags and apply MIR pooling to obtain per-image features.
+        """
+        if not self.mir_enabled:
+            return self.feature_extractor(images)
+        tiles, owners = self._build_mir_tiles(images, dataset_ids)
+        if tiles.size(0) == 0:
+            return self.feature_extractor(images)
+        tile_feats = self.feature_extractor(tiles)
+        bag_feats = self._mir_pool(tile_feats, owners)
+        return bag_feats
+
     def _shared_step(self, batch: Any, stage: str) -> Dict[str, Tensor]:
         # When multiple dataloaders are used, Lightning may deliver a list/tuple of batches
         # For alternating training, process only ONE sub-batch per step to avoid holding multiple graphs.
@@ -309,7 +633,11 @@ class BiomassRegressor(LightningModule):
         images: Tensor = batch["image"]
         is_ndvi_only: bool = bool(batch.get("ndvi_only", False))
 
-        features = self.feature_extractor(images)
+        if self.mir_enabled and not is_ndvi_only:
+            dataset_ids = batch.get("dataset_id", None)
+            features = self._extract_mir_bag_features(images, dataset_ids)
+        else:
+            features = self.feature_extractor(images)
         z = self.shared_bottleneck(features)
         if is_ndvi_only:
             # NDVI-only batch (no reg3 supervision). Optimize NDVI scalar head only.

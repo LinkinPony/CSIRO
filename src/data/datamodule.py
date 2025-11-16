@@ -115,6 +115,8 @@ class PastureImageDataset(Dataset):
             "ndvi_mask": ndvi_mask,       # 1 => NDVI supervised
             "y_species": y_species,
             "y_state": y_state,
+            # Identifier used by MIR tiling logic to select per-dataset tile params.
+            "dataset_id": "csiro",
         }
 
 

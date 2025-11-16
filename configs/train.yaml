@@ -1,5 +1,5 @@
 seed: 42
-version: baseline-lora-r4-extra-dataset-cmixup
+version: baseline-lora-r4-extra-dataset-mir
 data:
   root: data
   train_csv: train.csv
@@ -9,7 +9,7 @@ data:
     csiro:
       width_m: 0.7
       length_m: 0.3
-  image_size: [960, 480]
+  image_size: [2000, 1000]
   batch_size: 1
   val_batch_size: 1
   num_workers: 20
@@ -152,7 +152,7 @@ kfold:
   even_split: false
 
 trainer:
-  max_epochs: 15
+  max_epochs: 45
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -206,4 +206,32 @@ irish_glass_clover:
   image_dir: images
   # Separate image size for this dataset (H, W). Augmentation config is reused from `data.augment`.
   # You can adjust this to match the native resolution of the Irish images.
-  image_size: [640, 640]
+  image_size: [2000, 2000]
+
+mir:
+  # Single global flag to enable / disable Attention-based MIR pipeline.
+  enabled: true
+  # Number of initial epochs to train MIR head with full tiles and frozen LoRA
+  # (stage 1). After this, LoRA parameters are unfrozen and max_tiles_per_image /
+  # instance_dropout are applied (stage 2) within the same training run.
+  stage1_epochs: 5
+  # Attention hidden dimension for MIR pooling.
+  attn_hidden_dim: 256
+  # Number of attention heads; bag representations from different heads are averaged
+  # to keep the final feature dimension equal to 2 * embedding_dim.
+  num_heads: 1
+  # Token normalization before attention: one of [none, layernorm, l2].
+  token_normalize: none
+  # Dropout probability for randomly dropping tile instances during training.
+  instance_dropout: 0.1
+  # Per-dataset tiling settings. Tile size and stride are given as [W, H] and
+  # will be converted to (H, W) in code.
+  tiling:
+    csiro:
+      tile_size: [512, 512]
+      tile_stride: [512, 512]
+      max_tiles_per_image: 2
+    irish_glass_clover:
+      tile_size: [512, 512]
+      tile_stride: [512, 512]
+      max_tiles_per_image: 2

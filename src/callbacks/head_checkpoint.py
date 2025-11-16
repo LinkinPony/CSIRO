@@ -117,6 +117,38 @@ class HeadCheckpoint(Callback):
                 else:
                     raise
 
+        # If MIR is enabled, append MIR attention pooling weights so that the
+        # inference script can reconstruct the full MIR head (tiling lives in
+        # the YAML config, so only the attention parameters are needed here).
+        try:
+            mir_enabled = bool(getattr(pl_module.hparams, "mir_enabled", False)) if hasattr(pl_module, "hparams") else False
+        except Exception:
+            mir_enabled = False
+        if mir_enabled:
+            try:
+                mir_ln = getattr(pl_module, "_mir_ln", None)
+                if isinstance(mir_ln, nn.LayerNorm):
+                    state_dict_to_save["mir_ln.weight"] = mir_ln.weight.detach().cpu()
+                    state_dict_to_save["mir_ln.bias"] = mir_ln.bias.detach().cpu()
+            except Exception:
+                pass
+            try:
+                mir_attn_proj = getattr(pl_module, "_mir_attn_proj", None)
+                if isinstance(mir_attn_proj, nn.Linear):
+                    state_dict_to_save["mir_attn_proj.weight"] = mir_attn_proj.weight.detach().cpu()
+                    if mir_attn_proj.bias is not None:
+                        state_dict_to_save["mir_attn_proj.bias"] = mir_attn_proj.bias.detach().cpu()
+            except Exception:
+                pass
+            try:
+                mir_attn_out = getattr(pl_module, "_mir_attn_out", None)
+                if isinstance(mir_attn_out, nn.Linear):
+                    state_dict_to_save["mir_attn_out.weight"] = mir_attn_out.weight.detach().cpu()
+                    if mir_attn_out.bias is not None:
+                        state_dict_to_save["mir_attn_out.bias"] = mir_attn_out.bias.detach().cpu()
+            except Exception:
+                pass
+
         state: Dict[str, Any] = {
             "state_dict": state_dict_to_save,
             "meta": {
@@ -128,6 +160,13 @@ class HeadCheckpoint(Callback):
                 "head_dropout": float(getattr(pl_module.hparams, "dropout", 0.0)) if hasattr(pl_module, "hparams") else 0.0,
                 "use_output_softplus": (bool(getattr(pl_module.hparams, "use_output_softplus", True)) and not bool(getattr(pl_module.hparams, "log_scale_targets", False))) if hasattr(pl_module, "hparams") else True,
                 "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,
+                "mir": {
+                    "enabled": bool(getattr(pl_module.hparams, "mir_enabled", False)) if hasattr(pl_module, "hparams") else False,
+                    "attn_hidden_dim": int(getattr(pl_module.hparams, "mir_attn_hidden_dim", 256)) if hasattr(pl_module, "hparams") else 256,
+                    "num_heads": int(getattr(pl_module.hparams, "mir_num_heads", 1)) if hasattr(pl_module, "hparams") else 1,
+                    "token_normalize": getattr(pl_module.hparams, "mir_token_normalize", "none") if hasattr(pl_module, "hparams") else "none",
+                    "instance_dropout": float(getattr(pl_module.hparams, "mir_instance_dropout", 0.0)) if hasattr(pl_module, "hparams") else 0.0,
+                },
             },
         }
         # Optionally bundle LoRA adapter payload alongside the head (to preserve the two-inputs rule at inference)

@@ -307,10 +307,19 @@ def extract_features_for_images(
     batch_size: int,
     num_workers: int,
 ) -> Tuple[List[str], torch.Tensor]:
+    """
+    Legacy helper: extract CLS+mean features for full images (non-MIR path).
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
 
     feature_extractor.eval().to(device)
 
@@ -337,6 +346,228 @@ def predict_from_features(features_cpu: torch.Tensor, head: nn.Module, batch_siz
             out = head(chunk)
             preds_list.append(out.detach().cpu().float())
     return torch.cat(preds_list, dim=0) if preds_list else torch.empty((0, 3), dtype=torch.float32)
+
+
+def _build_mir_tiling_cfg(cfg: Dict) -> Tuple[int, int, int, int, Optional[int]]:
+    """
+    Resolve MIR tiling config for the main dataset (typically 'csiro').
+    Returns (tile_h, tile_w, stride_h, stride_w, max_tiles_per_image).
+    """
+    mir_cfg = dict(cfg.get("mir", {}))
+    tiling = dict(mir_cfg.get("tiling", {}))
+    ds_name = str(cfg.get("data", {}).get("dataset", "csiro"))
+    ds_tiling = dict(tiling.get(ds_name, tiling.get("csiro", {})))
+    size = ds_tiling.get("tile_size", None)
+    if size is None or not isinstance(size, (list, tuple)) or len(size) != 2:
+        # Fallback: single-tile covering the full resized image
+        tile_w, tile_h = cfg["data"]["image_size"][0], cfg["data"]["image_size"][1]
+    else:
+        tile_w, tile_h = int(size[0]), int(size[1])
+    stride = ds_tiling.get("tile_stride", size)
+    if stride is None or not isinstance(stride, (list, tuple)) or len(stride) != 2:
+        stride_w, stride_h = tile_w, tile_h
+    else:
+        stride_w, stride_h = int(stride[0]), int(stride[1])
+    max_tiles = ds_tiling.get("max_tiles_per_image", None)
+    max_tiles_int = int(max_tiles) if max_tiles is not None else None
+    if max_tiles_int is not None and max_tiles_int <= 0:
+        max_tiles_int = None
+    # YAML is [W, H]; convert to (H, W)
+    tile_h = max(1, int(tile_h))
+    tile_w = max(1, int(tile_w))
+    stride_h = max(1, int(stride_h))
+    stride_w = max(1, int(stride_w))
+    return tile_h, tile_w, stride_h, stride_w, max_tiles_int
+
+
+def _extract_mir_tile_features_for_images(
+    feature_extractor: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: int,
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+    tile_h: int,
+    tile_w: int,
+    stride_h: int,
+    stride_w: int,
+    max_tiles_per_image: Optional[int],
+) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+    """
+    Extract DINOv3 features for MIR tiles across all images.
+
+    Returns:
+        rels: list of image paths in order.
+        tile_feats_cpu: (N_total, D) tile-level features on CPU.
+        owners_cpu: (N_total,) long tensor mapping each tile to its image index.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    feature_extractor.eval().to(device)
+
+    rels: List[str] = []
+    tile_feats_cpu: List[torch.Tensor] = []
+    owners_cpu: List[torch.Tensor] = []
+
+    global_index = 0
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device, non_blocking=True)  # (B,C,H,W)
+            B, _, H, W = images.shape
+            rels.extend(list(rel_paths))
+
+            # Clamp tile size to actual image size (after resize)
+            th = min(tile_h, H)
+            tw = min(tile_w, W)
+            sh = stride_h
+            sw = stride_w
+
+            tiles: List[torch.Tensor] = []
+            owners: List[int] = []
+
+            for b in range(B):
+                img = images[b : b + 1]  # (1,C,H,W)
+                positions: List[Tuple[int, int]] = []
+                y = 0
+                while y + th <= H:
+                    x = 0
+                    while x + tw <= W:
+                        positions.append((y, x))
+                        x += sw
+                    y += sh
+                if not positions:
+                    # Fallback: use full image as a single tile
+                    tiles.append(img)
+                    owners.append(global_index + b)
+                    continue
+                if max_tiles_per_image is not None and len(positions) > max_tiles_per_image:
+                    positions = positions[:max_tiles_per_image]
+                for (yy, xx) in positions:
+                    tiles.append(img[..., yy : yy + th, xx : xx + tw])
+                    owners.append(global_index + b)
+
+            if tiles:
+                tile_batch = torch.cat(tiles, dim=0)  # (N_b,C,th,tw)
+                feats = feature_extractor(tile_batch)
+                tile_feats_cpu.append(feats.detach().cpu().float())
+                owners_cpu.append(torch.tensor(owners, dtype=torch.long))
+
+            global_index += B
+
+    if not tile_feats_cpu:
+        # Degenerate fallback: no tiles created; return empty tensors
+        return rels, torch.empty((0, 0), dtype=torch.float32), torch.empty((0,), dtype=torch.long)
+
+    tile_feats = torch.cat(tile_feats_cpu, dim=0)
+    owners = torch.cat(owners_cpu, dim=0)
+    return rels, tile_feats, owners
+
+
+def _mir_pool_inference(
+    tile_feats: torch.Tensor,
+    tile_to_image: torch.Tensor,
+    mir_meta: Dict,
+    state: Dict,
+) -> torch.Tensor:
+    """
+    Attention-based MIR pooling over tile features using weights stored in head state_dict.
+
+    Args:
+        tile_feats: (N_total, D)
+        tile_to_image: (N_total,) long tensor mapping each tile to its image index.
+        mir_meta: dict from head meta["mir"] (enabled, attn_hidden_dim, num_heads, token_normalize, instance_dropout).
+        state: head state_dict containing MIR weights under keys:
+            - "mir_ln.weight", "mir_ln.bias"
+            - "mir_attn_proj.weight", "mir_attn_proj.bias"
+            - "mir_attn_out.weight", "mir_attn_out.bias"
+    Returns:
+        bag_feats: (B, D)
+    """
+    if tile_feats.numel() == 0 or tile_feats.dim() != 2 or tile_to_image.numel() == 0:
+        return tile_feats
+
+    device = tile_feats.device
+    N, D = tile_feats.shape
+    B = int(tile_to_image.max().item()) + 1
+    if B <= 0:
+        return tile_feats.new_zeros((0, D))
+
+    token_norm = str(mir_meta.get("token_normalize", "none")).lower()
+    num_heads = int(mir_meta.get("num_heads", 1))
+    num_heads = max(1, num_heads)
+
+    # Load MIR weights if present; otherwise fall back to simple mean pooling.
+    ln_w = state.get("mir_ln.weight", None)
+    ln_b = state.get("mir_ln.bias", None)
+    attn_proj_w = state.get("mir_attn_proj.weight", None)
+    attn_proj_b = state.get("mir_attn_proj.bias", None)
+    attn_out_w = state.get("mir_attn_out.weight", None)
+    attn_out_b = state.get("mir_attn_out.bias", None)
+
+    have_mir_weights = (
+        attn_proj_w is not None
+        and attn_out_w is not None
+        and isinstance(attn_proj_w, torch.Tensor)
+        and isinstance(attn_out_w, torch.Tensor)
+    )
+    if not have_mir_weights:
+        # No MIR parameters available (e.g., legacy head); degrade to mean pooling.
+        bag_feats = tile_feats.new_zeros((B, D))
+        for b in range(B):
+            mask = (tile_to_image == b)
+            if not bool(mask.any()):
+                continue
+            h_b = tile_feats[mask]
+            bag_feats[b] = h_b.mean(dim=0)
+        return bag_feats
+
+    h = tile_feats
+    if token_norm == "layernorm" and isinstance(ln_w, torch.Tensor) and isinstance(ln_b, torch.Tensor):
+        ln_w_d = ln_w.to(device=device, dtype=h.dtype)
+        ln_b_d = ln_b.to(device=device, dtype=h.dtype)
+        h = torch.layer_norm(h, normalized_shape=(D,), weight=ln_w_d, bias=ln_b_d)
+    elif token_norm == "l2":
+        h = torch.nn.functional.normalize(h, p=2.0, dim=-1)
+
+    attn_proj_w_d = attn_proj_w.to(device=device, dtype=h.dtype)  # type: ignore[union-attr]
+    attn_proj_b_d = attn_proj_b.to(device=device, dtype=h.dtype) if isinstance(attn_proj_b, torch.Tensor) else None
+    attn_out_w_d = attn_out_w.to(device=device, dtype=h.dtype)  # type: ignore[union-attr]
+    attn_out_b_d = attn_out_b.to(device=device, dtype=h.dtype) if isinstance(attn_out_b, torch.Tensor) else None
+
+    # (N, H_dim)
+    u = torch.tanh(torch.nn.functional.linear(h, attn_proj_w_d, attn_proj_b_d))
+    # (N, num_heads)
+    scores = torch.nn.functional.linear(u, attn_out_w_d, attn_out_b_d)
+
+    bag_feats = tile_feats.new_zeros((B, D))
+    for b in range(B):
+        mask = (tile_to_image == b)
+        if not bool(mask.any()):
+            continue
+        idx = mask.nonzero(as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            continue
+        h_b = h[idx]  # (T_b, D)
+        scores_b = scores[idx]  # (T_b, num_heads)
+        head_outputs: List[torch.Tensor] = []
+        for k in range(num_heads):
+            attn_raw = scores_b[:, k]
+            attn = torch.nn.functional.softmax(attn_raw, dim=0)
+            head_outputs.append(torch.sum(attn.unsqueeze(-1) * h_b, dim=0))
+        bag_feats[b] = torch.stack(head_outputs, dim=0).mean(dim=0)
+
+    return bag_feats
 
 
 def predict_for_images(
@@ -517,7 +748,11 @@ def main():
             dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
             use_output_softplus=use_softplus_eff,
         )
-        head_module.load_state_dict(state, strict=True)
+        # Filter out MIR-specific weights (mir_*) from the head state_dict when
+        # constructing the plain MLP head for inference. MIR pooling is only
+        # applied inside the training model and not reconstructed here.
+        mlp_state = {k: v for k, v in state.items() if not k.startswith("mir_")}
+        head_module.load_state_dict(mlp_state, strict=True)
         preds = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
         # Invert z-score, then log-scale if applicable, then convert to grams
         if zscore_enabled:

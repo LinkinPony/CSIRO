@@ -264,6 +264,7 @@ def main():
         except Exception:
             pass
 
+        mir_cfg = dict(cfg.get("mir", {}))
         model = BiomassRegressor(
             backbone_name=str(cfg["model"]["backbone"]),
             embedding_dim=int(cfg["model"]["embedding_dim"]),
@@ -311,6 +312,14 @@ def main():
                 )
             ),
             cmixup_cfg=dict(cfg.get("data", {}).get("augment", {}).get("cmixup", {})),
+            # MIR config
+            mir_enabled=bool(mir_cfg.get("enabled", False)),
+            mir_attn_hidden_dim=int(mir_cfg.get("attn_hidden_dim", 256)),
+            mir_num_heads=int(mir_cfg.get("num_heads", 1)),
+            mir_token_normalize=str(mir_cfg.get("token_normalize", "none")),
+            mir_instance_dropout=float(mir_cfg.get("instance_dropout", 0.0)),
+            mir_tiling_cfg=dict(mir_cfg.get("tiling", {})),
+            mir_stage1_epochs=int(mir_cfg.get("stage1_epochs", 0)),
         )
 
         head_ckpt_dir = ckpt_dir / "head"
