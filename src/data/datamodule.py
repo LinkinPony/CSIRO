@@ -71,7 +71,7 @@ class PastureImageDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        # main regression targets (triple)
+        # main regression targets (one or more components depending on config.target_order)
         y_reg3_g = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
         reg3_mask = torch.ones_like(y_reg3_g, dtype=torch.float32)
         # Convert grams to grams per square meter if a valid area is provided
@@ -82,6 +82,36 @@ class PastureImageDataset(Dataset):
             y_reg3 = (y_reg3_g_m2 - self._reg3_mean) / safe_std
         else:
             y_reg3 = y_reg3_g_m2
+        # --- Canonical biomass components in grams (CSIRO only) ---
+        # Order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
+        try:
+            dry_clover = float(row.get("Dry_Clover_g", float("nan")))
+            dry_dead = float(row.get("Dry_Dead_g", float("nan")))
+            dry_green = float(row.get("Dry_Green_g", float("nan")))
+            gdm = float(row.get("GDM_g", float("nan")))
+            dry_total = float(row.get("Dry_Total_g", float("nan")))
+        except Exception:
+            dry_clover = dry_dead = dry_green = gdm = dry_total = float("nan")
+        y_5d_g = torch.tensor(
+            [dry_clover, dry_dead, dry_green, gdm, dry_total],
+            dtype=torch.float32,
+        )
+        biomass_5d_mask = torch.isfinite(y_5d_g).to(dtype=torch.float32)
+
+        # Ratio targets: proportions of (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) over Dry_Total_g.
+        # Only valid for CSIRO samples where all components are present and Dry_Total_g > 0.
+        y_ratio = torch.zeros(3, dtype=torch.float32)
+        ratio_mask = torch.zeros(1, dtype=torch.float32)
+        if torch.isfinite(y_5d_g[-1]) and y_5d_g[-1] > 0:
+            total = y_5d_g[-1]
+            clover = y_5d_g[0] if torch.isfinite(y_5d_g[0]) else 0.0
+            dead = y_5d_g[1] if torch.isfinite(y_5d_g[1]) else 0.0
+            green = y_5d_g[2] if torch.isfinite(y_5d_g[2]) else 0.0
+            y_ratio[0] = clover / total
+            y_ratio[1] = dead / total
+            y_ratio[2] = green / total
+            ratio_mask[...] = 1.0
+
         # auxiliary regression target: height
         y_height = torch.tensor([float(row.get("Height_Ave_cm", 0.0))], dtype=torch.float32)
         # auxiliary regression target: Pre_GSHH_NDVI
@@ -115,6 +145,11 @@ class PastureImageDataset(Dataset):
             "ndvi_mask": ndvi_mask,       # 1 => NDVI supervised
             "y_species": y_species,
             "y_state": y_state,
+            # Biomass decomposition targets (CSIRO only; masks handle missing values)
+            "y_biomass_5d_g": y_5d_g,
+            "biomass_5d_mask": biomass_5d_mask,
+            "y_ratio": y_ratio,
+            "ratio_mask": ratio_mask,
         }
 
 
@@ -216,11 +251,18 @@ class PastureDataModule(LightningDataModule):
         self._reg3_std: Optional[List[float]] = None
         self._ndvi_mean: Optional[float] = None
         self._ndvi_std: Optional[float] = None
+        # Optional z-score stats for full 5D biomass components:
+        # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
+        self._biomass_5d_mean: Optional[List[float]] = None
+        self._biomass_5d_std: Optional[List[float]] = None
 
     def _read_and_pivot(self) -> pd.DataFrame:
         csv_path = os.path.join(self.data_root, self.train_csv)
         df = pd.read_csv(csv_path)
-        df = df[df["target_name"].isin(self.target_order)]
+        # Do NOT filter by target_order here: we want to keep all canonical biomass
+        # components (Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g)
+        # so that auxiliary losses (ratio head, 5D weighted MSE) can be computed
+        # even when the main regression head supervises only a subset (e.g., Dry_Total_g).
         # sample_id in CSV includes target suffix, e.g., IDxxxx__Dry_Clover_g
         # derive an image_id without suffix to aggregate targets per image
         df = df.copy()
@@ -241,14 +283,36 @@ class PastureDataModule(LightningDataModule):
         merged = pivot.join(image_path_series, how="inner")
         merged = (
             merged.join(height_series, how="left")
-                  .join(ndvi_series, how="left")
-                  .join(species_series, how="left")
-                  .join(state_series, how="left")
+            .join(ndvi_series, how="left")
+            .join(species_series, how="left")
+            .join(state_series, how="left")
         )
+        # Ensure all supervised primary targets are present
         merged = merged.dropna(subset=self.target_order)
         merged = merged.reset_index(drop=False)
-        # Ensure proper column order: targets then image_path and image_id
-        cols = [*self.target_order, "Height_Ave_cm", "Pre_GSHH_NDVI", "Species", "State", "image_path", "image_id"]
+
+        # Ensure all canonical biomass components are present as columns so that
+        # downstream datasets can build ratio labels and 5D component targets.
+        canonical_targets = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
+        for t in canonical_targets:
+            if t not in merged.columns:
+                merged[t] = np.nan
+
+        # Ensure proper column order: primary targets (target_order), then canonical targets,
+        # followed by auxiliary labels and metadata.
+        target_cols = []
+        for t in list(self.target_order) + canonical_targets:
+            if t not in target_cols and t in merged.columns:
+                target_cols.append(t)
+        cols = [
+            *target_cols,
+            "Height_Ave_cm",
+            "Pre_GSHH_NDVI",
+            "Species",
+            "State",
+            "image_path",
+            "image_id",
+        ]
         merged = merged[cols]
         return merged
 
@@ -430,6 +494,35 @@ class PastureDataModule(LightningDataModule):
             reg_stds.append(sigma)
         self._reg3_mean = reg_means
         self._reg3_std = reg_stds
+
+        # Compute z-score stats for canonical 5D biomass components in g/m^2:
+        # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
+        biomass_targets = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
+        b_means: List[float] = []
+        b_stds: List[float] = []
+        for t in biomass_targets:
+            if t not in self.train_df.columns:
+                # If this component is absent, fall back to standard normal
+                b_means.append(0.0)
+                b_stds.append(1.0)
+                continue
+            vals = self.train_df[t].astype(float).to_numpy()
+            # Drop NaNs before statistics
+            vals = vals[np.isfinite(vals)]
+            vals = vals / area
+            if self._log_scale_targets:
+                vals = np.log1p(np.clip(vals, a_min=0.0, a_max=None))
+            if vals.size == 0:
+                mu, sigma = 0.0, 1.0
+            else:
+                mu = float(np.mean(vals))
+                sigma = float(np.std(vals)) if vals.size > 1 else 1.0
+                if not np.isfinite(sigma) or sigma <= 0.0:
+                    sigma = 1.0
+            b_means.append(mu)
+            b_stds.append(sigma)
+        self._biomass_5d_mean = b_means
+        self._biomass_5d_std = b_stds
         try:
             ndvi_vals = self.train_df["Pre_GSHH_NDVI"].astype(float).to_numpy()
             ndvi_mu = float(np.mean(ndvi_vals)) if ndvi_vals.size > 0 else 0.0
@@ -450,8 +543,20 @@ class PastureDataModule(LightningDataModule):
                 os.makedirs(out_dir, exist_ok=True)
             import json
             payload = {
-                "reg3": {"mean": list(self._reg3_mean or [0.0, 0.0, 0.0]), "std": list(self._reg3_std or [1.0, 1.0, 1.0])},
-                "ndvi": {"mean": float(self._ndvi_mean if self._ndvi_mean is not None else 0.0), "std": float(self._ndvi_std if self._ndvi_std is not None else 1.0)},
+                "reg3": {
+                    "mean": list(self._reg3_mean or []),
+                    "std": list(self._reg3_std or []),
+                },
+                "ndvi": {
+                    "mean": float(self._ndvi_mean if self._ndvi_mean is not None else 0.0),
+                    "std": float(self._ndvi_std if self._ndvi_std is not None else 1.0),
+                },
+                # Optional 5D biomass stats (g/m^2, possibly log-transformed)
+                "biomass_5d": {
+                    "mean": list(self._biomass_5d_mean or []),
+                    "std": list(self._biomass_5d_std or []),
+                    "order": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"],
+                },
                 "meta": {
                     "area_m2": float(self.sample_area_m2),
                     "log_scale_targets": bool(self._log_scale_targets),
@@ -478,3 +583,11 @@ class PastureDataModule(LightningDataModule):
     @property
     def ndvi_zscore_std(self) -> Optional[float]:
         return self._ndvi_std
+
+    @property
+    def biomass_5d_zscore_mean(self) -> Optional[List[float]]:
+        return self._biomass_5d_mean
+
+    @property
+    def biomass_5d_zscore_std(self) -> Optional[List[float]]:
+        return self._biomass_5d_std

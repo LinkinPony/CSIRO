@@ -41,14 +41,26 @@ class HeadCheckpoint(Callback):
         train_loss = _get_float("train_loss")
         val_r2 = _get_float("val_r2")
 
-        # Build an inference head state_dict: shared bottleneck + 3-d reg head (+ optional softplus)
+        # Build an inference head state_dict: shared bottleneck + main reg head
+        # (+ optional ratio head, packed into a single linear layer).
         state_dict_to_save: Dict[str, Any]
         try:
-            # Prefer composing a fresh head module to ensure compatibility with inference script
-            use_output_softplus_eff = bool(getattr(pl_module.hparams, "use_output_softplus", True)) and not bool(getattr(pl_module.hparams, "log_scale_targets", False))
+            # Prefer composing a fresh head module to ensure compatibility with inference script.
+            # When a ratio head is present, we pack both Dry_Total_g (main regression)
+            # and ratio logits into a single linear layer with out_features =
+            # num_outputs_main + num_ratio_outputs.
+            num_outputs_main = int(getattr(pl_module.hparams, "num_outputs", 1))
+            ratio_head = getattr(pl_module, "ratio_head", None)
+            num_ratio_outputs = int(ratio_head.out_features) if isinstance(ratio_head, nn.Linear) else 0
+            head_total_outputs = int(num_outputs_main + num_ratio_outputs)
+
+            # For the packed head we disable Softplus in the module itself and
+            # leave any required non-linearity to the inference script, which
+            # handles only the main regression output.
+            use_output_softplus_eff = False
             head_module = build_head_layer(
                 embedding_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)),
-                num_outputs=int(getattr(pl_module.hparams, "num_outputs", 3)),
+                num_outputs=head_total_outputs,
                 head_hidden_dims=list(getattr(pl_module.hparams, "head_hidden_dims", [])),
                 head_activation=str(getattr(pl_module.hparams, "head_activation", "relu")),
                 dropout=float(getattr(pl_module.hparams, "dropout", 0.0)),
@@ -58,7 +70,7 @@ class HeadCheckpoint(Callback):
             def collect_linears(m: nn.Module):
                 return [mod for mod in m.modules() if isinstance(mod, nn.Linear)]
 
-            # New-style model: shared_bottleneck + reg3_heads (three independent 1-d heads)
+            # New-style model: shared_bottleneck + reg3_heads (one or more independent 1-d heads)
             if hasattr(pl_module, "shared_bottleneck") and hasattr(pl_module, "reg3_heads"):
                 bottleneck_linears = collect_linears(pl_module.shared_bottleneck)
                 tgt_linears = collect_linears(head_module)
@@ -72,18 +84,29 @@ class HeadCheckpoint(Callback):
                         if t.bias is not None and s.bias is not None:
                             t.bias.copy_(s.bias.data)
 
-                # Aggregate final layer from three scalar heads into a single Linear(out_features=3)
+                # Aggregate final layer from scalar reg heads and optional ratio head
+                # into a single Linear(out_features=head_total_outputs).
                 final_linear = tgt_linears[-1]
                 reg3_heads = list(getattr(pl_module, "reg3_heads"))
-                if final_linear.out_features != len(reg3_heads):
-                    raise RuntimeError("Final inference head out_features does not match number of reg3 heads")
+                if final_linear.out_features != head_total_outputs:
+                    raise RuntimeError("Final inference head out_features does not match packed outputs")
                 with torch.no_grad():
-                    for idx, h in enumerate(reg3_heads):
+                    row = 0
+                    # Pack main reg3 scalar heads first
+                    for h in reg3_heads:
                         if not isinstance(h, nn.Linear) or h.out_features != 1:
                             raise RuntimeError("reg3_heads must contain nn.Linear modules with out_features=1")
-                        final_linear.weight[idx : idx + 1, :].copy_(h.weight.data)
+                        final_linear.weight[row : row + 1, :].copy_(h.weight.data)
                         if final_linear.bias is not None and h.bias is not None:
-                            final_linear.bias[idx] = h.bias.data[0]
+                            final_linear.bias[row] = h.bias.data[0]
+                        row += 1
+                    # Pack ratio head logits (if present) into remaining rows
+                    if num_ratio_outputs > 0 and isinstance(ratio_head, nn.Linear):
+                        if ratio_head.out_features != num_ratio_outputs:
+                            raise RuntimeError("ratio_head.out_features mismatch")
+                        final_linear.weight[row : row + num_ratio_outputs, :].copy_(ratio_head.weight.data)
+                        if final_linear.bias is not None and ratio_head.bias is not None:
+                            final_linear.bias[row : row + num_ratio_outputs].copy_(ratio_head.bias.data)
                 state_dict_to_save = head_module.state_dict()
 
             else:
@@ -122,12 +145,21 @@ class HeadCheckpoint(Callback):
             "meta": {
                 "backbone": getattr(pl_module.hparams, "backbone_name", None) if hasattr(pl_module, "hparams") else None,
                 "embedding_dim": int(getattr(pl_module.hparams, "embedding_dim", 1024)) if hasattr(pl_module, "hparams") else 1024,
-                "num_outputs": int(getattr(pl_module.hparams, "num_outputs", 3)) if hasattr(pl_module, "hparams") else 3,
+                # num_outputs_main: number of primary regression outputs (e.g., Dry_Total_g only)
+                "num_outputs_main": int(getattr(pl_module.hparams, "num_outputs", 1)) if hasattr(pl_module, "hparams") else 1,
+                # num_outputs_ratio: number of ratio logits packed after the main outputs
+                "num_outputs_ratio": int(num_ratio_outputs),
+                # head_total_outputs: total outputs in the packed head module
+                "head_total_outputs": int(head_total_outputs),
                 "head_hidden_dims": list(getattr(pl_module.hparams, "head_hidden_dims", [])) if hasattr(pl_module, "hparams") else [],
                 "head_activation": getattr(pl_module.hparams, "head_activation", "relu") if hasattr(pl_module, "hparams") else "relu",
                 "head_dropout": float(getattr(pl_module.hparams, "dropout", 0.0)) if hasattr(pl_module, "hparams") else 0.0,
-                "use_output_softplus": (bool(getattr(pl_module.hparams, "use_output_softplus", True)) and not bool(getattr(pl_module.hparams, "log_scale_targets", False))) if hasattr(pl_module, "hparams") else True,
+                # Softplus is applied (if needed) in the training module; the packed head
+                # used for offline inference is exported without a terminal Softplus.
+                "use_output_softplus": False,
                 "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,
+                # Order of ratio components packed in the head (if any)
+                "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
             },
         }
         # Optionally bundle LoRA adapter payload alongside the head (to preserve the two-inputs rule at inference)

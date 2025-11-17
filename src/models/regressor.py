@@ -19,7 +19,7 @@ class BiomassRegressor(LightningModule):
         self,
         backbone_name: str,
         embedding_dim: int,
-        num_outputs: int = 3,
+        num_outputs: int = 1,
         dropout: float = 0.0,
         head_hidden_dims: Optional[List[int]] = None,
         head_activation: str = "relu",
@@ -31,6 +31,8 @@ class BiomassRegressor(LightningModule):
         reg3_zscore_std: Optional[List[float]] = None,
         ndvi_zscore_mean: Optional[float] = None,
         ndvi_zscore_std: Optional[float] = None,
+        biomass_5d_zscore_mean: Optional[List[float]] = None,
+        biomass_5d_zscore_std: Optional[List[float]] = None,
         pretrained: bool = True,
         weights_url: Optional[str] = None,
         weights_path: Optional[str] = None,
@@ -57,6 +59,12 @@ class BiomassRegressor(LightningModule):
         # CutMix configs (batch-level augmentation)
         cutmix_cfg: Optional[Dict[str, Any]] = None,
         ndvi_dense_cutmix_cfg: Optional[Dict[str, Any]] = None,
+        # Biomass decomposition / ratio head configuration
+        enable_ratio_head: bool = True,
+        ratio_kl_weight: float = 1.0,
+        enable_5d_loss: bool = True,
+        loss_5d_weight: float = 1.0,
+        biomass_5d_weights: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -114,7 +122,7 @@ class BiomassRegressor(LightningModule):
 
         # Task heads
         bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
-        # Main reg3 heads: three independent 1-d regressors (one per biomass target)
+        # Main reg3 heads: one or more independent 1-d regressors (e.g., Dry_Total_g only)
         self.num_outputs: int = int(num_outputs)
         if self.num_outputs < 1:
             raise ValueError("num_outputs must be >= 1 for reg3 head")
@@ -156,6 +164,38 @@ class BiomassRegressor(LightningModule):
         else:
             self.num_state_classes = 0
             self.state_head = None
+        # Optional biomass ratio head: predicts proportions of
+        # (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) which are later combined with
+        # Dry_Total_g for 5D weighted MSE loss.
+        self.enable_ratio_head: bool = bool(enable_ratio_head)
+        self.ratio_kl_weight: float = float(max(0.0, ratio_kl_weight))
+        self.enable_5d_loss: bool = bool(enable_5d_loss)
+        self.loss_5d_weight: float = float(max(0.0, loss_5d_weight))
+        self.ratio_components: List[str] = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"]
+        self.num_ratio_outputs: int = len(self.ratio_components)
+        if self.enable_ratio_head:
+            self.ratio_head = nn.Linear(bottleneck_dim, self.num_ratio_outputs)
+        else:
+            self.ratio_head = None  # type: ignore[assignment]
+
+        # 5D biomass weights (Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g)
+        import math as _math  # local import to avoid polluting global namespace
+        default_5d = [0.1, 0.1, 0.1, 0.2, 0.5]
+        if biomass_5d_weights is not None and len(biomass_5d_weights) == 5:
+            try:
+                weights_list = [float(v) for v in biomass_5d_weights]
+                if not _math.isfinite(sum(weights_list)):
+                    weights_list = default_5d
+            except Exception:
+                weights_list = default_5d
+        else:
+            weights_list = default_5d
+        self.register_buffer(
+            "biomass_5d_weights",
+            torch.tensor(weights_list, dtype=torch.float32),
+            persistent=False,
+        )
+
         # Log-scale control applies only to main reg3 outputs
         self.log_scale_targets: bool = bool(log_scale_targets)
         # Per-task z-score params
@@ -165,6 +205,20 @@ class BiomassRegressor(LightningModule):
         self._ndvi_mean: Optional[float] = float(ndvi_zscore_mean) if ndvi_zscore_mean is not None else None
         self._ndvi_std: Optional[float] = float(ndvi_zscore_std) if ndvi_zscore_std is not None else None
         self._use_reg3_zscore: bool = (self._reg3_mean is not None and self._reg3_std is not None)
+        # Optional 5D biomass z-score (g/m^2, possibly log-transformed)
+        self._biomass_5d_mean: Optional[Tensor] = (
+            torch.tensor(biomass_5d_zscore_mean, dtype=torch.float32)
+            if biomass_5d_zscore_mean is not None
+            else None
+        )
+        self._biomass_5d_std: Optional[Tensor] = (
+            torch.tensor(biomass_5d_zscore_std, dtype=torch.float32)
+            if biomass_5d_zscore_std is not None
+            else None
+        )
+        self._use_biomass_5d_zscore: bool = (
+            self._biomass_5d_mean is not None and self._biomass_5d_std is not None
+        )
         # Softplus is disabled for reg3 when predicting in log-domain or when using z-score
         self.out_softplus = nn.Softplus() if (use_output_softplus and (not self.log_scale_targets) and (not self._use_reg3_zscore)) else None
         # Optional overrides for UW optimizer hyperparameters
@@ -177,6 +231,7 @@ class BiomassRegressor(LightningModule):
         self._uw_task_params: Optional[nn.ParameterDict] = None
         if self.mtl_enabled and self.loss_weighting == "uw":
             task_names: List[str] = ["reg3"]
+            # Keep auxiliary tasks for MTL
             if self.enable_height:
                 task_names.append("height")
             if self.enable_ndvi:
@@ -185,6 +240,9 @@ class BiomassRegressor(LightningModule):
                 task_names.append("species")
             if self.enable_state:
                 task_names.append("state")
+            # Ratio and 5D losses are conceptually part of the main biomass task,
+            # so they are folded into the single "reg3" UW head rather than
+            # having their own uncertainty parameters.
             pdict = nn.ParameterDict({name: nn.Parameter(torch.zeros(1)) for name in task_names})
             self._uw_task_params = pdict
 
@@ -342,11 +400,11 @@ class BiomassRegressor(LightningModule):
         diff_reg3 = pred_reg3 - y_reg3
         diff2_reg3 = (diff_reg3 * diff_reg3) * mask
         mask_sum_reg3 = mask.sum().clamp_min(1.0)
-        # If MTL is disabled, optimize only the main regression task
-        loss_reg3 = diff2_reg3.sum() / mask_sum_reg3
+        # Base MSE on main reg3 outputs (e.g., Dry_Total_g).
+        loss_reg3_mse = diff2_reg3.sum() / mask_sum_reg3
         if (not self.mtl_enabled) or (self.enable_height is False and self.enable_ndvi is False and self.enable_species is False and self.enable_state is False):
-            self.log(f"{stage}_loss_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
             mae_reg3 = (diff_reg3.abs() * mask).sum() / mask_sum_reg3
             self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
             with torch.no_grad():
@@ -355,10 +413,10 @@ class BiomassRegressor(LightningModule):
                 for i in range(per_dim_mse.shape[0]):
                     self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
 
-            total_loss = loss_reg3
+            total_loss = loss_reg3_mse
             self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
             self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mse", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
             # For external metrics (e.g., epoch-end R^2), return original-scale grams
             preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
             targets_out = batch.get("y_reg3_g", None)
@@ -373,7 +431,7 @@ class BiomassRegressor(LightningModule):
             return {
                 "loss": total_loss,
                 "mae": mae_reg3,
-                "mse": loss_reg3,
+                "mse": loss_reg3_mse,
                 "preds": preds_out,
                 "targets": targets_out,
             }
@@ -384,12 +442,12 @@ class BiomassRegressor(LightningModule):
         logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
         logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
 
-        # Always log reg3
-        self.log(f"{stage}_loss_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f"{stage}_mse_reg3", loss_reg3, on_step=False, on_epoch=True, prog_bar=False)
+        # Always log reg3 base MSE
+        self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
 
         # Collect losses in consistent order for UW/equal weighting
-        named_losses: List[Tuple[str, Tensor]] = [("reg3", loss_reg3)]
+        named_losses: List[Tuple[str, Tensor]] = []
         mae_reg3 = (diff_reg3.abs() * mask).sum() / mask_sum_reg3
         self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
         with torch.no_grad():
@@ -397,6 +455,92 @@ class BiomassRegressor(LightningModule):
             per_dim_mse = diff2_reg3.sum(dim=0) / per_dim_den
             for i in range(per_dim_mse.shape[0]):
                 self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
+
+        # --- Ratio KL loss (CSIRO only; masked via ratio_mask) ---
+        loss_ratio_kl: Optional[Tensor] = None
+        if self.enable_ratio_head:
+            y_ratio: Optional[Tensor] = batch.get("y_ratio", None)  # (B,3)
+            ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
+            if y_ratio is not None and ratio_mask is not None:
+                # Predict logits for (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
+                ratio_logits = self.ratio_head(z)  # type: ignore[operator]
+                log_p_pred = F.log_softmax(ratio_logits, dim=-1)
+                # Ensure target is a proper distribution
+                p_true = y_ratio.clamp_min(0.0)
+                denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                p_true = p_true / denom
+                # KL divergence per sample, then masked average
+                kl_per_dim = F.kl_div(log_p_pred, p_true, reduction="none")
+                kl_per_sample = kl_per_dim.sum(dim=-1, keepdim=True)  # (B,1)
+                m = ratio_mask.to(device=kl_per_sample.device, dtype=kl_per_sample.dtype)
+                num = (kl_per_sample * m).sum()
+                den = m.sum().clamp_min(1.0)
+                loss_ratio_kl = (num / den) * self.ratio_kl_weight
+                self.log(f"{stage}_loss_ratio_kl", loss_ratio_kl, on_step=False, on_epoch=True, prog_bar=False)
+
+        # --- 5D weighted MSE loss over physical components ---
+        loss_5d: Optional[Tensor] = None
+        y_5d_g: Optional[Tensor] = batch.get("y_biomass_5d_g", None)  # (B,5) grams
+        mask_5d: Optional[Tensor] = batch.get("biomass_5d_mask", None)  # (B,5)
+        if self.enable_5d_loss and y_5d_g is not None and mask_5d is not None and self.enable_ratio_head:
+            # Convert main reg3 prediction back to g/m^2 (Dry_Total_g)
+            pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
+            # Ratio predictions (probabilities over 3 components)
+            ratio_logits = self.ratio_head(z)  # type: ignore[operator]
+            p_pred = F.softmax(ratio_logits, dim=-1)  # (B,3)
+            # Component g/m^2
+            comp_gm2 = p_pred * pred_total_gm2  # (B,3)
+            clover_pred = comp_gm2[:, 0]
+            dead_pred = comp_gm2[:, 1]
+            green_pred = comp_gm2[:, 2]
+            gdm_pred = clover_pred + green_pred
+            total_pred = pred_total_gm2.squeeze(-1)
+            pred_5d_gm2 = torch.stack([clover_pred, dead_pred, green_pred, gdm_pred, total_pred], dim=-1)
+
+            # Convert targets to g/m^2
+            y_5d_gm2 = y_5d_g.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype) / float(
+                self._area_m2
+            )
+
+            # Optionally move to z-scored space using precomputed 5D stats
+            if self._use_biomass_5d_zscore:
+                mean_5d = self._biomass_5d_mean.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype)  # type: ignore[union-attr]
+                std_5d = torch.clamp(
+                    self._biomass_5d_std.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype),  # type: ignore[union-attr]
+                    min=1e-8,
+                )
+                pred_5d = (pred_5d_gm2 - mean_5d) / std_5d
+                target_5d = (y_5d_gm2 - mean_5d) / std_5d
+            else:
+                pred_5d = pred_5d_gm2
+                target_5d = y_5d_gm2
+
+            # Weighted MSE across components with masks
+            w = self.biomass_5d_weights.to(device=pred_5d.device, dtype=pred_5d.dtype)  # (5,)
+            m5 = mask_5d.to(device=pred_5d.device, dtype=pred_5d.dtype)
+            diff_5d = (pred_5d - target_5d) * m5
+            diff2_5d = diff_5d * diff_5d
+            per_dim_den = m5.sum(dim=0).clamp_min(1.0)
+            mse_per_dim = diff2_5d.sum(dim=0) / per_dim_den  # (5,)
+            valid_weight = w * (per_dim_den > 0).to(dtype=w.dtype)
+            total_w = valid_weight.sum().clamp_min(1e-8)
+            loss_5d = (w * mse_per_dim).sum() / total_w
+            loss_5d = loss_5d * self.loss_5d_weight
+
+            # Log per-component MSE and aggregated loss
+            names_5d = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
+            for i, name in enumerate(names_5d):
+                self.log(f"{stage}_mse_5d_{name}", mse_per_dim[i], on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_loss_5d_weighted", loss_5d, on_step=False, on_epoch=True, prog_bar=False)
+
+        # Aggregate reg3 losses: base MSE + optional ratio KL + optional 5D weighted MSE
+        loss_reg3_total = loss_reg3_mse
+        if loss_ratio_kl is not None:
+            loss_reg3_total = loss_reg3_total + loss_ratio_kl
+        if loss_5d is not None:
+            loss_reg3_total = loss_reg3_total + loss_5d
+        named_losses.append(("reg3", loss_reg3_total))
+        self.log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
 
         if self.enable_height:
             loss_height = F.mse_loss(pred_height, y_height)  # type: ignore[arg-type]
@@ -419,6 +563,11 @@ class BiomassRegressor(LightningModule):
             if mask_sum_ndvi > 0:
                 loss_ndvi = diff2_ndvi.sum() / mask_sum_ndvi
                 mae_ndvi = (diff_ndvi.abs() * m_nd).sum() / mask_sum_ndvi
+            else:
+                # No NDVI supervision in this batch (e.g., Irish-only). Use zero loss.
+                zero_nd = diff2_ndvi.sum() * 0.0
+                loss_ndvi = zero_nd
+                mae_ndvi = zero_nd
             self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
@@ -440,7 +589,7 @@ class BiomassRegressor(LightningModule):
 
         total_loss = self._uw_sum(named_losses)
 
-        # overall metrics for backward-compat
+        # overall metrics for backward-compat (on normalized reg3 space)
         mae = F.l1_loss(pred_reg3, y_reg3)
         mse = F.mse_loss(pred_reg3, y_reg3)
         self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)

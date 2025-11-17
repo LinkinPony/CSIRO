@@ -34,6 +34,7 @@ from PIL import Image
 import pandas as pd
 
 from torch import nn
+import torch.nn.functional as F
 
 
 import yaml
@@ -333,10 +334,11 @@ def predict_from_features(features_cpu: torch.Tensor, head: nn.Module, batch_siz
     preds_list: List[torch.Tensor] = []
     with torch.inference_mode():
         for i in range(0, N, max(1, batch_size)):
-            chunk = features_cpu[i:i + max(1, batch_size)].to(device, non_blocking=True)
+            chunk = features_cpu[i : i + max(1, batch_size)].to(device, non_blocking=True)
             out = head(chunk)
             preds_list.append(out.detach().cpu().float())
-    return torch.cat(preds_list, dim=0) if preds_list else torch.empty((0, 3), dtype=torch.float32)
+    # Do not assume a fixed output dimension; fall back to (0, 0) when empty.
+    return torch.cat(preds_list, dim=0) if preds_list else torch.empty((0, 0), dtype=torch.float32)
 
 
 def predict_for_images(
@@ -377,7 +379,7 @@ def main():
     image_size = _parse_image_size(cfg["data"]["image_size"])  # (H, W), e.g., (640, 640) or (640, 1280)
     mean = list(cfg["data"]["normalization"]["mean"])  # e.g., [0.485, 0.456, 0.406]
     std = list(cfg["data"]["normalization"]["std"])    # e.g., [0.229, 0.224, 0.225]
-    target_bases = list(cfg["data"]["target_order"])    # e.g., [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
+    target_bases = list(cfg["data"]["target_order"])    # legacy: base targets when using 3-d head
     # Dataset area (m^2) to convert g/m^2 (model output) back to grams for submission
     ds_name = str(cfg["data"].get("dataset", "csiro"))
     ds_map = dict(cfg["data"].get("datasets", {}))
@@ -427,8 +429,18 @@ def main():
             "dinov3 is not available locally. Ensure DINOV3_PATH points to third_party/dinov3/dinov3."
         )
 
-    # Discover head weights early to read optional PEFT payload
+    # Discover head weights early and read meta to determine head format
     head_weight_paths = discover_head_weight_paths(HEAD_WEIGHTS_PT_PATH)
+
+    # Inspect first head file to infer packed head shape (main + optional ratio outputs)
+    first_state, first_meta, _ = load_head_state(head_weight_paths[0])
+    if not isinstance(first_meta, dict):
+        first_meta = {}
+    num_outputs_main = int(first_meta.get("num_outputs_main", first_meta.get("num_outputs", 3)))
+    num_outputs_ratio = int(first_meta.get("num_outputs_ratio", 0))
+    head_total_outputs = int(first_meta.get("head_total_outputs", num_outputs_main + num_outputs_ratio))
+    ratio_components = first_meta.get("ratio_components", [])
+    is_ratio_format = num_outputs_ratio > 0 and head_total_outputs == (num_outputs_main + num_outputs_ratio)
 
     # Build backbone architecture locally (no torch.hub), then load state_dict
     backbone = _make_backbone(pretrained=False)
@@ -489,14 +501,24 @@ def main():
 
     # 2) Use discovered heads (single or per-fold) and ensemble predictions by averaging
 
-    preds_sum = torch.zeros((features_cpu.shape[0], 3), dtype=torch.float32)
+    N = features_cpu.shape[0]
+    if is_ratio_format:
+        # New format: head outputs [main_reg, ratio_logits...]
+        preds_main_sum = torch.zeros((N, num_outputs_main), dtype=torch.float32)
+        preds_ratio_sum = torch.zeros((N, num_outputs_ratio), dtype=torch.float32)
+    else:
+        # Legacy format: 3-d head for base targets
+        preds_sum = torch.zeros((N, num_outputs_main), dtype=torch.float32)
     num_heads = 0
+
     for head_pt in head_weight_paths:
         # Read head state and meta (to detect log-scale setting if bundled)
         state, meta, _peft = load_head_state(head_pt)
-        # Decide log-scale and effective Softplus for reg3
+        if not isinstance(meta, dict):
+            meta = {}
+        # Decide log-scale for main reg3 outputs
         log_scale_cfg = bool(cfg["model"].get("log_scale_targets", False))
-        log_scale_meta = bool(meta.get("log_scale_targets", log_scale_cfg)) if isinstance(meta, dict) else log_scale_cfg
+        log_scale_meta = bool(meta.get("log_scale_targets", log_scale_cfg))
         # Load z-score for this head (optional)
         zscore = _load_zscore_json_for_head(head_pt)
         reg3_mean = None
@@ -508,36 +530,112 @@ def main():
             except Exception:
                 reg3_mean, reg3_std = None, None
         zscore_enabled = reg3_mean is not None and reg3_std is not None
-        use_softplus_eff = bool(cfg["model"]["head"].get("use_output_softplus", True)) and (not log_scale_meta) and (not zscore_enabled)
+
+        # For packed heads we always export without a terminal Softplus.
         head_module = build_head_layer(
             embedding_dim=int(cfg["model"]["embedding_dim"]),
-            num_outputs=3,
+            num_outputs=head_total_outputs if is_ratio_format else num_outputs_main,
             head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
             head_activation=str(cfg["model"]["head"].get("activation", "relu")),
             dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
-            use_output_softplus=use_softplus_eff,
+            use_output_softplus=False,
         )
         head_module.load_state_dict(state, strict=True)
-        preds = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
-        # Invert z-score, then log-scale if applicable, then convert to grams
+        preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
+
+        if is_ratio_format:
+            preds_main = preds_all[:, :num_outputs_main]
+            preds_ratio = preds_all[:, num_outputs_main : num_outputs_main + num_outputs_ratio]
+        else:
+            preds_main = preds_all
+            preds_ratio = None
+
+        # Invert z-score and log-scale for main reg3 outputs only, then convert to grams
         if zscore_enabled:
-            preds = preds * reg3_std + reg3_mean  # type: ignore[operator]
+            preds_main = preds_main * reg3_std[:num_outputs_main] + reg3_mean[:num_outputs_main]  # type: ignore[index]
         if log_scale_meta:
-            preds = torch.expm1(preds).clamp_min(0.0)
-        preds_sum += preds
+            preds_main = torch.expm1(preds_main).clamp_min(0.0)
+
+        if is_ratio_format:
+            preds_main_sum += preds_main
+            preds_ratio_sum += preds_ratio  # type: ignore[operator]
+        else:
+            preds_sum += preds_main
         num_heads += 1
 
     if num_heads == 0:
         raise RuntimeError("No valid head weights found for inference.")
-    avg_preds = (preds_sum / float(num_heads))
-    # Convert g/m^2 to grams expected by submission format
-    avg_preds = (avg_preds * float(area_m2)).tolist()
 
-    # Build mapping from image path to base predictions
-    image_to_base_preds: Dict[str, Tuple[float, float, float]] = {}
-    for rel_path, vec in zip(rels_in_order, avg_preds):
-        v0, v1, v2 = float(vec[0]), float(vec[1]), float(vec[2])
-        image_to_base_preds[rel_path] = (v0, v1, v2)
+    if is_ratio_format:
+        avg_main_gm2 = preds_main_sum / float(num_heads)  # (N,1)
+        avg_ratio_logits = preds_ratio_sum / float(num_heads)  # (N,3)
+        # Convert main reg output (g/m^2) to grams for Dry_Total_g
+        avg_main_g = avg_main_gm2 * float(area_m2)
+        # Ratio distribution over (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
+        p_ratio = F.softmax(avg_ratio_logits, dim=-1)
+        total_g = avg_main_g.squeeze(-1)
+        clover_g = total_g * p_ratio[:, 0]
+        dead_g = total_g * p_ratio[:, 1]
+        green_g = total_g * p_ratio[:, 2]
+        gdm_g = clover_g + green_g
+
+        # Build mapping from image path to full 5D components
+        image_to_components: Dict[str, Dict[str, float]] = {}
+        for rel_path, t, c, d, g, gdm_val in zip(
+            rels_in_order,
+            total_g.tolist(),
+            clover_g.tolist(),
+            dead_g.tolist(),
+            green_g.tolist(),
+            gdm_g.tolist(),
+        ):
+            image_to_components[rel_path] = {
+                "Dry_Total_g": float(t),
+                "Dry_Clover_g": float(c),
+                "Dry_Dead_g": float(d),
+                "Dry_Green_g": float(g),
+                "GDM_g": float(gdm_val),
+            }
+    else:
+        # Legacy 3-d head: outputs base targets in config-defined order, then derive 5D components.
+        avg_preds = (preds_sum / float(num_heads))
+        avg_preds = (avg_preds * float(area_m2)).tolist()
+        image_to_base_preds: Dict[str, Tuple[float, ...]] = {}
+        for rel_path, vec in zip(rels_in_order, avg_preds):
+            image_to_base_preds[rel_path] = tuple(float(v) for v in vec)
+
+        image_to_components = {}
+        for rel_path, vec in image_to_base_preds.items():
+            base_map: Dict[str, float] = {}
+            try:
+                for idx, name in enumerate(target_bases):
+                    base_map[name] = vec[idx]
+            except Exception:
+                base_map = {}
+            # Derive full 5D components from base_map using legacy rules
+            total = base_map.get("Dry_Total_g", None)
+            clover = base_map.get("Dry_Clover_g", None)
+            dead = base_map.get("Dry_Dead_g", None)
+            green = base_map.get("Dry_Green_g", None)
+            if total is None:
+                # Fallback: infer Dry_Total_g if not directly predicted
+                total = (clover or 0.0) + (dead or 0.0) + (green or 0.0)
+            if dead is None and total is not None and clover is not None and green is not None:
+                dead = total - clover - green
+            if clover is None:
+                clover = 0.0
+            if dead is None:
+                dead = 0.0
+            if green is None:
+                green = 0.0
+            gdm_val = clover + green
+            image_to_components[rel_path] = {
+                "Dry_Total_g": float(total),
+                "Dry_Clover_g": float(clover),
+                "Dry_Dead_g": float(dead),
+                "Dry_Green_g": float(green),
+                "GDM_g": float(gdm_val),
+            }
 
     # Build submission
     rows = []
@@ -545,39 +643,8 @@ def main():
         sample_id = str(r["sample_id"])  # e.g., IDxxxx__Dry_Clover_g
         rel_path = str(r["image_path"])  # e.g., test/IDxxxx.jpg
         target_name = str(r["target_name"])  # one of 5
-        v0, v1, v2 = image_to_base_preds.get(rel_path, (0.0, 0.0, 0.0))
-        # Map base predictions by configured order
-        base_map: Dict[str, float] = {}
-        try:
-            base_map[target_bases[0]] = v0
-            base_map[target_bases[1]] = v1
-            base_map[target_bases[2]] = v2
-        except Exception:
-            base_map = {}
-        # Direct base prediction if target matches any base
-        if target_name in base_map:
-            value = base_map[target_name]
-        elif target_name == "GDM_g":
-            # GDM_g = Dry_Clover_g + Dry_Green_g
-            value = base_map.get("Dry_Clover_g", 0.0) + base_map.get("Dry_Green_g", 0.0)
-        elif target_name == "Dry_Total_g":
-            # Prefer direct prediction if present; else sum of components when available
-            if "Dry_Total_g" in base_map:
-                value = base_map["Dry_Total_g"]
-            else:
-                value = base_map.get("Dry_Clover_g", 0.0) + base_map.get("Dry_Dead_g", 0.0) + base_map.get("Dry_Green_g", 0.0)
-        elif target_name == "Dry_Dead_g":
-            # Dry_Dead_g = Dry_Total_g - Dry_Clover_g - Dry_Green_g
-            total = base_map.get("Dry_Total_g", None)
-            clover = base_map.get("Dry_Clover_g", 0.0)
-            green = base_map.get("Dry_Green_g", 0.0)
-            if total is None:
-                # Fallback: if no direct total, but individual base dead present (legacy case)
-                value = base_map.get("Dry_Dead_g", 0.0)
-            else:
-                value = total - clover - green
-        else:
-            value = 0.0
+        comps = image_to_components.get(rel_path, {})
+        value = comps.get(target_name, 0.0)
         # Clamp final physical predictions to be non-negative for submission
         value = max(0.0, float(value))
         rows.append((sample_id, value))

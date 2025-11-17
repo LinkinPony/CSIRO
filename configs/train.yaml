@@ -1,5 +1,5 @@
 seed: 42
-version: baseline-lora-r4-extra-dataset-no-ndvi
+version: ratio
 data:
   root: data
   train_csv: train.csv
@@ -16,7 +16,10 @@ data:
   prefetch_factor: 4
   val_split: 0.1
   shuffle: true
-  target_order: [Dry_Green_g, Dry_Total_g, Dry_Clover_g]
+  # Primary regression targets for the main head.
+  # In the new design we predict only Dry_Total_g directly and recover
+  # the remaining components via a separate ratio head.
+  target_order: [Dry_Total_g]
   augment:
     random_resized_crop_scale: [0.8, 1.0]
     horizontal_flip_prob: 0.5
@@ -127,6 +130,17 @@ peft:
 
 loss:
   weighting: uw
+  # Enable/disable the biomass ratio head (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
+  use_ratio_head: true
+  # KL divergence weight for the ratio head
+  ratio_kl_weight: 1.0
+  # Enable/disable 5D weighted MSE loss computed on:
+  # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
+  use_5d_weighted_mse: true
+  # Global multiplier for the 5D weighted MSE term
+  mse_5d_weight: 1.0
+  # Per-component weights for the 5D MSE term.
+  mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
 
 optimizer:
   name: adamw

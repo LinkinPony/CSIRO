@@ -264,10 +264,19 @@ def main():
         except Exception:
             pass
 
+        loss_cfg = cfg.get("loss", {})
+        ratio_head_enabled = bool(loss_cfg.get("use_ratio_head", True))
+        loss_5d_enabled = bool(loss_cfg.get("use_5d_weighted_mse", True))
+        ratio_kl_weight = float(loss_cfg.get("ratio_kl_weight", 1.0))
+        mse_5d_weight = float(loss_cfg.get("mse_5d_weight", 1.0))
+        mse_5d_weights_per_target = list(
+            loss_cfg.get("mse_5d_weights_per_target", [0.1, 0.1, 0.1, 0.2, 0.5])
+        )
+
         model = BiomassRegressor(
             backbone_name=str(cfg["model"]["backbone"]),
             embedding_dim=int(cfg["model"]["embedding_dim"]),
-            num_outputs=3,
+            num_outputs=len(cfg["data"]["target_order"]),
             dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
             head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
             head_activation=str(cfg["model"]["head"].get("activation", "relu")),
@@ -278,6 +287,8 @@ def main():
             reg3_zscore_std=list(dm.reg3_zscore_std or []) if hasattr(dm, "reg3_zscore_std") else None,
             ndvi_zscore_mean=float(dm.ndvi_zscore_mean) if getattr(dm, "ndvi_zscore_mean", None) is not None else None,
             ndvi_zscore_std=float(dm.ndvi_zscore_std) if getattr(dm, "ndvi_zscore_std", None) is not None else None,
+            biomass_5d_zscore_mean=list(dm.biomass_5d_zscore_mean or []) if hasattr(dm, "biomass_5d_zscore_mean") else None,
+            biomass_5d_zscore_std=list(dm.biomass_5d_zscore_std or []) if hasattr(dm, "biomass_5d_zscore_std") else None,
             uw_learning_rate=float(cfg.get("optimizer", {}).get("uw_lr", cfg["optimizer"]["lr"])),
             uw_weight_decay=float(cfg.get("optimizer", {}).get("uw_weight_decay", cfg["optimizer"]["weight_decay"])),
             pretrained=bool(cfg["model"].get("pretrained", True)),
@@ -310,6 +321,12 @@ def main():
                     cfg.get("data", {}).get("augment", {}).get("cutmix", {}),
                 )
             ),
+            # Biomass ratio / 5D loss configuration
+            enable_ratio_head=ratio_head_enabled,
+            ratio_kl_weight=ratio_kl_weight,
+            enable_5d_loss=loss_5d_enabled,
+            loss_5d_weight=mse_5d_weight,
+            biomass_5d_weights=mse_5d_weights_per_target,
         )
 
         head_ckpt_dir = ckpt_dir / "head"

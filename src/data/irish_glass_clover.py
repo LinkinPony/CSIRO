@@ -110,6 +110,14 @@ class IrishGlassCloverDataset(Dataset):
         y_species = torch.tensor(0, dtype=torch.long)
         y_state = torch.tensor(0, dtype=torch.long)
 
+        # Biomass decomposition targets are not available for this dataset.
+        # We provide zero tensors with zero masks so that the model can share
+        # the same loss code path while effectively skipping these terms.
+        y_5d_g = torch.zeros(5, dtype=torch.float32)
+        biomass_5d_mask = torch.zeros(5, dtype=torch.float32)
+        y_ratio = torch.zeros(3, dtype=torch.float32)
+        ratio_mask = torch.zeros(1, dtype=torch.float32)
+
         return {
             "image": image,
             # main regression (normalized + original g/m^2)
@@ -123,6 +131,11 @@ class IrishGlassCloverDataset(Dataset):
             "ndvi_mask": ndvi_mask,
             "y_species": y_species,
             "y_state": y_state,
+            # Biomass decomposition (unused for Irish; masks are zero)
+            "y_biomass_5d_g": y_5d_g,
+            "biomass_5d_mask": biomass_5d_mask,
+            "y_ratio": y_ratio,
+            "ratio_mask": ratio_mask,
         }
 
 
