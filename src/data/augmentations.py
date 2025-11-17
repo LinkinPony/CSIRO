@@ -167,14 +167,31 @@ class RandomLightSpot:
         p: float = 0.3,
         radius_frac_range: Tuple[float, float] = (0.06, 0.18),
         alpha_range: Tuple[float, float] = (0.2, 0.6),
-        color: Tuple[int, int, int] = (255, 255, 220),
+        color: Optional[Tuple[int, int, int]] = (255, 255, 220),
         blur_frac: float = 0.5,
     ) -> None:
         self.p = float(p)
         self.radius_frac_range = (float(radius_frac_range[0]), float(radius_frac_range[1]))
         self.alpha_range = (float(alpha_range[0]), float(alpha_range[1]))
-        self.color = (int(color[0]), int(color[1]), int(color[2]))
+        self.color = (
+            (int(color[0]), int(color[1]), int(color[2]))
+            if color is not None
+            else None
+        )
         self.blur_frac = float(blur_frac)
+        self.use_random_color = False
+
+    def enable_random_color(self, flag: bool = True) -> None:
+        self.use_random_color = bool(flag)
+
+    def _sample_color(self) -> Tuple[int, int, int]:
+        # Default to a bright, slightly warm random color when randomization is enabled
+        if self.use_random_color or self.color is None:
+            r = random.randint(220, 255)
+            g = random.randint(220, 255)
+            b = random.randint(200, 255)
+            return (r, g, b)
+        return self.color
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if self.p <= 0.0:
@@ -185,20 +202,46 @@ class RandomLightSpot:
             return img
         w, h = img.size
         rgba = img.convert("RGBA")
-        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        mask = Image.new("L", (w, h), 0)
-        draw_mask = ImageDraw.Draw(mask)
-        r = int(min(w, h) * random.uniform(*self.radius_frac_range))
+        r_px = int(min(w, h) * random.uniform(*self.radius_frac_range))
+        if r_px <= 0:
+            return img
+
         cx = random.randint(0, w - 1)
         cy = random.randint(0, h - 1)
-        alpha_val = int(255 * random.uniform(*self.alpha_range))
-        bbox = [cx - r, cy - r, cx + r, cy + r]
-        draw_mask.ellipse(bbox, fill=alpha_val)
-        blur_radius = max(1, int(r * self.blur_frac))
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        alpha_max = int(255 * random.uniform(*self.alpha_range))
+        if alpha_max <= 0:
+            return img
 
-        spot_layer = Image.new("RGBA", (w, h), self.color + (0,))
-        composite = Image.composite(spot_layer, rgba, mask)
+        blur_radius = max(1, int(r_px * self.blur_frac))
+
+        x0 = max(0, cx - r_px)
+        x1 = min(w - 1, cx + r_px)
+        y0 = max(0, cy - r_px)
+        y1 = min(h - 1, cy + r_px)
+
+        spot_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        pixels = spot_layer.load()
+        color = self._sample_color()
+
+        for y in range(y0, y1 + 1):
+            dy = y - cy
+            for x in range(x0, x1 + 1):
+                dx = x - cx
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist > r_px:
+                    continue
+                t = dist / float(r_px)
+                # Smooth radial falloff; brighter in the center, fading towards the edges
+                intensity = max(0.0, 1.0 - t * t)
+                alpha = int(alpha_max * intensity)
+                if alpha <= 0:
+                    continue
+                pixels[x, y] = (color[0], color[1], color[2], alpha)
+
+        if blur_radius > 0:
+            spot_layer = spot_layer.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+        composite = Image.alpha_composite(rgba, spot_layer)
         return composite.convert("RGB")
 
 
@@ -292,10 +335,28 @@ def _maybe_add_visual_overlays(cfg: Dict[str, Any], transforms_list: List[Any]) 
                 p=float(ls_cfg.get("prob", 0.3)),
                 radius_frac_range=tuple(ls_cfg.get("radius_frac_range", [0.06, 0.18])),
                 alpha_range=tuple(ls_cfg.get("alpha_range", [0.2, 0.6])),
-                color=tuple(ls_cfg.get("color", [255, 255, 220])),
+                color=tuple(ls_cfg.get("color", [255, 255, 220])) if "color" in ls_cfg else None,
                 blur_frac=float(ls_cfg.get("blur_frac", 0.5)),
             )
         )
+
+
+def _maybe_add_color_jitter(cfg: Dict[str, Any], transforms_list: List[Any]) -> None:
+    cj_cfg: Dict[str, Any] = dict(cfg.get("color_jitter", {}))
+    if not bool(cj_cfg.get("enabled", False)):
+        return
+    brightness = cj_cfg.get("brightness", 0.0)
+    contrast = cj_cfg.get("contrast", 0.0)
+    saturation = cj_cfg.get("saturation", 0.0)
+    hue = cj_cfg.get("hue", 0.0)
+    transforms_list.append(
+        T.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue,
+        )
+    )
 
 
 def build_train_transform(
@@ -318,6 +379,7 @@ def build_train_transform(
 
     _maybe_add_vertical_flip(cfg, pre_tensor)
     _maybe_add_affine(cfg, pre_tensor)
+    _maybe_add_color_jitter(cfg, pre_tensor)
     _maybe_add_visual_overlays(cfg, pre_tensor)
 
     # 2) Convert to tensor for tensor-domain ops

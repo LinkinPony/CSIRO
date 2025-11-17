@@ -416,13 +416,13 @@ class BiomassRegressor(LightningModule):
             diff2_ndvi = (diff_ndvi * diff_ndvi) * m_nd
             mask_sum_ndvi = m_nd.sum().clamp_min(0.0)
 
-            if mask_sum_ndvi > 0:
+            if mask_sum_ndvi.item() > 0.0:
                 loss_ndvi = diff2_ndvi.sum() / mask_sum_ndvi
                 mae_ndvi = (diff_ndvi.abs() * m_nd).sum() / mask_sum_ndvi
-            self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
-            named_losses.append(("ndvi", loss_ndvi))
+                self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+                named_losses.append(("ndvi", loss_ndvi))
         if self.enable_species and logits_species is not None:
             loss_species = F.cross_entropy(logits_species, y_species)
             self.log(f"{stage}_loss_species", loss_species, on_step=False, on_epoch=True, prog_bar=False)
