@@ -6,14 +6,15 @@ import yaml
 from loguru import logger
 
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, StochasticWeightAveraging
 import torch
 
-from src.data.datamodule import PastureDataModule
-from src.models.regressor import BiomassRegressor
-from src.callbacks.head_checkpoint import HeadCheckpoint
 from src.training.kfold_runner import run_kfold
-from src.training.logging_utils import init_logging, create_lightning_loggers, plot_epoch_metrics
+from src.training.logging_utils import init_logging
+from src.training.single_run import (
+    parse_image_size,
+    resolve_dataset_area_m2,
+    train_single_split,
+)
 
 
 def parse_args():
@@ -25,19 +26,6 @@ def parse_args():
         help="Path to YAML config file",
     )
     return parser.parse_args()
-
-
-def _parse_image_size(value):
-    # Accept int (square) or [width, height]; return (height, width)
-    try:
-        if isinstance(value, (list, tuple)) and len(value) == 2:
-            w, h = int(value[0]), int(value[1])
-            return (int(h), int(w))
-        v = int(value)
-        return (v, v)
-    except Exception:
-        v = int(value)
-        return (v, v)
 
 
 def main():
@@ -91,314 +79,69 @@ def main():
     if use_kfold:
         run_kfold(cfg, log_dir, ckpt_dir)
     else:
-        # Regular single-split training
-        # Resolve dataset area (m^2) from config for unit conversion g <-> g/m^2
-        ds_name = str(cfg["data"].get("dataset", "csiro"))
-        ds_map = dict(cfg["data"].get("datasets", {}))
-        ds_info = dict(ds_map.get(ds_name, {}))
-        try:
-            width_m = float(ds_info.get("width_m", ds_info.get("width", 1.0)))
-        except Exception:
-            width_m = 1.0
-        try:
-            length_m = float(ds_info.get("length_m", ds_info.get("length", 1.0)))
-        except Exception:
-            length_m = 1.0
-        try:
-            area_m2 = float(ds_info.get("area_m2", width_m * length_m))
-        except Exception:
-            area_m2 = max(1.0, width_m * length_m if (width_m > 0.0 and length_m > 0.0) else 1.0)
-        if not (area_m2 > 0.0):
-            area_m2 = 1.0
-        log_scale_targets_cfg = bool(cfg["model"].get("log_scale_targets", False))
+        # Regular single-split training (including train_all special case)
+        # Build full dataframe once when train_all is enabled to construct splits.
+        train_df = None
+        val_df = None
 
-        irish_cfg = cfg.get("irish_glass_clover", {})
-        dm = PastureDataModule(
-            data_root=cfg["data"]["root"],
-            train_csv=cfg["data"]["train_csv"],
-            image_size=_parse_image_size(cfg["data"]["image_size"]),
-            batch_size=int(cfg["data"]["batch_size"]),
-            val_batch_size=int(cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])),
-            num_workers=int(cfg["data"]["num_workers"]),
-            prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
-            val_split=float(cfg["data"]["val_split"]),
-            target_order=list(cfg["data"]["target_order"]),
-            mean=list(cfg["data"]["normalization"]["mean"]),
-            std=list(cfg["data"]["normalization"]["std"]),
-            train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
-            sample_area_m2=float(area_m2),
-            zscore_output_path=str(log_dir / "z_score.json"),
-            log_scale_targets=log_scale_targets_cfg,
-            hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
-            augment_cfg=dict(cfg["data"].get("augment", {})),
-            shuffle=bool(cfg["data"].get("shuffle", True)),
-            # NDVI dense (optional)
-            ndvi_dense_enabled=bool(cfg.get("ndvi_dense", {}).get("enabled", False)),
-            ndvi_dense_root=str(cfg.get("ndvi_dense", {}).get("root", "")) if cfg.get("ndvi_dense", {}).get("root", None) is not None else None,
-            ndvi_dense_tile_size=int(cfg.get("ndvi_dense", {}).get("tile_size", 512)),
-            ndvi_dense_stride=int(cfg.get("ndvi_dense", {}).get("tile_stride", cfg.get("ndvi_dense", {}).get("stride", 448))),
-            ndvi_dense_batch_size=int(cfg.get("ndvi_dense", {}).get("batch_size", cfg["data"]["batch_size"])),
-            ndvi_dense_num_workers=int(cfg.get("ndvi_dense", {}).get("num_workers", cfg["data"]["num_workers"])),
-            ndvi_dense_mean=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("mean", cfg["data"]["normalization"]["mean"])),
-            ndvi_dense_std=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("std", cfg["data"]["normalization"]["std"])),
-            ndvi_dense_hflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("horizontal_flip_prob", cfg["data"]["augment"]["horizontal_flip_prob"])),
-            ndvi_dense_vflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("vertical_flip_prob", 0.0)),
-            # Irish Glass Clover (optional mixed dataset)
-            irish_enabled=bool(irish_cfg.get("enabled", False)),
-            irish_root=str(irish_cfg.get("root", "")) if irish_cfg.get("root", None) is not None else None,
-            irish_csv=str(irish_cfg.get("csv", "data.csv")) if irish_cfg.get("csv", None) is not None else None,
-            irish_image_dir=str(irish_cfg.get("image_dir", "images")),
-            irish_image_size=_parse_image_size(irish_cfg.get("image_size", cfg["data"]["image_size"])) if irish_cfg.get("image_size", None) is not None else None,
-        )
-
-        # MTL toggle: when disabled, train only reg3 task
-        mtl_cfg = cfg.get("mtl", {})
-        mtl_enabled = bool(mtl_cfg.get("enabled", True))
-
-        # Build full dataframe once (also used by train_all)
-        try:
-            full_df = dm.build_full_dataframe()
-        except Exception as e:
-            logger.warning(f"Building full dataframe failed: {e}")
-            raise
-
-        # Train-all: use all samples for train and a single duplicated sample as dummy val
         if train_all_enabled:
             try:
-                import pandas as pd  # local import to avoid global dependency if unused
-                rng_seed = int(cfg.get("seed", 42))
-                if len(full_df) < 1:
-                    raise ValueError("No samples available to construct train_all splits.")
-                dummy_val = full_df.sample(n=1, random_state=rng_seed)
-                # Optionally duplicate the single row to avoid degenerate loader corner cases
-                val_df = pd.concat([dummy_val], ignore_index=True)
-                train_df = full_df.reset_index(drop=True)
-                # Recreate datamodule with predefined splits
-                irish_cfg = cfg.get("irish_glass_clover", {})
-                dm = PastureDataModule(
+                from src.data.datamodule import PastureDataModule
+
+                area_m2 = resolve_dataset_area_m2(cfg)
+                base_dm = PastureDataModule(
                     data_root=cfg["data"]["root"],
                     train_csv=cfg["data"]["train_csv"],
-                    image_size=_parse_image_size(cfg["data"]["image_size"]),
+                    image_size=parse_image_size(cfg["data"]["image_size"]),
                     batch_size=int(cfg["data"]["batch_size"]),
-                    val_batch_size=int(cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])),
+                    val_batch_size=int(
+                        cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])
+                    ),
                     num_workers=int(cfg["data"]["num_workers"]),
                     prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
-                    val_split=0.0,
+                    val_split=float(cfg["data"]["val_split"]),
                     target_order=list(cfg["data"]["target_order"]),
                     mean=list(cfg["data"]["normalization"]["mean"]),
                     std=list(cfg["data"]["normalization"]["std"]),
                     train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
                     sample_area_m2=float(area_m2),
                     zscore_output_path=str(log_dir / "z_score.json"),
-                    log_scale_targets=log_scale_targets_cfg,
+                    log_scale_targets=bool(
+                        cfg["model"].get("log_scale_targets", False)
+                    ),
                     hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
-                    augment_cfg=dict(cfg["data"].get("augment", {})),
                     shuffle=bool(cfg["data"].get("shuffle", True)),
-                    predefined_train_df=train_df,
-                    predefined_val_df=val_df,
-                    # Ensure NDVI dense remains enabled under train_all mode
-                    ndvi_dense_enabled=bool(cfg.get("ndvi_dense", {}).get("enabled", False)),
-                    ndvi_dense_root=str(cfg.get("ndvi_dense", {}).get("root", "")) if cfg.get("ndvi_dense", {}).get("root", None) is not None else None,
-                    ndvi_dense_tile_size=int(cfg.get("ndvi_dense", {}).get("tile_size", 512)),
-                    ndvi_dense_stride=int(cfg.get("ndvi_dense", {}).get("tile_stride", cfg.get("ndvi_dense", {}).get("stride", 448))),
-                    ndvi_dense_batch_size=int(cfg.get("ndvi_dense", {}).get("batch_size", cfg["data"]["batch_size"])),
-                    ndvi_dense_num_workers=int(cfg.get("ndvi_dense", {}).get("num_workers", cfg["data"]["num_workers"])),
-                    ndvi_dense_mean=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("mean", cfg["data"]["normalization"]["mean"])),
-                    ndvi_dense_std=list(cfg.get("ndvi_dense", {}).get("normalization", {}).get("std", cfg["data"]["normalization"]["std"])),
-                    ndvi_dense_hflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("horizontal_flip_prob", cfg["data"]["augment"]["horizontal_flip_prob"])),
-                    ndvi_dense_vflip_prob=float(cfg.get("ndvi_dense", {}).get("augment", {}).get("vertical_flip_prob", 0.0)),
-                    # Irish Glass Clover (optional mixed dataset)
-                    irish_enabled=bool(irish_cfg.get("enabled", False)),
-                    irish_root=str(irish_cfg.get("root", "")) if irish_cfg.get("root", None) is not None else None,
-                    irish_csv=str(irish_cfg.get("csv", "data.csv")) if irish_cfg.get("csv", None) is not None else None,
-                    irish_image_dir=str(irish_cfg.get("image_dir", "images")),
-                    irish_image_size=_parse_image_size(irish_cfg.get("image_size", cfg["data"]["image_size"])) if irish_cfg.get("image_size", None) is not None else None,
                 )
+                try:
+                    full_df = base_dm.build_full_dataframe()
+                except Exception as e:
+                    logger.warning(f"Building full dataframe failed: {e}")
+                    raise
+
+                import pandas as pd  # local import to avoid global dependency if unused
+
+                rng_seed = int(cfg.get("seed", 42))
+                if len(full_df) < 1:
+                    raise ValueError(
+                        "No samples available to construct train_all splits."
+                    )
+                dummy_val = full_df.sample(n=1, random_state=rng_seed)
+                # Optionally duplicate the single row to avoid degenerate loader corner cases
+                val_df = pd.concat([dummy_val], ignore_index=True)
+                train_df = full_df.reset_index(drop=True)
             except Exception as e:
                 logger.warning(f"Constructing train_all splits failed: {e}")
                 raise
 
-        # Task toggles (default off)
-        tasks_cfg = cfg.get("mtl", {}).get("tasks", {})
-        height_enabled = bool(tasks_cfg.get("height", False)) and mtl_enabled
-        ndvi_enabled = bool(tasks_cfg.get("ndvi", False)) and mtl_enabled
-        ndvi_dense_enabled = bool(tasks_cfg.get("ndvi_dense", False)) and mtl_enabled
-        species_enabled = bool(tasks_cfg.get("species", False)) and mtl_enabled
-        state_enabled = bool(tasks_cfg.get("state", False)) and mtl_enabled
-
-        # Infer number of species/state classes only if corresponding tasks are enabled
-        if mtl_enabled:
-            try:
-                if species_enabled:
-                    num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
-                    if num_species_classes <= 1:
-                        raise ValueError("Species column has <=1 unique values")
-                else:
-                    num_species_classes = None
-            except Exception as e:
-                if species_enabled:
-                    logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
-                    num_species_classes = 2
-                else:
-                    num_species_classes = None
-            try:
-                if state_enabled:
-                    num_state_classes = int(len(sorted(full_df["State"].dropna().astype(str).unique().tolist())))
-                    if num_state_classes <= 1:
-                        raise ValueError("State column has <=1 unique values")
-                else:
-                    num_state_classes = None
-            except Exception as e:
-                if state_enabled:
-                    logger.warning(f"Falling back to num_state_classes=2 (reason: {e})")
-                    num_state_classes = 2
-                else:
-                    num_state_classes = None
-        else:
-            num_species_classes = None
-            num_state_classes = None
-
-        # Ensure z-score stats are computed before model init
-        try:
-            dm.setup()
-        except Exception:
-            pass
-
-        loss_cfg = cfg.get("loss", {})
-        ratio_head_enabled = bool(loss_cfg.get("use_ratio_head", True))
-        loss_5d_enabled = bool(loss_cfg.get("use_5d_weighted_mse", True))
-        ratio_kl_weight = float(loss_cfg.get("ratio_kl_weight", 1.0))
-        mse_5d_weight = float(loss_cfg.get("mse_5d_weight", 1.0))
-        mse_5d_weights_per_target = list(
-            loss_cfg.get("mse_5d_weights_per_target", [0.1, 0.1, 0.1, 0.2, 0.5])
+        # Delegate the actual training pipeline to the shared single-run helper.
+        train_single_split(
+            cfg,
+            log_dir,
+            ckpt_dir,
+            train_df=train_df,
+            val_df=val_df,
+            train_all_mode=train_all_enabled,
         )
-
-        model = BiomassRegressor(
-            backbone_name=str(cfg["model"]["backbone"]),
-            embedding_dim=int(cfg["model"]["embedding_dim"]),
-            num_outputs=len(cfg["data"]["target_order"]),
-            dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
-            head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-            head_activation=str(cfg["model"]["head"].get("activation", "relu")),
-            use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
-            log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
-            area_m2=float(area_m2),
-            reg3_zscore_mean=list(dm.reg3_zscore_mean or []) if hasattr(dm, "reg3_zscore_mean") else None,
-            reg3_zscore_std=list(dm.reg3_zscore_std or []) if hasattr(dm, "reg3_zscore_std") else None,
-            ndvi_zscore_mean=float(dm.ndvi_zscore_mean) if getattr(dm, "ndvi_zscore_mean", None) is not None else None,
-            ndvi_zscore_std=float(dm.ndvi_zscore_std) if getattr(dm, "ndvi_zscore_std", None) is not None else None,
-            biomass_5d_zscore_mean=list(dm.biomass_5d_zscore_mean or []) if hasattr(dm, "biomass_5d_zscore_mean") else None,
-            biomass_5d_zscore_std=list(dm.biomass_5d_zscore_std or []) if hasattr(dm, "biomass_5d_zscore_std") else None,
-            uw_learning_rate=float(cfg.get("optimizer", {}).get("uw_lr", cfg["optimizer"]["lr"])),
-            uw_weight_decay=float(cfg.get("optimizer", {}).get("uw_weight_decay", cfg["optimizer"]["weight_decay"])),
-            pretrained=bool(cfg["model"].get("pretrained", True)),
-            weights_url=cfg["model"].get("weights_url", None),
-            weights_path=cfg["model"].get("weights_path", None),
-            freeze_backbone=bool(cfg["model"].get("freeze_backbone", True)),
-            learning_rate=float(cfg["optimizer"]["lr"]),
-            weight_decay=float(cfg["optimizer"]["weight_decay"]),
-            scheduler_name=str(cfg.get("scheduler", {}).get("name", "")).lower() or None,
-            scheduler_warmup_epochs=int(cfg.get("scheduler", {}).get("warmup_epochs", 0) or 0),
-            scheduler_warmup_start_factor=float(cfg.get("scheduler", {}).get("warmup_start_factor", 0.1)),
-            max_epochs=int(cfg["trainer"]["max_epochs"]),
-            loss_weighting=(str(cfg.get("loss", {}).get("weighting", "")).lower() or None),
-            num_species_classes=num_species_classes,
-            num_state_classes=num_state_classes,
-            mtl_enabled=mtl_enabled,
-            # Task sampling ratio: probability to include NDVI-dense on a training step
-            ndvi_dense_prob=float(cfg.get("mtl", {}).get("sample_ratio", {}).get("ndvi_dense", 1.0 if ndvi_dense_enabled else 0.0)),
-            enable_height=height_enabled,
-            enable_ndvi=ndvi_enabled,
-            enable_ndvi_dense=ndvi_dense_enabled,
-            enable_species=species_enabled,
-            enable_state=state_enabled,
-            peft_cfg=dict(cfg.get("peft", {})),
-            # CutMix configs
-            cutmix_cfg=dict(cfg.get("data", {}).get("augment", {}).get("cutmix", {})),
-            ndvi_dense_cutmix_cfg=dict(
-                cfg.get("ndvi_dense", {}).get("augment", {}).get(
-                    "cutmix",
-                    cfg.get("data", {}).get("augment", {}).get("cutmix", {}),
-                )
-            ),
-            # Biomass ratio / 5D loss configuration
-            enable_ratio_head=ratio_head_enabled,
-            ratio_kl_weight=ratio_kl_weight,
-            enable_5d_loss=loss_5d_enabled,
-            loss_5d_weight=mse_5d_weight,
-            biomass_5d_weights=mse_5d_weights_per_target,
-        )
-
-        head_ckpt_dir = ckpt_dir / "head"
-        callbacks = []
-        # Lightweight Lightning checkpoint (last + best) to preserve full training state, excluding backbone weights.
-        # When multiple val dataloaders are used (NDVI-dense enabled), Lightning logs metrics with
-        # the suffix `/dataloader_idx_0`. Otherwise, it logs plain `val_loss`.
-        use_multi_val = bool(cfg.get("ndvi_dense", {}).get("enabled", False))
-        monitor_metric = "val_loss/dataloader_idx_0" if use_multi_val else "val_loss"
-        checkpoint_cb = ModelCheckpoint(
-            dirpath=str(ckpt_dir),
-            filename="best",
-            auto_insert_metric_name=False,
-            monitor=monitor_metric,
-            mode="min",
-            save_top_k=1,
-            save_last=True,
-        )
-        callbacks.append(checkpoint_cb)
-        callbacks.append(LearningRateMonitor(logging_interval="epoch"))
-        callbacks.append(HeadCheckpoint(output_dir=str(head_ckpt_dir)))
-
-        # Optional SWA to stabilize small-batch updates (match k-fold behavior)
-        swa_cfg = cfg.get("trainer", {}).get("swa", {})
-        if bool(swa_cfg.get("enabled", False)):
-            try:
-                swa_cb = StochasticWeightAveraging(
-                    swa_lrs=float(swa_cfg.get("swa_lrs", cfg["optimizer"]["lr"])),
-                    swa_epoch_start=float(swa_cfg.get("swa_epoch_start", 0.8)),
-                    annealing_epochs=int(swa_cfg.get("annealing_epochs", 5)),
-                    annealing_strategy=str(swa_cfg.get("annealing_strategy", "cos")),
-                )
-                callbacks.append(swa_cb)
-            except Exception as e:
-                logger.warning(f"SWA callback creation failed, continuing without SWA: {e}")
-
-        csv_logger, tb_logger = create_lightning_loggers(log_dir)
-
-        trainer = pl.Trainer(
-            max_epochs=int(cfg["trainer"]["max_epochs"]),
-            accelerator=str(cfg["trainer"]["accelerator"]),
-            devices=cfg["trainer"]["devices"],
-            precision=cfg["trainer"]["precision"],
-            limit_train_batches=cfg["trainer"].get("limit_train_batches", 1.0),
-            limit_val_batches=(cfg["trainer"].get("limit_val_batches", 1 if train_all_enabled else 1.0)),
-            callbacks=callbacks,
-            logger=[csv_logger, tb_logger],
-            log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
-            accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
-            gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
-            gradient_clip_algorithm=str(cfg["trainer"].get("gradient_clip_algorithm", "norm")),
-            enable_checkpointing=True,
-        )
-
-        last_ckpt = ckpt_dir / "last.ckpt"
-        resume_from_cfg = cfg.get("trainer", {}).get("resume_from", None)
-        if last_ckpt.is_file():
-            resume_path = str(last_ckpt)
-            logger.info(f"Auto-resuming from last checkpoint: {resume_path}")
-        elif resume_from_cfg is not None and resume_from_cfg != "null" and str(resume_from_cfg).strip() != "":
-            resume_path = str(resume_from_cfg)
-            logger.info(f"Resuming from checkpoint (config): {resume_path}")
-        else:
-            resume_path = None
-
-        trainer.fit(model=model, datamodule=dm, ckpt_path=resume_path)
-
-    # Generate metric plots for non-kfold run
-    if not use_kfold:
-        metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
-        plots_dir = Path(log_dir) / "plots"
-        plot_epoch_metrics(metrics_csv, plots_dir)
 
 
 if __name__ == "__main__":

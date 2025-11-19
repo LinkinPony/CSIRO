@@ -402,52 +402,10 @@ class BiomassRegressor(LightningModule):
         mask_sum_reg3 = mask.sum().clamp_min(1.0)
         # Base MSE on main reg3 outputs (e.g., Dry_Total_g).
         loss_reg3_mse = diff2_reg3.sum() / mask_sum_reg3
-        if (not self.mtl_enabled) or (self.enable_height is False and self.enable_ndvi is False and self.enable_species is False and self.enable_state is False):
-            self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
-            mae_reg3 = (diff_reg3.abs() * mask).sum() / mask_sum_reg3
-            self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
-            with torch.no_grad():
-                per_dim_den = mask.sum(dim=0).clamp_min(1.0)
-                per_dim_mse = diff2_reg3.sum(dim=0) / per_dim_den
-                for i in range(per_dim_mse.shape[0]):
-                    self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
 
-            total_loss = loss_reg3_mse
-            self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
-            self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
-            # For external metrics (e.g., epoch-end R^2), return original-scale grams
-            preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
-            targets_out = batch.get("y_reg3_g", None)
-            if targets_out is None:
-                # Fallback: invert from g/m^2 stored if present
-                y_gm2 = batch.get("y_reg3_g_m2", None)
-                if y_gm2 is not None:
-                    targets_out = y_gm2 * float(self._area_m2)
-                else:
-                    # Last resort: invert from normalized y (approximate)
-                    targets_out = self._invert_reg3_to_grams(y_reg3.detach())
-            return {
-                "loss": total_loss,
-                "mae": mae_reg3,
-                "mse": loss_reg3_mse,
-                "preds": preds_out,
-                "targets": targets_out,
-            }
-
-        # Otherwise, compute enabled auxiliary task heads and losses
-        pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
-        pred_ndvi = self.ndvi_head(z) if self.enable_ndvi else None  # type: ignore[assignment]
-        logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
-        logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
-
-        # Always log reg3 base MSE
+        # Always log base reg3 metrics (independent of MTL / auxiliary tasks)
         self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
-
-        # Collect losses in consistent order for UW/equal weighting
-        named_losses: List[Tuple[str, Tensor]] = []
         mae_reg3 = (diff_reg3.abs() * mask).sum() / mask_sum_reg3
         self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
         with torch.no_grad():
@@ -539,8 +497,48 @@ class BiomassRegressor(LightningModule):
             loss_reg3_total = loss_reg3_total + loss_ratio_kl
         if loss_5d is not None:
             loss_reg3_total = loss_reg3_total + loss_5d
-        named_losses.append(("reg3", loss_reg3_total))
         self.log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
+
+        # If MTL is disabled or all auxiliary tasks are off, optimize only the reg3 path
+        if (not self.mtl_enabled) or (
+            self.enable_height is False
+            and self.enable_ndvi is False
+            and self.enable_species is False
+            and self.enable_state is False
+        ):
+            total_loss = loss_reg3_total
+            self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+            # Overall mae/mse are computed on normalized reg3 space for backward compatibility
+            self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+            # For external metrics (e.g., epoch-end R^2), return original-scale grams
+            preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
+            targets_out = batch.get("y_reg3_g", None)
+            if targets_out is None:
+                # Fallback: invert from g/m^2 stored if present
+                y_gm2 = batch.get("y_reg3_g_m2", None)
+                if y_gm2 is not None:
+                    targets_out = y_gm2 * float(self._area_m2)
+                else:
+                    # Last resort: invert from normalized y (approximate)
+                    targets_out = self._invert_reg3_to_grams(y_reg3.detach())
+            return {
+                "loss": total_loss,
+                "mae": mae_reg3,
+                "mse": loss_reg3_mse,
+                "preds": preds_out,
+                "targets": targets_out,
+            }
+
+        # Otherwise, compute enabled auxiliary task heads and losses
+        pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
+        pred_ndvi = self.ndvi_head(z) if self.enable_ndvi else None  # type: ignore[assignment]
+        logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
+        logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
+
+        # Collect losses in consistent order for UW/equal weighting
+        named_losses: List[Tuple[str, Tensor]] = []
+        named_losses.append(("reg3", loss_reg3_total))
 
         if self.enable_height:
             loss_height = F.mse_loss(pred_height, y_height)  # type: ignore[arg-type]

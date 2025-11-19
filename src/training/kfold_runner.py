@@ -2,109 +2,27 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 from loguru import logger
-import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, StochasticWeightAveraging
 
 from src.data.datamodule import PastureDataModule
-from src.models.regressor import BiomassRegressor
-from src.callbacks.head_checkpoint import HeadCheckpoint
-from src.training.logging_utils import create_lightning_loggers, plot_epoch_metrics
-
-
-def _build_model(
-    cfg: Dict,
-    num_species_classes: int | None,
-    num_state_classes: int | None,
-    mtl_enabled: bool,
-    height_enabled: bool,
-    ndvi_enabled: bool,
-    species_enabled: bool,
-    state_enabled: bool,
-    *,
-    area_m2: float,
-    reg3_zscore_mean: list[float] | None,
-    reg3_zscore_std: list[float] | None,
-    ndvi_zscore_mean: float | None,
-    ndvi_zscore_std: float | None,
-) -> BiomassRegressor:
-    return BiomassRegressor(
-        backbone_name=str(cfg["model"]["backbone"]),
-        embedding_dim=int(cfg["model"]["embedding_dim"]),
-        num_outputs=3,
-        dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
-        head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-        head_activation=str(cfg["model"]["head"].get("activation", "relu")),
-        use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
-        log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
-        area_m2=float(area_m2),
-        reg3_zscore_mean=list(reg3_zscore_mean or []) if reg3_zscore_mean is not None else None,
-        reg3_zscore_std=list(reg3_zscore_std or []) if reg3_zscore_std is not None else None,
-        ndvi_zscore_mean=float(ndvi_zscore_mean) if ndvi_zscore_mean is not None else None,
-        ndvi_zscore_std=float(ndvi_zscore_std) if ndvi_zscore_std is not None else None,
-        uw_learning_rate=float(cfg.get("optimizer", {}).get("uw_lr", cfg["optimizer"]["lr"])),
-        uw_weight_decay=float(cfg.get("optimizer", {}).get("uw_weight_decay", cfg["optimizer"]["weight_decay"])),
-        pretrained=bool(cfg["model"].get("pretrained", True)),
-        weights_url=cfg["model"].get("weights_url", None),
-        weights_path=cfg["model"].get("weights_path", None),
-        freeze_backbone=bool(cfg["model"].get("freeze_backbone", True)),
-        learning_rate=float(cfg["optimizer"]["lr"]),
-        weight_decay=float(cfg["optimizer"]["weight_decay"]),
-        scheduler_name=str(cfg.get("scheduler", {}).get("name", "")).lower() or None,
-        max_epochs=int(cfg["trainer"]["max_epochs"]),
-        loss_weighting=(str(cfg.get("loss", {}).get("weighting", "")).lower() or None),
-        num_species_classes=(int(num_species_classes) if num_species_classes is not None else None),
-        num_state_classes=(int(num_state_classes) if num_state_classes is not None else None),
-        peft_cfg=dict(cfg.get("peft", {})),
-        mtl_enabled=mtl_enabled,
-        enable_height=height_enabled,
-        enable_ndvi=ndvi_enabled,
-        enable_species=species_enabled,
-        enable_state=state_enabled,
-    )
-
-
-def _parse_image_size(value):
-    try:
-        if isinstance(value, (list, tuple)) and len(value) == 2:
-            w, h = int(value[0]), int(value[1])
-            return (int(h), int(w))
-        v = int(value)
-        return (v, v)
-    except Exception:
-        v = int(value)
-        return (v, v)
+from src.training.single_run import (
+    parse_image_size,
+    resolve_dataset_area_m2,
+    train_single_split,
+)
 
 
 def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
-    # Build once to get the full dataframe and other settings
-    ds_name = str(cfg["data"].get("dataset", "csiro"))
-    ds_map = dict(cfg["data"].get("datasets", {}))
-    ds_info = dict(ds_map.get(ds_name, {}))
-    try:
-        width_m = float(ds_info.get("width_m", ds_info.get("width", 1.0)))
-    except Exception:
-        width_m = 1.0
-    try:
-        length_m = float(ds_info.get("length_m", ds_info.get("length", 1.0)))
-    except Exception:
-        length_m = 1.0
-    try:
-        area_m2 = float(ds_info.get("area_m2", width_m * length_m))
-    except Exception:
-        area_m2 = max(1.0, width_m * length_m if (width_m > 0.0 and length_m > 0.0) else 1.0)
-    if not (area_m2 > 0.0):
-        area_m2 = 1.0
-
-    log_scale_targets_cfg = bool(cfg["model"].get("log_scale_targets", False))
+    # Build once to get the full dataframe and other settings used for splitting.
+    area_m2 = resolve_dataset_area_m2(cfg)
 
     base_dm = PastureDataModule(
         data_root=cfg["data"]["root"],
         train_csv=cfg["data"]["train_csv"],
-        image_size=_parse_image_size(cfg["data"]["image_size"]),
+        image_size=parse_image_size(cfg["data"]["image_size"]),
         batch_size=int(cfg["data"]["batch_size"]),
         val_batch_size=int(cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])),
         num_workers=int(cfg["data"]["num_workers"]),
@@ -116,7 +34,7 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
         train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
         sample_area_m2=float(area_m2),
         zscore_output_path=str(log_dir / "z_score.json"),
-        log_scale_targets=log_scale_targets_cfg,
+        log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
         hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
         shuffle=bool(cfg["data"].get("shuffle", True)),
     )
@@ -130,31 +48,41 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
     state_enabled = bool(tasks_cfg.get("state", False)) and mtl_enabled
 
     full_df = base_dm.build_full_dataframe()
-    # infer number of species/state classes (only if tasks enabled)
-    if mtl_enabled:
+
+    # Infer number of species/state classes (only if tasks enabled).
+    num_species_classes: Optional[int]
+    num_state_classes: Optional[int]
+    if mtl_enabled and (species_enabled or state_enabled):
         try:
             if species_enabled:
-                num_species_classes = int(len(sorted(full_df["Species"].dropna().astype(str).unique().tolist())))
+                uniques = full_df["Species"].dropna().astype(str).unique().tolist()
+                num_species_classes = int(len(sorted(uniques)))
                 if num_species_classes <= 1:
                     raise ValueError("Species column has <=1 unique values")
             else:
                 num_species_classes = None
         except Exception as e:
             if species_enabled:
-                logger.warning(f"Falling back to num_species_classes=2 (reason: {e})")
+                logger.warning(
+                    f"Falling back to num_species_classes=2 (reason: {e})"
+                )
                 num_species_classes = 2
             else:
                 num_species_classes = None
+
         try:
             if state_enabled:
-                num_state_classes = int(len(sorted(full_df["State"].dropna().astype(str).unique().tolist())))
+                uniques = full_df["State"].dropna().astype(str).unique().tolist()
+                num_state_classes = int(len(sorted(uniques)))
                 if num_state_classes <= 1:
                     raise ValueError("State column has <=1 unique values")
             else:
                 num_state_classes = None
         except Exception as e:
             if state_enabled:
-                logger.warning(f"Falling back to num_state_classes=2 (reason: {e})")
+                logger.warning(
+                    f"Falling back to num_state_classes=2 (reason: {e})"
+                )
                 num_state_classes = 2
             else:
                 num_state_classes = None
@@ -227,113 +155,16 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
         fold_log_dir.mkdir(parents=True, exist_ok=True)
         fold_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Datamodule with predefined splits
-        dm = PastureDataModule(
-            data_root=cfg["data"]["root"],
-            train_csv=cfg["data"]["train_csv"],
-            image_size=_parse_image_size(cfg["data"]["image_size"]),
-            batch_size=int(cfg["data"]["batch_size"]),
-            val_batch_size=int(cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])),
-            num_workers=int(cfg["data"]["num_workers"]),
-            prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
-            val_split=0.0,
-            target_order=list(cfg["data"]["target_order"]),
-            mean=list(cfg["data"]["normalization"]["mean"]),
-            std=list(cfg["data"]["normalization"]["std"]),
-            train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
-            sample_area_m2=float(area_m2),
-            zscore_output_path=str(fold_log_dir / "z_score.json"),
-            log_scale_targets=log_scale_targets_cfg,
-            hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
-            shuffle=bool(cfg["data"].get("shuffle", True)),
-            predefined_train_df=train_df,
-            predefined_val_df=val_df,
-        )
-
-        # Ensure z-score stats computed
-        try:
-            dm.setup()
-        except Exception:
-            pass
-
-        model = _build_model(
+        # Delegate actual training of this fold to the shared single-run helper.
+        train_single_split(
             cfg,
-            num_species_classes,
-            num_state_classes,
-            mtl_enabled,
-            height_enabled,
-            ndvi_enabled,
-            species_enabled,
-            state_enabled,
-            area_m2=float(area_m2),
-            reg3_zscore_mean=list(dm.reg3_zscore_mean or []) if hasattr(dm, "reg3_zscore_mean") else None,
-            reg3_zscore_std=list(dm.reg3_zscore_std or []) if hasattr(dm, "reg3_zscore_std") else None,
-            ndvi_zscore_mean=float(dm.ndvi_zscore_mean) if getattr(dm, "ndvi_zscore_mean", None) is not None else None,
-            ndvi_zscore_std=float(dm.ndvi_zscore_std) if getattr(dm, "ndvi_zscore_std", None) is not None else None,
+            fold_log_dir,
+            fold_ckpt_dir,
+            train_df=train_df,
+            val_df=val_df,
+            train_all_mode=False,
+            num_species_classes=num_species_classes,
+            num_state_classes=num_state_classes,
         )
-
-        # Lightweight Lightning checkpoint (last + best) to preserve full training state, excluding backbone weights
-        head_ckpt_dir = fold_ckpt_dir / "head"
-        callbacks = []
-        checkpoint_cb = ModelCheckpoint(
-            dirpath=str(fold_ckpt_dir),
-            filename="best",
-            auto_insert_metric_name=False,
-            monitor="val_loss",
-            mode="min",
-            save_top_k=1,
-            save_last=True,
-        )
-        callbacks.append(checkpoint_cb)
-        callbacks.append(LearningRateMonitor(logging_interval="epoch"))
-        callbacks.append(HeadCheckpoint(output_dir=str(head_ckpt_dir)))
-
-        # Optional SWA to stabilize small-batch updates
-        swa_cfg = cfg.get("trainer", {}).get("swa", {})
-        if bool(swa_cfg.get("enabled", False)):
-            try:
-                swa_cb = StochasticWeightAveraging(
-                    swa_lrs=float(swa_cfg.get("swa_lrs", cfg["optimizer"]["lr"])),
-                    swa_epoch_start=float(swa_cfg.get("swa_epoch_start", 0.8)),
-                    annealing_epochs=int(swa_cfg.get("annealing_epochs", 5)),
-                    annealing_strategy=str(swa_cfg.get("annealing_strategy", "cos")),
-                )
-                callbacks.append(swa_cb)
-            except Exception as e:
-                logger.warning(f"SWA callback creation failed, continuing without SWA: {e}")
-
-        csv_logger, tb_logger = create_lightning_loggers(fold_log_dir)
-
-        trainer = pl.Trainer(
-            max_epochs=int(cfg["trainer"]["max_epochs"]),
-            accelerator=str(cfg["trainer"]["accelerator"]),
-            devices=cfg["trainer"]["devices"],
-            precision=cfg["trainer"]["precision"],
-            callbacks=callbacks,
-            logger=[csv_logger, tb_logger],
-            log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
-            accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
-            gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
-            gradient_clip_algorithm=str(cfg["trainer"].get("gradient_clip_algorithm", "norm")),
-            enable_checkpointing=True,
-        )
-
-        last_ckpt = fold_ckpt_dir / "last.ckpt"
-        resume_from_cfg = cfg.get("trainer", {}).get("resume_from", None)
-        if last_ckpt.is_file():
-            resume_path = str(last_ckpt)
-            logger.info(f"[Fold {fold_idx}] Auto-resuming from last checkpoint: {resume_path}")
-        elif resume_from_cfg is not None and resume_from_cfg != "null" and str(resume_from_cfg).strip() != "":
-            resume_path = str(resume_from_cfg)
-            logger.info(f"[Fold {fold_idx}] Resuming from checkpoint (config): {resume_path}")
-        else:
-            resume_path = None
-
-        trainer.fit(model=model, datamodule=dm, ckpt_path=resume_path)
-
-        # plots per fold
-        metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
-        plots_dir = fold_log_dir / "plots"
-        plot_epoch_metrics(metrics_csv, plots_dir)
 
 

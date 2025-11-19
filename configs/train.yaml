@@ -1,5 +1,5 @@
 seed: 42
-version: ratio
+version: ratio-check-repeat
 data:
   root: data
   train_csv: train.csv
