@@ -1,5 +1,5 @@
 seed: 42
-version: ratio-check-repeat
+version: ratio-fix-mixup-no-irish-no-cutmix
 data:
   root: data
   train_csv: train.csv
@@ -69,7 +69,7 @@ data:
       ratio: [0.3, 3.3]
       value: random
     cutmix:
-      enabled: true
+      enabled: false
       prob: 0.5
       alpha: 0.5
       # minmax: [0.3, 0.7]  # optional clamp for bbox size; comment to disable

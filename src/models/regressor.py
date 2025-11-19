@@ -461,17 +461,24 @@ class BiomassRegressor(LightningModule):
             )
 
             # Optionally move to z-scored space using precomputed 5D stats
+            pred_5d_input = pred_5d_gm2
+            target_5d_input = y_5d_gm2
+
+            if self.log_scale_targets:
+                pred_5d_input = torch.log1p(torch.clamp(pred_5d_input, min=0.0))
+                target_5d_input = torch.log1p(torch.clamp(target_5d_input, min=0.0))
+
             if self._use_biomass_5d_zscore:
                 mean_5d = self._biomass_5d_mean.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype)  # type: ignore[union-attr]
                 std_5d = torch.clamp(
                     self._biomass_5d_std.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype),  # type: ignore[union-attr]
                     min=1e-8,
                 )
-                pred_5d = (pred_5d_gm2 - mean_5d) / std_5d
-                target_5d = (y_5d_gm2 - mean_5d) / std_5d
+                pred_5d = (pred_5d_input - mean_5d) / std_5d
+                target_5d = (target_5d_input - mean_5d) / std_5d
             else:
-                pred_5d = pred_5d_gm2
-                target_5d = y_5d_gm2
+                pred_5d = pred_5d_input
+                target_5d = target_5d_input
 
             # Weighted MSE across components with masks
             w = self.biomass_5d_weights.to(device=pred_5d.device, dtype=pred_5d.dtype)  # (5,)

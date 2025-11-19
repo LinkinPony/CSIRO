@@ -45,6 +45,7 @@ class PastureImageDataset(Dataset):
         reg3_std: Optional[Sequence[float]] = None,
         ndvi_mean: Optional[float] = None,
         ndvi_std: Optional[float] = None,
+        log_scale_targets: bool = False,
         species_to_idx: Optional[dict] = None,
         state_to_idx: Optional[dict] = None,
         transform: Optional[T.Compose] = None,
@@ -58,6 +59,7 @@ class PastureImageDataset(Dataset):
         self._reg3_std = torch.tensor(list(reg3_std), dtype=torch.float32) if reg3_std is not None else None
         self._ndvi_mean = float(ndvi_mean) if ndvi_mean is not None else None
         self._ndvi_std = float(ndvi_std) if ndvi_std is not None else None
+        self._log_scale_targets = bool(log_scale_targets)
         self.species_to_idx = dict(species_to_idx or {})
         self.state_to_idx = dict(state_to_idx or {})
         self.transform = transform
@@ -76,12 +78,18 @@ class PastureImageDataset(Dataset):
         reg3_mask = torch.ones_like(y_reg3_g, dtype=torch.float32)
         # Convert grams to grams per square meter if a valid area is provided
         y_reg3_g_m2 = y_reg3_g / float(self.area_m2) if self.area_m2 > 0.0 else y_reg3_g
+        
+        # Apply optional log-scale + z-score normalization
+        y_reg3_norm = y_reg3_g_m2.clone()
+        if self._log_scale_targets:
+            y_reg3_norm = torch.log1p(torch.clamp(y_reg3_norm, min=0.0))
+
         # Apply z-score if provided
         if self._reg3_mean is not None and self._reg3_std is not None:
             safe_std = torch.clamp(self._reg3_std, min=1e-8)
-            y_reg3 = (y_reg3_g_m2 - self._reg3_mean) / safe_std
+            y_reg3 = (y_reg3_norm - self._reg3_mean) / safe_std
         else:
-            y_reg3 = y_reg3_g_m2
+            y_reg3 = y_reg3_norm
         # --- Canonical biomass components in grams (CSIRO only) ---
         # Order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
         try:
@@ -355,6 +363,7 @@ class PastureDataModule(LightningDataModule):
             reg3_std=self._reg3_std,
             ndvi_mean=self._ndvi_mean,
             ndvi_std=self._ndvi_std,
+            log_scale_targets=self._log_scale_targets,
             species_to_idx=species_to_idx,
             state_to_idx=state_to_idx,
             transform=self.train_tf,
@@ -419,6 +428,7 @@ class PastureDataModule(LightningDataModule):
             reg3_std=self._reg3_std,
             ndvi_mean=self._ndvi_mean,
             ndvi_std=self._ndvi_std,
+            log_scale_targets=self._log_scale_targets,
             species_to_idx=species_to_idx,
             state_to_idx=state_to_idx,
             transform=self.val_tf,

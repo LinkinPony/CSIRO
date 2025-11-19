@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 
@@ -25,10 +26,13 @@ def plot_distributions(
     - Additionally, if the CSV is in the 'flattened' format with
       columns `target_name` and `target`, extra plots are created
       for each target (grouped by `target_name`).
+    - Saves a JSON analysis report.
     """
     df = pd.read_csv(csv_path)
 
     os.makedirs(output_dir, exist_ok=True)
+
+    analysis_report = {}
 
     for idx, col in enumerate(df.columns):
         series = df[col]
@@ -36,6 +40,15 @@ def plot_distributions(
         # Skip columns that are completely empty
         if series.dropna().empty:
             continue
+
+        # Collect stats
+        col_stats = {
+            "column": col,
+            "dtype": str(series.dtype),
+            "count": int(len(series)),
+            "missing_count": int(series.isna().sum()),
+            "missing_ratio": float(series.isna().mean()),
+        }
 
         plt.figure(figsize=(7, 5))
 
@@ -45,19 +58,43 @@ def plot_distributions(
             plt.xlabel(col)
             plt.ylabel("Frequency")
             plt.title(f"Distribution of {col}")
+
+            # Numeric stats
+            desc = series.describe()
+            col_stats.update({
+                "type": "numeric",
+                "mean": float(desc.get("mean")) if not pd.isna(desc.get("mean")) else None,
+                "std": float(desc.get("std")) if not pd.isna(desc.get("std")) else None,
+                "min": float(desc.get("min")) if not pd.isna(desc.get("min")) else None,
+                "25%": float(desc.get("25%")) if not pd.isna(desc.get("25%")) else None,
+                "50%": float(desc.get("50%")) if not pd.isna(desc.get("50%")) else None,
+                "75%": float(desc.get("75%")) if not pd.isna(desc.get("75%")) else None,
+                "max": float(desc.get("max")) if not pd.isna(desc.get("max")) else None,
+                "skew": float(series.skew()) if not pd.isna(series.skew()) else None,
+                "kurtosis": float(series.kurtosis()) if not pd.isna(series.kurtosis()) else None,
+            })
         else:
             # Categorical / string-like: bar plot of counts
             value_counts = series.astype(str).value_counts()
             if len(value_counts) > max_categories:
-                value_counts = value_counts.head(max_categories)
+                plot_counts = value_counts.head(max_categories)
                 title_suffix = f" (top {max_categories})"
             else:
+                plot_counts = value_counts
                 title_suffix = ""
 
-            value_counts.plot.bar()
+            plot_counts.plot.bar()
             plt.ylabel("Count")
             plt.title(f"Category counts of {col}{title_suffix}")
             plt.xticks(rotation=45, ha="right")
+
+            # Categorical stats
+            col_stats["type"] = "categorical"
+            col_stats["unique_count"] = int(series.nunique())
+            top_n = value_counts.head(max_categories)
+            col_stats["top_categories"] = {str(k): int(v) for k, v in top_n.items()}
+
+        analysis_report[col] = col_stats
 
         plt.tight_layout()
 
@@ -71,6 +108,8 @@ def plot_distributions(
     if {"target", "target_name"}.issubset(df.columns):
         target_col = "target"
         group_col = "target_name"
+
+        analysis_report["grouped_targets"] = {}
 
         for target_name, group_df in df.groupby(group_col):
             series = group_df[target_col]
@@ -89,6 +128,25 @@ def plot_distributions(
             save_path = os.path.join(output_dir, filename)
             plt.savefig(save_path)
             plt.close()
+
+            # Group stats
+            desc = series.describe()
+            analysis_report["grouped_targets"][str(target_name)] = {
+                "count": int(series.count()),
+                "mean": float(desc.get("mean")) if not pd.isna(desc.get("mean")) else None,
+                "std": float(desc.get("std")) if not pd.isna(desc.get("std")) else None,
+                "min": float(desc.get("min")) if not pd.isna(desc.get("min")) else None,
+                "25%": float(desc.get("25%")) if not pd.isna(desc.get("25%")) else None,
+                "50%": float(desc.get("50%")) if not pd.isna(desc.get("50%")) else None,
+                "75%": float(desc.get("75%")) if not pd.isna(desc.get("75%")) else None,
+                "max": float(desc.get("max")) if not pd.isna(desc.get("max")) else None,
+            }
+
+    # Save JSON report
+    json_path = os.path.join(output_dir, "analysis_report.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(analysis_report, f, indent=4, ensure_ascii=False)
+    print(f"Analysis report saved to {json_path}")
 
 
 def parse_args() -> argparse.Namespace:

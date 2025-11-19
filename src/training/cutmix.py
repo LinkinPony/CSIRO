@@ -91,6 +91,11 @@ class CutMixBatchAugment:
             "y_reg3": batch["y_reg3"].detach().clone(),
             "y_height": batch["y_height"].detach().clone(),
             "y_ndvi": batch["y_ndvi"].detach().clone(),
+            # Cache auxiliary targets for consistent mixing
+            "y_biomass_5d_g": batch.get("y_biomass_5d_g", torch.empty(0)).detach().clone(),
+            "biomass_5d_mask": batch.get("biomass_5d_mask", torch.empty(0)).detach().clone(),
+            "y_ratio": batch.get("y_ratio", torch.empty(0)).detach().clone(),
+            "ratio_mask": batch.get("ratio_mask", torch.empty(0)).detach().clone(),
         }
 
     def _maybe_update_prev_dense(self, batch: Dict[str, torch.Tensor]) -> None:
@@ -135,6 +140,33 @@ class CutMixBatchAugment:
             batch["y_reg3"] = lam_eff * batch["y_reg3"] + (1.0 - lam_eff) * batch["y_reg3"][perm]
             batch["y_height"] = lam_eff * batch["y_height"] + (1.0 - lam_eff) * batch["y_height"][perm]
             batch["y_ndvi"] = lam_eff * batch["y_ndvi"] + (1.0 - lam_eff) * batch["y_ndvi"][perm]
+
+            # Mix 5D biomass and update ratios
+            if "y_biomass_5d_g" in batch:
+                y_5d = batch["y_biomass_5d_g"]
+                mask_5d = batch.get("biomass_5d_mask", torch.ones_like(y_5d))
+
+                y_5d_perm = y_5d[perm]
+                mask_5d_perm = mask_5d[perm]
+
+                # Linear mix of grams
+                batch["y_biomass_5d_g"] = lam_eff * y_5d + (1.0 - lam_eff) * y_5d_perm
+                batch["biomass_5d_mask"] = mask_5d * mask_5d_perm
+
+                # Re-calculate ratios from mixed 5D
+                # 5D: [Clover, Dead, Green, GDM, Total]
+                mixed_5d = batch["y_biomass_5d_g"]
+                mixed_total = mixed_5d[:, 4].clamp(min=1e-6)
+
+                if "y_ratio" in batch:
+                    batch["y_ratio"] = torch.stack([
+                        mixed_5d[:, 0] / mixed_total,
+                        mixed_5d[:, 1] / mixed_total,
+                        mixed_5d[:, 2] / mixed_total,
+                    ], dim=-1)
+
+                if "ratio_mask" in batch:
+                    batch["ratio_mask"] = batch["ratio_mask"] * batch["ratio_mask"][perm]
         else:
             # bsz == 1
             if self.cfg.use_prev_for_bsz1 and self._prev_main is not None:
@@ -149,6 +181,33 @@ class CutMixBatchAugment:
                     batch["y_reg3"] = lam_eff * batch["y_reg3"] + (1.0 - lam_eff) * prev["y_reg3"].to(batch["y_reg3"].device, dtype=batch["y_reg3"].dtype)
                     batch["y_height"] = lam_eff * batch["y_height"] + (1.0 - lam_eff) * prev["y_height"].to(batch["y_height"].device, dtype=batch["y_height"].dtype)
                     batch["y_ndvi"] = lam_eff * batch["y_ndvi"] + (1.0 - lam_eff) * prev["y_ndvi"].to(batch["y_ndvi"].device, dtype=batch["y_ndvi"].dtype)
+
+                    # Mix 5D biomass and update ratios
+                    if "y_biomass_5d_g" in batch and "y_biomass_5d_g" in prev and prev["y_biomass_5d_g"].numel() > 0:
+                        y_5d = batch["y_biomass_5d_g"]
+                        prev_y_5d = prev["y_biomass_5d_g"].to(y_5d.device, dtype=y_5d.dtype)
+
+                        mask_5d = batch.get("biomass_5d_mask", torch.ones_like(y_5d))
+                        prev_mask_5d = prev["biomass_5d_mask"].to(mask_5d.device, dtype=mask_5d.dtype)
+                        if prev_mask_5d.numel() == 0:
+                            prev_mask_5d = torch.ones_like(prev_y_5d)
+
+                        batch["y_biomass_5d_g"] = lam_eff * y_5d + (1.0 - lam_eff) * prev_y_5d
+                        batch["biomass_5d_mask"] = mask_5d * prev_mask_5d
+
+                        mixed_5d = batch["y_biomass_5d_g"]
+                        mixed_total = mixed_5d[:, 4].clamp(min=1e-6)
+
+                        if "y_ratio" in batch:
+                            batch["y_ratio"] = torch.stack([
+                                mixed_5d[:, 0] / mixed_total,
+                                mixed_5d[:, 1] / mixed_total,
+                                mixed_5d[:, 2] / mixed_total,
+                            ], dim=-1)
+
+                        if "ratio_mask" in batch and "ratio_mask" in prev and prev["ratio_mask"].numel() > 0:
+                            batch["ratio_mask"] = batch["ratio_mask"] * prev["ratio_mask"].to(batch["ratio_mask"].device)
+
             # Update cache for next time
             if self.cfg.use_prev_for_bsz1:
                 self._maybe_update_prev_main(batch)
