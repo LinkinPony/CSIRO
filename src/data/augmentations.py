@@ -1,7 +1,7 @@
 import math
 import random
 import string
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -123,7 +123,16 @@ class RandomWatermark:
 
         use_ts = random.random() < self.timestamp_prob
         if use_ts:
-            text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Generate a reproducible pseudo-timestamp based only on RNG state,
+            # which is seeded globally via pl.seed_everything(cfg['seed'], workers=True).
+            # This avoids dependence on wall-clock time while still producing
+            # realistic-looking timestamps.
+            base = datetime(2020, 1, 1, 0, 0, 0)
+            # Sample up to ~10 years worth of seconds for variety.
+            max_offset_seconds = 10 * 365 * 24 * 60 * 60
+            offset_seconds = random.randint(0, max_offset_seconds)
+            ts = base + timedelta(seconds=offset_seconds)
+            text = ts.strftime("%Y-%m-%d %H:%M:%S")
         else:
             if self.use_random_text:
                 lo, hi = self.random_text_length_range

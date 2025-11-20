@@ -105,25 +105,32 @@ class CutMixBatchAugment:
             "ndvi_mask": batch.get("ndvi_mask", torch.ones_like(batch["ndvi_dense"], dtype=torch.bool)).detach().clone(),
         }
 
-    def apply_main_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def apply_main_batch(self, batch: Dict[str, torch.Tensor], *, force: bool = False) -> Tuple[Dict[str, torch.Tensor], bool]:
         """
         Apply CutMix to main batch dict with keys:
           - image: (B,C,H,W)
           - y_reg3: (B,3), y_height: (B,1), y_ndvi: (B,1)
         Classification targets, if any, are left unchanged.
+
+        Returns:
+            (batch, applied_flag)
         """
-        if not self.cfg.enabled or self.cfg.prob <= 0.0:
-            return batch
-        if torch.rand(()) > self.cfg.prob:
-            # Still update cache
-            if self.cfg.use_prev_for_bsz1 and batch["image"].size(0) == 1:
-                self._maybe_update_prev_main(batch)
-            return batch
+        applied = False
+        if not self.cfg.enabled:
+            return batch, applied
+        if not force:
+            if self.cfg.prob <= 0.0:
+                return batch, applied
+            if torch.rand(()) > self.cfg.prob:
+                # Still update cache
+                if self.cfg.use_prev_for_bsz1 and batch["image"].size(0) == 1:
+                    self._maybe_update_prev_main(batch)
+                return batch, applied
 
         images = batch["image"]
         bsz, _, h, w = images.shape
         if bsz <= 0:
-            return batch
+            return batch, applied
 
         # Sample mix coefficient
         lam = 1.0
@@ -167,6 +174,7 @@ class CutMixBatchAugment:
 
                 if "ratio_mask" in batch:
                     batch["ratio_mask"] = batch["ratio_mask"] * batch["ratio_mask"][perm]
+            applied = True
         else:
             # bsz == 1
             if self.cfg.use_prev_for_bsz1 and self._prev_main is not None:
@@ -207,12 +215,13 @@ class CutMixBatchAugment:
 
                         if "ratio_mask" in batch and "ratio_mask" in prev and prev["ratio_mask"].numel() > 0:
                             batch["ratio_mask"] = batch["ratio_mask"] * prev["ratio_mask"].to(batch["ratio_mask"].device)
+                        applied = True
 
             # Update cache for next time
             if self.cfg.use_prev_for_bsz1:
                 self._maybe_update_prev_main(batch)
 
-        return batch
+        return batch, applied
 
     def apply_ndvi_dense_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """

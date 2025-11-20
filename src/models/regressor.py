@@ -14,6 +14,93 @@ from .head_builder import build_head_layer
 from src.training.cutmix import CutMixBatchAugment
 
 
+class ManifoldMixup:
+    """
+    Feature-level (\"manifold\") mixup applied on the shared bottleneck representation z,
+    together with consistent mixing of regression and 5D/ratio targets.
+    """
+
+    def __init__(self, *, enabled: bool, prob: float, alpha: float) -> None:
+        self.enabled: bool = bool(enabled)
+        self.prob: float = float(prob)
+        self.alpha: float = float(alpha)
+
+    @staticmethod
+    def from_cfg(cfg: Optional[Dict[str, Any]]) -> Optional["ManifoldMixup"]:
+        if cfg is None:
+            return None
+        enabled = bool(cfg.get("enabled", False))
+        prob = float(cfg.get("prob", 0.0))
+        alpha = float(cfg.get("alpha", 1.0))
+        if (not enabled) or prob <= 0.0:
+            return None
+        return ManifoldMixup(enabled=enabled, prob=prob, alpha=alpha)
+
+    def apply(self, z: Tensor, batch: Dict[str, Tensor], *, force: bool = False) -> Tuple[Tensor, Dict[str, Tensor], bool]:
+        """
+        Apply manifold mixup on feature tensor z and relevant regression/5D/ratio targets.
+
+        Returns:
+            z_mixed, batch_mixed, applied_flag
+        """
+        if not self.enabled:
+            return z, batch, False
+        if z.dim() < 2 or z.size(0) <= 1:
+            return z, batch, False
+        if not force:
+            if self.prob <= 0.0:
+                return z, batch, False
+            if torch.rand(()) > self.prob:
+                return z, batch, False
+
+        bsz = z.size(0)
+        lam = 1.0
+        if self.alpha > 0.0:
+            lam = float(torch.distributions.Beta(self.alpha, self.alpha).sample().item())
+
+        perm = torch.randperm(bsz, device=z.device)
+        z_mixed = lam * z + (1.0 - lam) * z[perm]
+
+        # Mix main scalar regression targets (already in normalized space when applicable)
+        for key in ("y_reg3", "y_height", "y_ndvi"):
+            if key in batch:
+                y = batch[key]
+                if isinstance(y, torch.Tensor) and y.dim() >= 1 and y.size(0) == bsz:
+                    batch[key] = lam * y + (1.0 - lam) * y[perm]
+
+        # Mix 5D biomass grams and recompute ratio targets from the mixed grams.
+        if "y_biomass_5d_g" in batch:
+            y_5d = batch["y_biomass_5d_g"]
+            if isinstance(y_5d, torch.Tensor) and y_5d.dim() == 2 and y_5d.size(0) == bsz and y_5d.size(1) >= 5:
+                y_5d_perm = y_5d[perm]
+                mixed_5d = lam * y_5d + (1.0 - lam) * y_5d_perm
+                batch["y_biomass_5d_g"] = mixed_5d
+
+                # Mix 5D masks conservatively (only keep supervision where both were valid)
+                mask_5d = batch.get("biomass_5d_mask", None)
+                if isinstance(mask_5d, torch.Tensor) and mask_5d.dim() == mixed_5d.dim():
+                    mask_5d_perm = mask_5d[perm]
+                    batch["biomass_5d_mask"] = mask_5d * mask_5d_perm
+
+                # Recompute ratio labels from mixed grams to keep physical consistency
+                mixed_total = mixed_5d[:, 4].clamp(min=1e-6)
+                if "y_ratio" in batch:
+                    batch["y_ratio"] = torch.stack(
+                        [
+                            mixed_5d[:, 0] / mixed_total,
+                            mixed_5d[:, 1] / mixed_total,
+                            mixed_5d[:, 2] / mixed_total,
+                        ],
+                        dim=-1,
+                    )
+                if "ratio_mask" in batch:
+                    ratio_mask = batch["ratio_mask"]
+                    if isinstance(ratio_mask, torch.Tensor) and ratio_mask.size(0) == bsz:
+                        batch["ratio_mask"] = ratio_mask * ratio_mask[perm]
+
+        return z_mixed, batch, True
+
+
 class BiomassRegressor(LightningModule):
     def __init__(
         self,
@@ -59,6 +146,8 @@ class BiomassRegressor(LightningModule):
         # CutMix configs (batch-level augmentation)
         cutmix_cfg: Optional[Dict[str, Any]] = None,
         ndvi_dense_cutmix_cfg: Optional[Dict[str, Any]] = None,
+        # Manifold mixup on shared bottleneck representation
+        manifold_mixup_cfg: Optional[Dict[str, Any]] = None,
         # Biomass decomposition / ratio head configuration
         enable_ratio_head: bool = True,
         ratio_kl_weight: float = 1.0,
@@ -252,6 +341,8 @@ class BiomassRegressor(LightningModule):
 
         # --- CutMix batch-level augmentation ---
         self._cutmix_main = CutMixBatchAugment.from_cfg(cutmix_cfg)
+        # --- Manifold mixup on bottleneck representation ---
+        self._manifold_mixup = ManifoldMixup.from_cfg(manifold_mixup_cfg)
 
     def _forward_reg3_logits(self, z: Tensor) -> Tensor:
         """
@@ -350,17 +441,73 @@ class BiomassRegressor(LightningModule):
             return self._shared_step(selected, stage)
 
         # batch is a dict from the dataset
-        # Optional CutMix for main regression tasks (train only)
-        if stage == "train" and self._cutmix_main is not None:
+        is_ndvi_only: bool = bool(batch.get("ndvi_only", False))
+        # Decide which augmentation (CutMix / manifold mixup) to apply for this batch.
+        use_cutmix = False
+        use_mixup = False
+        if stage == "train" and (not is_ndvi_only):
+            # CutMix gating
+            cutmix_enabled = self._cutmix_main is not None
+            cutmix_prob = 0.0
+            if cutmix_enabled:
+                try:
+                    cutmix_enabled = bool(getattr(self._cutmix_main, "cfg", None) and self._cutmix_main.cfg.enabled)
+                    cutmix_prob = float(self._cutmix_main.cfg.prob)
+                except Exception:
+                    cutmix_enabled = False
+                    cutmix_prob = 0.0
+            # Manifold mixup gating
+            mixup_enabled = self._manifold_mixup is not None and bool(self._manifold_mixup.enabled)
+            mixup_prob = 0.0
+            if mixup_enabled:
+                try:
+                    mixup_prob = float(self._manifold_mixup.prob)
+                except Exception:
+                    mixup_prob = 0.0
+            cut_trigger = False
+            mix_trigger = False
+            if cutmix_enabled and cutmix_prob > 0.0:
+                try:
+                    cut_trigger = bool(torch.rand(()) < cutmix_prob)
+                except Exception:
+                    cut_trigger = False
+            if mixup_enabled and mixup_prob > 0.0:
+                try:
+                    mix_trigger = bool(torch.rand(()) < mixup_prob)
+                except Exception:
+                    mix_trigger = False
+            if cut_trigger and mix_trigger:
+                # Both selected by their own probabilities: choose exactly one with equal chance.
+                try:
+                    choose_cut = bool(torch.rand(()) < 0.5)
+                except Exception:
+                    choose_cut = True
+                if choose_cut:
+                    use_cutmix, use_mixup = True, False
+                else:
+                    use_cutmix, use_mixup = False, True
+            elif cut_trigger:
+                use_cutmix = True
+            elif mix_trigger:
+                use_mixup = True
+
+        images: Tensor = batch["image"]
+        # Apply CutMix on images + scalar/dense labels before backbone if chosen
+        if use_cutmix and self._cutmix_main is not None:
             try:
-                batch = self._cutmix_main.apply_main_batch(batch)  # type: ignore[assignment]
+                batch, _ = self._cutmix_main.apply_main_batch(batch, force=True)  # type: ignore[assignment]
+                images = batch["image"]
             except Exception:
                 pass
-        images: Tensor = batch["image"]
-        is_ndvi_only: bool = bool(batch.get("ndvi_only", False))
 
         features = self.feature_extractor(images)
         z = self.shared_bottleneck(features)
+        # Apply manifold mixup on bottleneck features if chosen
+        if use_mixup and self._manifold_mixup is not None and (stage == "train") and (not is_ndvi_only):
+            try:
+                z, batch, _ = self._manifold_mixup.apply(z, batch, force=True)
+            except Exception:
+                pass
         if is_ndvi_only:
             # NDVI-only batch (no reg3 supervision). Optimize NDVI scalar head only.
             if not self.enable_ndvi or self.ndvi_head is None:

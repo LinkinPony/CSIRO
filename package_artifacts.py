@@ -23,6 +23,11 @@ def parse_args():
         default=str(Path(__file__).parent / "weights"),
         help="Destination weights directory",
     )
+    p.add_argument(
+        "--best",
+        action="store_true",
+        help="Select best checkpoint by val_loss (default: use latest-epoch checkpoint)",
+    )
     return p.parse_args()
 
 
@@ -186,6 +191,8 @@ def main():
     train_all_cfg = cfg.get("train_all", {})
     train_all_enabled = bool(train_all_cfg.get("enabled", False))
 
+    select_best = bool(getattr(args, "best", False))
+
     if kfold_enabled or train_all_enabled:
         k = 1 if train_all_enabled else int(kfold_cfg.get("k", 5))
         exported = []
@@ -196,20 +203,23 @@ def main():
             if not head_files:
                 raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
 
-            # Pick best by val_loss using this fold's latest metrics.csv
-            fold_log_dir = log_dir / f"fold_{fold_idx}"
-            metrics_csv = find_latest_metrics_csv(fold_log_dir)
-            chosen: Path | None = None
-            if metrics_csv is not None:
-                best_epoch = pick_best_epoch_from_metrics(metrics_csv)
-                if best_epoch is not None:
-                    p = find_head_by_epoch(fold_ckpt_head_dir, best_epoch)
-                    if p is not None:
-                        chosen = p
-
-            # Fallback to latest
-            if chosen is None:
+            if select_best:
+                # Pick best by val_loss using this fold's latest metrics.csv
+                metrics_csv = find_latest_metrics_csv(fold_log_dir)
+                chosen: Path | None = None
+                if metrics_csv is not None:
+                    best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+                    if best_epoch is not None:
+                        p = find_head_by_epoch(fold_ckpt_head_dir, best_epoch)
+                        if p is not None:
+                            chosen = p
+                # Fallback to latest-epoch checkpoint if best could not be determined
+                if chosen is None:
+                    chosen = pick_latest_head(head_files)
+            else:
+                # Default: purely latest-epoch checkpoint
                 chosen = pick_latest_head(head_files)
+
             if chosen is None:
                 raise FileNotFoundError(f"Failed to determine a head checkpoint for fold {fold_idx}.")
 
@@ -239,17 +249,20 @@ def main():
         if not head_files:
             raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
 
-        metrics_csv = find_latest_metrics_csv(log_dir)
-        chosen: Path | None = None
-        if metrics_csv is not None:
-            best_epoch = pick_best_epoch_from_metrics(metrics_csv)
-            if best_epoch is not None:
-                p = find_head_by_epoch(head_dir, best_epoch)
-                if p is not None:
-                    chosen = p
-
-        if chosen is None:
+        if select_best:
+            metrics_csv = find_latest_metrics_csv(log_dir)
+            chosen: Path | None = None
+            if metrics_csv is not None:
+                best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+                if best_epoch is not None:
+                    p = find_head_by_epoch(head_dir, best_epoch)
+                    if p is not None:
+                        chosen = p
+            if chosen is None:
+                chosen = pick_latest_head(head_files)
+        else:
             chosen = pick_latest_head(head_files)
+
         if chosen is None:
             raise FileNotFoundError("Failed to determine a head checkpoint to package.")
 

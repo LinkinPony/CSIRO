@@ -339,7 +339,10 @@ def train_single_split(
         enable_species=bool(tasks_cfg.get("species", False)) and mtl_enabled,
         enable_state=bool(tasks_cfg.get("state", False)) and mtl_enabled,
         peft_cfg=dict(cfg.get("peft", {})),
-        # CutMix configs
+        # Feature-level manifold mixup & CutMix configs (augmentation-level)
+        manifold_mixup_cfg=dict(
+            cfg.get("data", {}).get("augment", {}).get("manifold_mixup", {})
+        ),
         cutmix_cfg=dict(cfg.get("data", {}).get("augment", {}).get("cutmix", {})),
         ndvi_dense_cutmix_cfg=dict(
             cfg.get("ndvi_dense", {})
