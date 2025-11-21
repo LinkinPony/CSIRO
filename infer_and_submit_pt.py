@@ -532,11 +532,14 @@ def main():
         zscore_enabled = reg3_mean is not None and reg3_std is not None
 
         # For packed heads we always export without a terminal Softplus.
+        # Prefer the activation used during training (stored in meta), and fall back
+        # to config only if missing for backward compatibility.
+        head_activation = str(meta.get("head_activation", cfg["model"]["head"].get("activation", "relu")))
         head_module = build_head_layer(
             embedding_dim=int(cfg["model"]["embedding_dim"]),
             num_outputs=head_total_outputs if is_ratio_format else num_outputs_main,
             head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-            head_activation=str(cfg["model"]["head"].get("activation", "relu")),
+            head_activation=head_activation,
             dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
             use_output_softplus=False,
         )

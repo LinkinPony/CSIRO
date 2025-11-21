@@ -10,7 +10,7 @@ from loguru import logger
 
 from .backbone import build_feature_extractor
 from .peft_integration import inject_lora_into_feature_extractor, get_lora_param_list
-from .head_builder import build_head_layer
+from .head_builder import build_head_layer, SwiGLU
 from src.training.cutmix import CutMixBatchAugment
 
 
@@ -184,29 +184,44 @@ class BiomassRegressor(LightningModule):
             feature_extractor.backbone.train()
         self.feature_extractor = feature_extractor
 
-        # Shared bottleneck: MLP defined by hidden_dims; last hidden dim is bottleneck size
+        # Shared bottleneck: MLP defined by hidden_dims; last hidden dim is bottleneck size.
+        # Supports a legacy activation-based MLP and a SwiGLU variant.
         hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
-        act_name = head_activation
+        act_name = (head_activation or "").lower()
         layers: List[nn.Module] = []
         # Backbone feature now returns CLS concat mean(patch) → 2 * embedding_dim
         in_dim = embedding_dim * 2
         if dropout and dropout > 0:
             layers.append(nn.Dropout(dropout))
-        def _act():
-            name = (act_name or "").lower()
-            if name == "relu":
+
+        if act_name == "swiglu":
+            # SwiGLU bottleneck: for each hidden_dim we use Linear(in_dim, 2 * hidden_dim)
+            # followed by a SwiGLU gate, which halves the dimension back to hidden_dim.
+            for hd in hidden_dims:
+                layers.append(nn.Linear(in_dim, hd * 2))
+                layers.append(SwiGLU())
+                if dropout and dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+                in_dim = hd
+        else:
+            # Legacy MLP: Linear + pointwise activation (ReLU/GELU/SiLU).
+            def _act():
+                name = act_name
+                if name == "relu":
+                    return nn.ReLU(inplace=True)
+                if name == "gelu":
+                    return nn.GELU()
+                if name in ("silu", "swish"):
+                    return nn.SiLU(inplace=True)
                 return nn.ReLU(inplace=True)
-            if name == "gelu":
-                return nn.GELU()
-            if name in ("silu", "swish"):
-                return nn.SiLU(inplace=True)
-            return nn.ReLU(inplace=True)
-        for hd in hidden_dims:
-            layers.append(nn.Linear(in_dim, hd))
-            layers.append(_act())
-            if dropout and dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            in_dim = hd
+
+            for hd in hidden_dims:
+                layers.append(nn.Linear(in_dim, hd))
+                layers.append(_act())
+                if dropout and dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+                in_dim = hd
+
         self.shared_bottleneck = nn.Sequential(*layers)
 
         # Task heads

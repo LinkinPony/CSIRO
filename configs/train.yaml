@@ -1,5 +1,5 @@
 seed: 42
-version: ratio-mlp-2560-manifold-mixup-extreme
+version: ratio-mlp-320-manifold-mixup-extreme-swiglu
 data:
   root: data
   train_csv: train.csv
@@ -97,8 +97,7 @@ model:
   log_scale_targets: false
   head:
     type: mlp
-    hidden_dims: [2560]
-    activation: relu
+    hidden_dims: [320]
     dropout: 0.5
     use_output_softplus: true
 

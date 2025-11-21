@@ -279,7 +279,8 @@ def train_single_split(
         num_outputs=len(cfg["data"]["target_order"]),
         dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
         head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-        head_activation=str(cfg["model"]["head"].get("activation", "relu")),
+        # Use a fixed SwiGLU bottleneck; activation is no longer configurable via YAML.
+        head_activation="swiglu",
         use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
         log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
         area_m2=float(area_m2),
