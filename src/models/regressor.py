@@ -11,6 +11,7 @@ from loguru import logger
 from .backbone import build_feature_extractor
 from .peft_integration import inject_lora_into_feature_extractor, get_lora_param_list
 from .head_builder import build_head_layer, SwiGLU
+from .head_ple import PLEHead
 from src.training.cutmix import CutMixBatchAugment
 
 
@@ -154,6 +155,9 @@ class BiomassRegressor(LightningModule):
         enable_5d_loss: bool = True,
         loss_5d_weight: float = 1.0,
         biomass_5d_weights: Optional[List[float]] = None,
+        # Head architecture type: "mlp" (legacy) or "ple" (gated experts)
+        head_type: str = "mlp",
+        ple_expert_hidden_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -184,55 +188,91 @@ class BiomassRegressor(LightningModule):
             feature_extractor.backbone.train()
         self.feature_extractor = feature_extractor
 
-        # Shared bottleneck: MLP defined by hidden_dims; last hidden dim is bottleneck size.
-        # Supports a legacy activation-based MLP and a SwiGLU variant.
+        # Head architecture configuration
         hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
         act_name = (head_activation or "").lower()
-        layers: List[nn.Module] = []
         # Backbone feature now returns CLS concat mean(patch) → 2 * embedding_dim
         in_dim = embedding_dim * 2
-        if dropout and dropout > 0:
-            layers.append(nn.Dropout(dropout))
+        self.head_type: str = (head_type or "mlp").lower()
+        self._ple_expert_hidden_dim: Optional[int] = ple_expert_hidden_dim
 
-        if act_name == "swiglu":
-            # SwiGLU bottleneck: for each hidden_dim we use Linear(in_dim, 2 * hidden_dim)
-            # followed by a SwiGLU gate, which halves the dimension back to hidden_dim.
-            for hd in hidden_dims:
-                layers.append(nn.Linear(in_dim, hd * 2))
-                layers.append(SwiGLU())
-                if dropout and dropout > 0:
-                    layers.append(nn.Dropout(dropout))
-                in_dim = hd
+        if self.head_type == "ple":
+            # PLE-style gated experts head; use backbone features directly as bottleneck input.
+            bottleneck_dim = hidden_dims[-1] if hidden_dims else in_dim
+            expert_hidden_dim = (
+                int(ple_expert_hidden_dim)
+                if ple_expert_hidden_dim is not None
+                else max(1, bottleneck_dim // 4)
+            )
+            # Identity bottleneck for compatibility; actual transformation lives in self.head.
+            self.shared_bottleneck = nn.Identity()
+            # Main reg3 outputs
+            self.num_outputs: int = int(num_outputs)
+            if self.num_outputs < 1:
+                raise ValueError("num_outputs must be >= 1 for reg3 head")
+            num_ratio_outputs_cfg = 3 if enable_ratio_head else 0
+            self.head = PLEHead(
+                embedding_dim=embedding_dim,
+                bottleneck_dim=bottleneck_dim,
+                num_outputs_main=self.num_outputs,
+                num_ratio_outputs=num_ratio_outputs_cfg,
+                activation=act_name or "gelu",
+                dropout=float(dropout or 0.0),
+                expert_hidden_dim=expert_hidden_dim,
+                enable_ndvi=bool(enable_ndvi),
+            )
+            # Expose sub-heads for downstream code
+            self.reg3_heads = self.head.reg3_heads
+            # Will be respected only when enable_ratio_head is True below.
+            self.ratio_head = self.head.ratio_head  # type: ignore[assignment]
+            # Store NDVI head for later wiring after MTL toggles are applied.
+            self._ple_ndvi_head = self.head.ndvi_head
         else:
-            # Legacy MLP: Linear + pointwise activation (ReLU/GELU/SiLU).
-            def _act():
-                name = act_name
-                if name == "relu":
+            # Shared bottleneck: MLP defined by hidden_dims; last hidden dim is bottleneck size.
+            # Supports a legacy activation-based MLP and a SwiGLU variant.
+            layers: List[nn.Module] = []
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+
+            if act_name == "swiglu":
+                # SwiGLU bottleneck: for each hidden_dim we use Linear(in_dim, 2 * hidden_dim)
+                # followed by a SwiGLU gate, which halves the dimension back to hidden_dim.
+                for hd in hidden_dims:
+                    layers.append(nn.Linear(in_dim, hd * 2))
+                    layers.append(SwiGLU())
+                    if dropout and dropout > 0:
+                        layers.append(nn.Dropout(dropout))
+                    in_dim = hd
+            else:
+                # Legacy MLP: Linear + pointwise activation (ReLU/GELU/SiLU).
+                def _act():
+                    name = act_name
+                    if name == "relu":
+                        return nn.ReLU(inplace=True)
+                    if name == "gelu":
+                        return nn.GELU()
+                    if name in ("silu", "swish"):
+                        return nn.SiLU(inplace=True)
                     return nn.ReLU(inplace=True)
-                if name == "gelu":
-                    return nn.GELU()
-                if name in ("silu", "swish"):
-                    return nn.SiLU(inplace=True)
-                return nn.ReLU(inplace=True)
 
-            for hd in hidden_dims:
-                layers.append(nn.Linear(in_dim, hd))
-                layers.append(_act())
-                if dropout and dropout > 0:
-                    layers.append(nn.Dropout(dropout))
-                in_dim = hd
+                for hd in hidden_dims:
+                    layers.append(nn.Linear(in_dim, hd))
+                    layers.append(_act())
+                    if dropout and dropout > 0:
+                        layers.append(nn.Dropout(dropout))
+                    in_dim = hd
 
-        self.shared_bottleneck = nn.Sequential(*layers)
+            self.shared_bottleneck = nn.Sequential(*layers)
 
-        # Task heads
-        bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
-        # Main reg3 heads: one or more independent 1-d regressors (e.g., Dry_Total_g only)
-        self.num_outputs: int = int(num_outputs)
-        if self.num_outputs < 1:
-            raise ValueError("num_outputs must be >= 1 for reg3 head")
-        self.reg3_heads = nn.ModuleList(
-            [nn.Linear(bottleneck_dim, 1) for _ in range(self.num_outputs)]
-        )
+            # Task heads
+            bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
+            # Main reg3 heads: one or more independent 1-d regressors (e.g., Dry_Total_g only)
+            self.num_outputs: int = int(num_outputs)
+            if self.num_outputs < 1:
+                raise ValueError("num_outputs must be >= 1 for reg3 head")
+            self.reg3_heads = nn.ModuleList(
+                [nn.Linear(bottleneck_dim, 1) for _ in range(self.num_outputs)]
+            )
 
         self.mtl_enabled: bool = bool(mtl_enabled)
         # Per-task toggles (gated by global MTL flag)
@@ -251,7 +291,14 @@ class BiomassRegressor(LightningModule):
 
         # Instantiate only enabled heads
         self.height_head = nn.Linear(bottleneck_dim, 1) if self.enable_height else None  # type: ignore[assignment]
-        self.ndvi_head = nn.Linear(bottleneck_dim, 1) if self.enable_ndvi else None  # type: ignore[assignment]
+        if self.head_type == "ple":
+            # For PLE head, reuse NDVI head from the gated experts when enabled.
+            if self.enable_ndvi and getattr(self, "_ple_ndvi_head", None) is not None:
+                self.ndvi_head = self._ple_ndvi_head  # type: ignore[assignment]
+            else:
+                self.ndvi_head = None  # type: ignore[assignment]
+        else:
+            self.ndvi_head = nn.Linear(bottleneck_dim, 1) if self.enable_ndvi else None  # type: ignore[assignment]
         if self.enable_species:
             if num_species_classes is None or int(num_species_classes) <= 1:
                 raise ValueError("num_species_classes must be provided (>1) when species task is enabled")
@@ -278,7 +325,9 @@ class BiomassRegressor(LightningModule):
         self.ratio_components: List[str] = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"]
         self.num_ratio_outputs: int = len(self.ratio_components)
         if self.enable_ratio_head:
-            self.ratio_head = nn.Linear(bottleneck_dim, self.num_ratio_outputs)
+            # For PLE head we reuse the ratio head defined inside the PLEHead module.
+            if self.head_type != "ple":
+                self.ratio_head = nn.Linear(bottleneck_dim, self.num_ratio_outputs)
         else:
             self.ratio_head = None  # type: ignore[assignment]
 
@@ -372,8 +421,14 @@ class BiomassRegressor(LightningModule):
     def forward(self, images: Tensor) -> Tensor:
         # Return main 3-d regression prediction in original grams (g)
         features = self.feature_extractor(images)
-        z = self.shared_bottleneck(features)
-        out = self._forward_reg3_logits(z)
+        head_type = getattr(self, "head_type", "mlp")
+        if isinstance(head_type, str) and head_type.lower() == "ple" and hasattr(self, "head"):
+            # PLE head consumes backbone features directly.
+            head_out = self.head.forward_multi(features)  # type: ignore[operator]
+            out = head_out["reg3_logits"]
+        else:
+            z = self.shared_bottleneck(features)
+            out = self._forward_reg3_logits(z)
         if self.out_softplus is not None:
             out = self.out_softplus(out)
         # Invert normalization and scaling to grams
@@ -454,6 +509,12 @@ class BiomassRegressor(LightningModule):
             if selected is None:
                 selected = next((x for x in flat_batches if isinstance(x, dict)), flat_batches[0])
             return self._shared_step(selected, stage)
+
+        # PLE head uses a dedicated path that shares augmentation logic but routes
+        # predictions through the gated experts head.
+        head_type = getattr(self, "head_type", "mlp")
+        if isinstance(head_type, str) and head_type.lower() == "ple":
+            return self._shared_step_ple(batch, stage)
 
         # batch is a dict from the dataset
         is_ndvi_only: bool = bool(batch.get("ndvi_only", False))
@@ -717,6 +778,353 @@ class BiomassRegressor(LightningModule):
             self.log(f"{stage}_mae_height", mae_height, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("height", loss_height))
         if self.enable_ndvi:
+            ndvi_mask: Optional[Tensor] = batch.get("ndvi_mask", None)
+            if ndvi_mask is not None:
+                m_nd = ndvi_mask.to(device=y_ndvi.device, dtype=y_ndvi.dtype)  # type: ignore[arg-type]
+            else:
+                m_nd = torch.ones_like(y_ndvi, dtype=y_ndvi.dtype, device=y_ndvi.device)  # type: ignore[arg-type]
+
+            diff_ndvi = pred_ndvi - y_ndvi  # type: ignore[operator]
+            diff2_ndvi = (diff_ndvi * diff_ndvi) * m_nd
+            mask_sum_ndvi = m_nd.sum().clamp_min(0.0)
+
+            if mask_sum_ndvi > 0:
+                loss_ndvi = diff2_ndvi.sum() / mask_sum_ndvi
+                mae_ndvi = (diff_ndvi.abs() * m_nd).sum() / mask_sum_ndvi
+            else:
+                # No NDVI supervision in this batch (e.g., Irish-only). Use zero loss.
+                zero_nd = diff2_ndvi.sum() * 0.0
+                loss_ndvi = zero_nd
+                mae_ndvi = zero_nd
+            self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+            named_losses.append(("ndvi", loss_ndvi))
+        if self.enable_species and logits_species is not None:
+            loss_species = F.cross_entropy(logits_species, y_species)
+            self.log(f"{stage}_loss_species", loss_species, on_step=False, on_epoch=True, prog_bar=False)
+            with torch.no_grad():
+                acc_species = (logits_species.argmax(dim=-1) == y_species).float().mean()
+            self.log(f"{stage}_acc_species", acc_species, on_step=False, on_epoch=True, prog_bar=False)
+            named_losses.append(("species", loss_species))
+        if self.enable_state and logits_state is not None:
+            loss_state = F.cross_entropy(logits_state, y_state)
+            self.log(f"{stage}_loss_state", loss_state, on_step=False, on_epoch=True, prog_bar=False)
+            with torch.no_grad():
+                acc_state = (logits_state.argmax(dim=-1) == y_state).float().mean()
+            self.log(f"{stage}_acc_state", acc_state, on_step=False, on_epoch=True, prog_bar=False)
+            named_losses.append(("state", loss_state))
+
+        total_loss = self._uw_sum(named_losses)
+
+        # overall metrics for backward-compat (on normalized reg3 space)
+        mae = F.l1_loss(pred_reg3, y_reg3)
+        mse = F.mse_loss(pred_reg3, y_reg3)
+        self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log(f"{stage}_mae", mae, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f"{stage}_mse", mse, on_step=False, on_epoch=True, prog_bar=False)
+        # For external validation epoch R^2, return original-scale grams
+        preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
+        targets_out = batch.get("y_reg3_g", None)
+        if targets_out is None:
+            y_gm2 = batch.get("y_reg3_g_m2", None)
+            if y_gm2 is not None:
+                targets_out = y_gm2 * float(self._area_m2)
+            else:
+                targets_out = self._invert_reg3_to_grams(y_reg3.detach())
+        return {
+            "loss": total_loss,
+            "mae": mae,
+            "mse": mse,
+            "preds": preds_out,
+            "targets": targets_out,
+        }
+
+    def _shared_step_ple(self, batch: Any, stage: str) -> Dict[str, Tensor]:
+        """
+        Shared train/val step for PLE-style head.
+
+        Mirrors the legacy _shared_step but routes predictions through
+        self.head (PLEHead) which consumes backbone features directly
+        and returns task-specific logits and bottleneck representations.
+        """
+        # batch is a dict from the dataset
+        is_ndvi_only: bool = bool(batch.get("ndvi_only", False))
+        # Decide which augmentation (CutMix / manifold mixup) to apply for this batch.
+        use_cutmix = False
+        use_mixup = False
+        if stage == "train" and (not is_ndvi_only):
+            # CutMix gating
+            cutmix_enabled = self._cutmix_main is not None
+            cutmix_prob = 0.0
+            if cutmix_enabled:
+                try:
+                    cutmix_enabled = bool(getattr(self._cutmix_main, "cfg", None) and self._cutmix_main.cfg.enabled)
+                    cutmix_prob = float(self._cutmix_main.cfg.prob)
+                except Exception:
+                    cutmix_enabled = False
+                    cutmix_prob = 0.0
+            # Manifold mixup gating
+            mixup_enabled = self._manifold_mixup is not None and bool(self._manifold_mixup.enabled)
+            mixup_prob = 0.0
+            if mixup_enabled:
+                try:
+                    mixup_prob = float(self._manifold_mixup.prob)
+                except Exception:
+                    mixup_prob = 0.0
+            cut_trigger = False
+            mix_trigger = False
+            if cutmix_enabled and cutmix_prob > 0.0:
+                try:
+                    cut_trigger = bool(torch.rand(()) < cutmix_prob)
+                except Exception:
+                    cut_trigger = False
+            if mixup_enabled and mixup_prob > 0.0:
+                try:
+                    mix_trigger = bool(torch.rand(()) < mixup_prob)
+                except Exception:
+                    mix_trigger = False
+            if cut_trigger and mix_trigger:
+                # Both selected by their own probabilities: choose exactly one with equal chance.
+                try:
+                    choose_cut = bool(torch.rand(()) < 0.5)
+                except Exception:
+                    choose_cut = True
+                if choose_cut:
+                    use_cutmix, use_mixup = True, False
+                else:
+                    use_cutmix, use_mixup = False, True
+            elif cut_trigger:
+                use_cutmix = True
+            elif mix_trigger:
+                use_mixup = True
+
+        images: Tensor = batch["image"]
+        # Apply CutMix on images + scalar/dense labels before backbone if chosen
+        if use_cutmix and self._cutmix_main is not None:
+            try:
+                batch, _ = self._cutmix_main.apply_main_batch(batch, force=True)  # type: ignore[assignment]
+                images = batch["image"]
+            except Exception:
+                pass
+
+        # Backbone features: CLS || mean(patch)
+        z = self.feature_extractor(images)
+        # Apply manifold mixup on backbone features if chosen
+        if use_mixup and self._manifold_mixup is not None and (stage == "train") and (not is_ndvi_only):
+            try:
+                z, batch, _ = self._manifold_mixup.apply(z, batch, force=True)
+            except Exception:
+                pass
+
+        if is_ndvi_only:
+            # NDVI-only batch (no reg3 supervision). Optimize NDVI scalar head only.
+            if not self.enable_ndvi or self.ndvi_head is None or not hasattr(self, "head"):
+                # If NDVI task is disabled, skip by returning zero loss
+                zero = (z.sum() * 0.0)
+                self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
+                self.log(f"{stage}_loss", zero, on_step=False, on_epoch=True, prog_bar=True)
+                return {"loss": zero}
+            y_ndvi_only: Tensor = batch["y_ndvi"]  # (B,1)
+            head_out_ndvi = self.head.forward_multi(z)  # type: ignore[operator]
+            pred_ndvi_only = head_out_ndvi.get("ndvi", None)
+            if pred_ndvi_only is None:
+                zero = (z.sum() * 0.0)
+                self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
+                self.log(f"{stage}_loss", zero, on_step=False, on_epoch=True, prog_bar=True)
+                return {"loss": zero}
+            loss_ndvi_only = F.mse_loss(pred_ndvi_only, y_ndvi_only)
+            self.log(f"{stage}_loss_ndvi", loss_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse_ndvi", loss_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
+            mae_ndvi_only = F.l1_loss(pred_ndvi_only, y_ndvi_only)
+            self.log(f"{stage}_mae_ndvi", mae_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
+            total_ndvi = self._uw_sum([("ndvi", loss_ndvi_only)])
+            self.log(f"{stage}_loss", total_ndvi, on_step=False, on_epoch=True, prog_bar=True)
+            return {"loss": total_ndvi}
+
+        # y_reg3 provided by dataset is already in normalized domain (z-score on g/m^2 when enabled)
+        y_reg3: Tensor = batch["y_reg3"]  # (B,3)
+        reg3_mask: Optional[Tensor] = batch.get("reg3_mask", None)
+        y_height: Tensor = batch["y_height"]  # (B,1)
+        y_ndvi: Tensor = batch["y_ndvi"]  # (B,1)
+        y_species: Tensor = batch["y_species"]  # (B,)
+        y_state: Tensor = batch["y_state"]  # (B,)
+
+        # PLE head forward: main reg3 logits + optional NDVI / ratio logits and task reps
+        head_out = self.head.forward_multi(z)  # type: ignore[operator]
+        pred_reg3 = head_out["reg3_logits"]
+        if self.out_softplus is not None:
+            pred_reg3 = self.out_softplus(pred_reg3)
+
+        # Optional per-dimension supervision mask for reg3 (to support partial targets)
+        if reg3_mask is not None:
+            mask = reg3_mask.to(device=y_reg3.device, dtype=y_reg3.dtype)
+        else:
+            mask = torch.ones_like(y_reg3, dtype=y_reg3.dtype, device=y_reg3.device)
+        diff_reg3 = pred_reg3 - y_reg3
+        diff2_reg3 = (diff_reg3 * diff_reg3) * mask
+        mask_sum_reg3 = mask.sum().clamp_min(1.0)
+        # Base MSE on main reg3 outputs (e.g., Dry_Total_g).
+        loss_reg3_mse = diff2_reg3.sum() / mask_sum_reg3
+
+        # Always log base reg3 metrics (independent of MTL / auxiliary tasks)
+        self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+        mae_reg3 = (diff_reg3.abs() * mask).sum() / mask_sum_reg3
+        self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+        with torch.no_grad():
+            per_dim_den = mask.sum(dim=0).clamp_min(1.0)
+            per_dim_mse = diff2_reg3.sum(dim=0) / per_dim_den
+            for i in range(per_dim_mse.shape[0]):
+                self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
+
+        # --- Ratio KL loss (CSIRO only; masked via ratio_mask) ---
+        loss_ratio_kl: Optional[Tensor] = None
+        if self.enable_ratio_head:
+            y_ratio: Optional[Tensor] = batch.get("y_ratio", None)  # (B,3)
+            ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
+            ratio_logits = head_out.get("ratio_logits", None)
+            if y_ratio is not None and ratio_mask is not None and ratio_logits is not None:
+                # Predict logits for (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
+                log_p_pred = F.log_softmax(ratio_logits, dim=-1)
+                # Ensure target is a proper distribution
+                p_true = y_ratio.clamp_min(0.0)
+                denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                p_true = p_true / denom
+                # KL divergence per sample, then masked average
+                kl_per_dim = F.kl_div(log_p_pred, p_true, reduction="none")
+                kl_per_sample = kl_per_dim.sum(dim=-1, keepdim=True)  # (B,1)
+                m = ratio_mask.to(device=kl_per_sample.device, dtype=kl_per_sample.dtype)
+                num = (kl_per_sample * m).sum()
+                den = m.sum().clamp_min(1.0)
+                loss_ratio_kl = (num / den) * self.ratio_kl_weight
+                self.log(f"{stage}_loss_ratio_kl", loss_ratio_kl, on_step=False, on_epoch=True, prog_bar=False)
+
+        # --- 5D weighted MSE loss over physical components ---
+        loss_5d: Optional[Tensor] = None
+        y_5d_g: Optional[Tensor] = batch.get("y_biomass_5d_g", None)  # (B,5) grams
+        mask_5d: Optional[Tensor] = batch.get("biomass_5d_mask", None)  # (B,5)
+        ratio_logits_for_5d = head_out.get("ratio_logits", None) if self.enable_ratio_head else None
+        if (
+            self.enable_5d_loss
+            and y_5d_g is not None
+            and mask_5d is not None
+            and ratio_logits_for_5d is not None
+        ):
+            # Convert main reg3 prediction back to g/m^2 (Dry_Total_g)
+            pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
+            # Ratio predictions (probabilities over 3 components)
+            p_pred = F.softmax(ratio_logits_for_5d, dim=-1)  # (B,3)
+            # Component g/m^2
+            comp_gm2 = p_pred * pred_total_gm2  # (B,3)
+            clover_pred = comp_gm2[:, 0]
+            dead_pred = comp_gm2[:, 1]
+            green_pred = comp_gm2[:, 2]
+            gdm_pred = clover_pred + green_pred
+            total_pred = pred_total_gm2.squeeze(-1)
+            pred_5d_gm2 = torch.stack([clover_pred, dead_pred, green_pred, gdm_pred, total_pred], dim=-1)
+
+            # Convert targets to g/m^2
+            y_5d_gm2 = y_5d_g.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype) / float(
+                self._area_m2
+            )
+
+            # Optionally move to z-scored space using precomputed 5D stats
+            pred_5d_input = pred_5d_gm2
+            target_5d_input = y_5d_gm2
+
+            if self.log_scale_targets:
+                pred_5d_input = torch.log1p(torch.clamp(pred_5d_input, min=0.0))
+                target_5d_input = torch.log1p(torch.clamp(target_5d_input, min=0.0))
+
+            if self._use_biomass_5d_zscore:
+                mean_5d = self._biomass_5d_mean.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype)  # type: ignore[union-attr]
+                std_5d = torch.clamp(
+                    self._biomass_5d_std.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype),  # type: ignore[union-attr]
+                    min=1e-8,
+                )
+                pred_5d = (pred_5d_input - mean_5d) / std_5d
+                target_5d = (target_5d_input - mean_5d) / std_5d
+            else:
+                pred_5d = pred_5d_input
+                target_5d = target_5d_input
+
+            # Weighted MSE across components with masks
+            w = self.biomass_5d_weights.to(device=pred_5d.device, dtype=pred_5d.dtype)  # (5,)
+            m5 = mask_5d.to(device=pred_5d.device, dtype=pred_5d.dtype)
+            diff_5d = (pred_5d - target_5d) * m5
+            diff2_5d = diff_5d * diff_5d
+            per_dim_den = m5.sum(dim=0).clamp_min(1.0)
+            mse_per_dim = diff2_5d.sum(dim=0) / per_dim_den  # (5,)
+            valid_weight = w * (per_dim_den > 0).to(dtype=w.dtype)
+            total_w = valid_weight.sum().clamp_min(1e-8)
+            loss_5d = (w * mse_per_dim).sum() / total_w
+            loss_5d = loss_5d * self.loss_5d_weight
+
+            # Log per-component MSE and aggregated loss
+            names_5d = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
+            for i, name in enumerate(names_5d):
+                self.log(f"{stage}_mse_5d_{name}", mse_per_dim[i], on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_loss_5d_weighted", loss_5d, on_step=False, on_epoch=True, prog_bar=False)
+
+        # Aggregate reg3 losses: base MSE + optional ratio KL + optional 5D weighted MSE
+        loss_reg3_total = loss_reg3_mse
+        if loss_ratio_kl is not None:
+            loss_reg3_total = loss_reg3_total + loss_ratio_kl
+        if loss_5d is not None:
+            loss_reg3_total = loss_reg3_total + loss_5d
+        self.log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
+
+        # If MTL is disabled or all auxiliary tasks are off, optimize only the reg3 path
+        if (not self.mtl_enabled) or (
+            self.enable_height is False
+            and self.enable_ndvi is False
+            and self.enable_species is False
+            and self.enable_state is False
+        ):
+            total_loss = loss_reg3_total
+            self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+            # Overall mae/mse are computed on normalized reg3 space for backward compatibility
+            self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+            # For external metrics (e.g., epoch-end R^2), return original-scale grams
+            preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
+            targets_out = batch.get("y_reg3_g", None)
+            if targets_out is None:
+                # Fallback: invert from g/m^2 stored if present
+                y_gm2 = batch.get("y_reg3_g_m2", None)
+                if y_gm2 is not None:
+                    targets_out = y_gm2 * float(self._area_m2)
+                else:
+                    # Last resort: invert from normalized y (approximate)
+                    targets_out = self._invert_reg3_to_grams(y_reg3.detach())
+            return {
+                "loss": total_loss,
+                "mae": mae_reg3,
+                "mse": loss_reg3_mse,
+                "preds": preds_out,
+                "targets": targets_out,
+            }
+
+        # Otherwise, compute enabled auxiliary task heads and losses
+        z_reg3: Tensor = head_out["z_reg3"]
+        pred_height = self.height_head(z_reg3) if self.enable_height else None  # type: ignore[assignment]
+        pred_ndvi = head_out.get("ndvi", None) if self.enable_ndvi else None
+        logits_species = self.species_head(z_reg3) if self.enable_species else None  # type: ignore[assignment]
+        logits_state = self.state_head(z_reg3) if self.enable_state else None  # type: ignore[assignment]
+
+        # Collect losses in consistent order for UW/equal weighting
+        named_losses: List[Tuple[str, Tensor]] = []
+        named_losses.append(("reg3", loss_reg3_total))
+
+        if self.enable_height:
+            loss_height = F.mse_loss(pred_height, y_height)  # type: ignore[arg-type]
+            self.log(f"{stage}_loss_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
+            mae_height = F.l1_loss(pred_height, y_height)  # type: ignore[arg-type]
+            self.log(f"{stage}_mae_height", mae_height, on_step=False, on_epoch=True, prog_bar=False)
+            named_losses.append(("height", loss_height))
+        if self.enable_ndvi and pred_ndvi is not None:
             ndvi_mask: Optional[Tensor] = batch.get("ndvi_mask", None)
             if ndvi_mask is not None:
                 m_nd = ndvi_mask.to(device=y_ndvi.device, dtype=y_ndvi.dtype)  # type: ignore[arg-type]

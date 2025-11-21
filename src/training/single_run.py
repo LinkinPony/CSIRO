@@ -273,6 +273,11 @@ def train_single_split(
         )
     )
 
+    # Head configuration (including optional PLE-style gated experts)
+    head_cfg = cfg.get("model", {}).get("head", {})
+    head_type = str(head_cfg.get("type", "mlp"))
+    ple_expert_hidden_dim = head_cfg.get("ple_expert_hidden_dim", None)
+
     model = BiomassRegressor(
         backbone_name=str(cfg["model"]["backbone"]),
         embedding_dim=int(cfg["model"]["embedding_dim"]),
@@ -356,6 +361,8 @@ def train_single_split(
         enable_5d_loss=loss_5d_enabled,
         loss_5d_weight=mse_5d_weight,
         biomass_5d_weights=mse_5d_weights_per_target,
+        head_type=head_type,
+        ple_expert_hidden_dim=ple_expert_hidden_dim,
     )
 
     head_ckpt_dir = ckpt_dir / "head"

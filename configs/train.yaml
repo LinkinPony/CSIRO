@@ -1,5 +1,5 @@
 seed: 42
-version: ratio-mlp-2560-gelu-manifold-mixup-extreme-swa
+version: moe
 data:
   root: data
   train_csv: train.csv
@@ -96,8 +96,14 @@ model:
   embedding_dim: 1280
   log_scale_targets: false
   head:
-    type: mlp
-    hidden_dims: [2560]
+    # Head architecture type:
+    # - mlp: legacy shared bottleneck MLP
+    # - ple: PLE-style gated experts with shared + task-specific experts
+    type: ple
+    # Hidden dimension of each expert's internal MLP.
+    # When unspecified, defaults to bottleneck_dim / 4.
+    ple_expert_hidden_dim: 640
+    hidden_dims: [640]
     activation: gelu
     dropout: 0.5
     use_output_softplus: true

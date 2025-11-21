@@ -65,6 +65,7 @@ if _PROJECT_DIR_ABS not in sys.path:
     sys.path.insert(0, _PROJECT_DIR_ABS)
 
 from src.models.head_builder import build_head_layer  # noqa: E402
+from src.models.head_ple import PLEHead  # noqa: E402
 from src.models.peft_integration import _import_peft  # noqa: E402
 from src.data.augmentations import build_eval_transform  # noqa: E402
 
@@ -515,6 +516,17 @@ def main():
     head_total_outputs = int(first_meta.get("head_total_outputs", num_outputs_main + num_outputs_ratio))
     ratio_components = first_meta.get("ratio_components", [])
     is_ratio_format = num_outputs_ratio > 0 and head_total_outputs == (num_outputs_main + num_outputs_ratio)
+    # Head architecture type and optional PLE expert width
+    head_type = str(first_meta.get("head_type", cfg["model"]["head"].get("type", "mlp")))
+    ple_expert_hidden_dim_meta = int(first_meta.get("ple_expert_hidden_dim", 0) or 0)
+    # Infer whether NDVI head was enabled during training based on meta/state_dict.
+    # If meta does not carry an explicit flag, we fall back to checking for ndvi_head.*
+    # keys in the packed head state_dict.
+    enable_ndvi_meta = bool(first_meta.get("enable_ndvi", False))
+    has_ndvi_head_key = isinstance(first_state, dict) and any(
+        (isinstance(k, str) and k.startswith("ndvi_head.")) for k in first_state.keys()
+    )
+    enable_ndvi_in_head = enable_ndvi_meta or has_ndvi_head_key
 
     # Build backbone architecture locally (no torch.hub), then load state_dict
     backbone = _make_backbone(pretrained=False)
@@ -623,17 +635,41 @@ def main():
         zscore_enabled = reg3_mean is not None and reg3_std is not None
 
         # For packed heads we always export without a terminal Softplus.
-        # Prefer the activation used during training (stored in meta), and fall back
-        # to config only if missing for backward compatibility.
+        # Prefer the activation and dropout used during training (stored in meta),
+        # and fall back to config only if missing for backward compatibility.
         head_activation = str(meta.get("head_activation", cfg["model"]["head"].get("activation", "relu")))
-        head_module = build_head_layer(
-            embedding_dim=int(cfg["model"]["embedding_dim"]),
-            num_outputs=head_total_outputs if is_ratio_format else num_outputs_main,
-            head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-            head_activation=head_activation,
-            dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
-            use_output_softplus=False,
-        )
+        head_dropout = float(meta.get("head_dropout", cfg["model"]["head"].get("dropout", 0.0)))
+        head_hidden_dims_meta = list(meta.get("head_hidden_dims", cfg["model"]["head"].get("hidden_dims", [512, 256])))
+
+        # Instantiate the appropriate head architecture.
+        if head_type.lower() == "ple":
+            # PLE-style gated experts: architecture mirrors training-time PLEHead.
+            # Bottleneck dimension: last hidden dim when provided; otherwise fall back to 2 * embedding_dim.
+            if head_hidden_dims_meta:
+                bottleneck_dim = int(head_hidden_dims_meta[-1])
+            else:
+                bottleneck_dim = int(cfg["model"]["embedding_dim"]) * 2
+            ple_expert_hidden_dim = ple_expert_hidden_dim_meta or max(1, bottleneck_dim // 4)
+            head_module = PLEHead(
+                embedding_dim=int(cfg["model"]["embedding_dim"]),
+                bottleneck_dim=bottleneck_dim,
+                num_outputs_main=num_outputs_main,
+                num_ratio_outputs=num_outputs_ratio if is_ratio_format else 0,
+                activation=head_activation,
+                dropout=head_dropout,
+                expert_hidden_dim=int(ple_expert_hidden_dim),
+                enable_ndvi=bool(enable_ndvi_in_head),
+            )
+        else:
+            head_module = build_head_layer(
+                embedding_dim=int(cfg["model"]["embedding_dim"]),
+                num_outputs=head_total_outputs if is_ratio_format else num_outputs_main,
+                head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
+                head_activation=head_activation,
+                dropout=head_dropout,
+                use_output_softplus=False,
+            )
+
         head_module.load_state_dict(state, strict=True)
 
         if mc_enabled:
