@@ -26,6 +26,8 @@ PROJECT_DIR = "."
 import os
 import sys
 from typing import Dict, List, Tuple, Optional
+import random
+import numpy as np
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -341,6 +343,52 @@ def predict_from_features(features_cpu: torch.Tensor, head: nn.Module, batch_siz
     return torch.cat(preds_list, dim=0) if preds_list else torch.empty((0, 0), dtype=torch.float32)
 
 
+def predict_from_features_mc_dropout(
+    features_cpu: torch.Tensor,
+    head: nn.Module,
+    batch_size: int,
+    num_samples: int,
+) -> torch.Tensor:
+    """
+    Run Monte-Carlo dropout on the regression head only.
+
+    Args:
+        features_cpu: (N, D) features on CPU computed once by the frozen DINOv3 backbone.
+        head: nn.Module containing dropout layers (kept in training mode to enable dropout).
+        batch_size: mini-batch size for head-only forward passes.
+        num_samples: number of stochastic forward passes to run.
+
+    Returns:
+        Tensor of shape (S, N, C) where:
+          - S = num_samples
+          - N = number of images
+          - C = number of head outputs
+    """
+    if num_samples <= 0:
+        preds = predict_from_features(features_cpu, head, batch_size)
+        return preds.unsqueeze(0)  # (1, N, C)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    head = head.to(device)
+    head.train()  # enable dropout during forward
+
+    N = features_cpu.shape[0]
+    samples: List[torch.Tensor] = []
+    with torch.inference_mode():
+        for _ in range(num_samples):
+            preds_list: List[torch.Tensor] = []
+            for i in range(0, N, max(1, batch_size)):
+                chunk = features_cpu[i : i + max(1, batch_size)].to(device, non_blocking=True)
+                out = head(chunk)
+                preds_list.append(out.detach().cpu().float())
+            preds = torch.cat(preds_list, dim=0) if preds_list else torch.empty((0, 0), dtype=torch.float32)
+            samples.append(preds)
+
+    if not samples:
+        return torch.empty((0, 0, 0), dtype=torch.float32)
+    return torch.stack(samples, dim=0)  # (S, N, C)
+
+
 def predict_for_images(
     model: nn.Module,
     dataset_root: str,
@@ -375,6 +423,23 @@ def main():
     # Load configuration from project
     cfg = load_config(_PROJECT_DIR_ABS)
 
+    # Reuse global seed from YAML for reproducible MC dropout and any other RNG usage.
+    try:
+        seed = int(cfg.get("seed", 42))
+    except Exception:
+        seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    try:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    except Exception:
+        # Some backends/hardware combinations may not expose these flags; ignore in that case.
+        pass
+
     # Data settings from config (single source of truth)
     image_size = _parse_image_size(cfg["data"]["image_size"])  # (H, W), e.g., (640, 640) or (640, 1280)
     mean = list(cfg["data"]["normalization"]["mean"])  # e.g., [0.485, 0.456, 0.406]
@@ -400,6 +465,15 @@ def main():
         area_m2 = 1.0
     batch_size = int(cfg["data"].get("batch_size", 32))
     num_workers = int(cfg["data"].get("num_workers", 4))
+
+    # MC dropout configuration (head-only, backbone always frozen), controlled purely via YAML.
+    mc_cfg = dict(cfg.get("mc_dropout", {}) or {})
+    mc_enabled = bool(mc_cfg.get("enabled", False))
+    mc_num_samples = int(mc_cfg.get("num_samples", 0) or 0)
+    debug_mode = bool(mc_cfg.get("debug", False))
+    if not mc_enabled or mc_num_samples <= 1:
+        mc_enabled = False
+        mc_num_samples = 0
 
     # Read test.csv
     dataset_root, test_csv = resolve_paths(INPUT_PATH)
@@ -499,17 +573,34 @@ def main():
         num_workers=num_workers,
     )
 
-    # 2) Use discovered heads (single or per-fold) and ensemble predictions by averaging
+    # 2) Use discovered heads (single or per-fold) and ensemble predictions.
+    #    When mc_dropout.enabled is set in the YAML, we keep the backbone frozen and
+    #    run multiple stochastic passes through the head with dropout enabled.
 
     N = features_cpu.shape[0]
-    if is_ratio_format:
-        # New format: head outputs [main_reg, ratio_logits...]
-        preds_main_sum = torch.zeros((N, num_outputs_main), dtype=torch.float32)
-        preds_ratio_sum = torch.zeros((N, num_outputs_ratio), dtype=torch.float32)
+    image_to_components: Dict[str, Dict[str, float]] = {}
+
+    if mc_enabled:
+        # MC-dropout statistics over all stochastic passes across all heads.
+        if is_ratio_format:
+            # 5 physical outputs: [Dry_Total_g, Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g]
+            mc_num_outputs = 5
+        else:
+            # Legacy head: base targets in grams
+            mc_num_outputs = num_outputs_main
+        mc_sum = torch.zeros((N, mc_num_outputs), dtype=torch.float32)
+        mc_sumsq = torch.zeros_like(mc_sum)
+        mc_total = 0
+        mc_samples_list: List[torch.Tensor] = []
     else:
-        # Legacy format: 3-d head for base targets
-        preds_sum = torch.zeros((N, num_outputs_main), dtype=torch.float32)
-    num_heads = 0
+        if is_ratio_format:
+            # New format: head outputs [main_reg, ratio_logits...]
+            preds_main_sum = torch.zeros((N, num_outputs_main), dtype=torch.float32)
+            preds_ratio_sum = torch.zeros((N, num_outputs_ratio), dtype=torch.float32)
+        else:
+            # Legacy format: 3-d head for base targets
+            preds_sum = torch.zeros((N, num_outputs_main), dtype=torch.float32)
+        num_heads = 0
 
     for head_pt in head_weight_paths:
         # Read head state and meta (to detect log-scale setting if bundled)
@@ -544,101 +635,255 @@ def main():
             use_output_softplus=False,
         )
         head_module.load_state_dict(state, strict=True)
-        preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
+
+        if mc_enabled:
+            # MC dropout: (S, N, C) samples in physical or latent space depending on head type.
+            preds_samples_all = predict_from_features_mc_dropout(
+                features_cpu=features_cpu,
+                head=head_module,
+                batch_size=batch_size,
+                num_samples=mc_num_samples,
+            )
+            if preds_samples_all.ndim != 3 or preds_samples_all.shape[1] != N:
+                continue
+
+            if is_ratio_format:
+                # Split main regression and ratio logits for each MC sample
+                preds_main_s = preds_samples_all[:, :, :num_outputs_main]  # (S, N, num_outputs_main)
+                preds_ratio_s = preds_samples_all[:, :, num_outputs_main : num_outputs_main + num_outputs_ratio]  # (S, N, num_outputs_ratio)
+
+                # Invert z-score / log-scale in g/m^2 space for each sample
+                if zscore_enabled and reg3_mean is not None and reg3_std is not None:
+                    mean_view = reg3_mean[:num_outputs_main].view(1, 1, -1)
+                    std_view = reg3_std[:num_outputs_main].view(1, 1, -1)
+                    preds_main_s = preds_main_s * std_view + mean_view
+                if log_scale_meta:
+                    preds_main_s = torch.expm1(preds_main_s).clamp_min(0.0)
+
+                # Convert to grams and decompose into 5D physical components per sample
+                main_g_s = preds_main_s * float(area_m2)  # (S, N, 1)
+                ratio_logits_s = preds_ratio_s  # (S, N, 3)
+                p_ratio_s = F.softmax(ratio_logits_s, dim=-1)  # (S, N, 3)
+
+                comp_g_s = p_ratio_s * main_g_s  # (S, N, 3)
+                clover_g_s = comp_g_s[:, :, 0]
+                dead_g_s = comp_g_s[:, :, 1]
+                green_g_s = comp_g_s[:, :, 2]
+                gdm_g_s = clover_g_s + green_g_s
+                total_g_s = main_g_s.squeeze(-1)  # (S, N)
+
+                # Stack as [Dry_Total_g, Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g]
+                samples_phys = torch.stack(
+                    [total_g_s, clover_g_s, dead_g_s, green_g_s, gdm_g_s],
+                    dim=-1,
+                )  # (S, N, 5)
+            else:
+                # Legacy: only main regression outputs, then convert to grams.
+                preds_main_s = preds_samples_all  # (S, N, num_outputs_main)
+                if zscore_enabled and reg3_mean is not None and reg3_std is not None:
+                    mean_view = reg3_mean[:num_outputs_main].view(1, 1, -1)
+                    std_view = reg3_std[:num_outputs_main].view(1, 1, -1)
+                    preds_main_s = preds_main_s * std_view + mean_view
+                if log_scale_meta:
+                    preds_main_s = torch.expm1(preds_main_s).clamp_min(0.0)
+                samples_phys = preds_main_s * float(area_m2)  # (S, N, num_outputs_main)
+
+            # Aggregate statistics over MC samples for this head
+            mc_sum += samples_phys.sum(dim=0)
+            mc_sumsq += (samples_phys * samples_phys).sum(dim=0)
+            mc_total += samples_phys.shape[0]
+
+            if debug_mode:
+                mc_samples_list.append(samples_phys)
+        else:
+            # Deterministic single-pass head inference (original behaviour)
+            preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
+
+            if is_ratio_format:
+                preds_main = preds_all[:, :num_outputs_main]
+                preds_ratio = preds_all[:, num_outputs_main : num_outputs_main + num_outputs_ratio]
+            else:
+                preds_main = preds_all
+                preds_ratio = None
+
+            # Invert z-score and log-scale for main reg3 outputs only, then convert to grams
+            if zscore_enabled:
+                preds_main = preds_main * reg3_std[:num_outputs_main] + reg3_mean[:num_outputs_main]  # type: ignore[index]
+            if log_scale_meta:
+                preds_main = torch.expm1(preds_main).clamp_min(0.0)
+
+            if is_ratio_format:
+                preds_main_sum += preds_main
+                preds_ratio_sum += preds_ratio  # type: ignore[operator]
+            else:
+                preds_sum += preds_main
+            num_heads += 1
+
+    if mc_enabled:
+        if mc_total == 0:
+            raise RuntimeError("MC dropout inference failed: no valid samples were produced.")
+
+        mean_phys = mc_sum / float(mc_total)
+        var_phys = mc_sumsq / float(mc_total) - mean_phys * mean_phys
+        var_phys = torch.clamp(var_phys, min=0.0)
+        std_phys = torch.sqrt(var_phys + 1e-12)
 
         if is_ratio_format:
-            preds_main = preds_all[:, :num_outputs_main]
-            preds_ratio = preds_all[:, num_outputs_main : num_outputs_main + num_outputs_ratio]
+            # mean_phys: (N, 5) ordered as [Dry_Total_g, Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g]
+            for rel_path, vec in zip(rels_in_order, mean_phys.tolist()):
+                t, c, d, g, gdm_val = vec
+                image_to_components[rel_path] = {
+                    "Dry_Total_g": float(t),
+                    "Dry_Clover_g": float(c),
+                    "Dry_Dead_g": float(d),
+                    "Dry_Green_g": float(g),
+                    "GDM_g": float(gdm_val),
+                }
+
+            if debug_mode and mc_samples_list:
+                all_samples = torch.cat(mc_samples_list, dim=0)  # (M, N, 5)
+                output_names = ["Dry_Total_g", "Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g"]
+                debug_path = os.path.splitext(os.path.abspath(OUTPUT_SUBMISSION_PATH))[0] + "_mc_dropout_debug.json"
+                try:
+                    _write_mc_dropout_debug_csv(
+                        csv_path=debug_path,
+                        rel_paths=rels_in_order,
+                        all_samples=all_samples,
+                        mean=mean_phys,
+                        var=var_phys,
+                        std=std_phys,
+                        output_names=output_names,
+                    )
+                    print(f"MC dropout debug CSV written to: {debug_path}")
+                except Exception as e:
+                    print(f"[WARN] Failed to write MC dropout debug CSV: {e}")
         else:
-            preds_main = preds_all
-            preds_ratio = None
+            # Legacy head: mean predictions in grams for base targets, then derive 5D components.
+            mean_main_g = mean_phys  # (N, num_outputs_main)
+            image_to_base_preds: Dict[str, Tuple[float, ...]] = {}
+            for rel_path, vec in zip(rels_in_order, mean_main_g.tolist()):
+                image_to_base_preds[rel_path] = tuple(float(v) for v in vec)
 
-        # Invert z-score and log-scale for main reg3 outputs only, then convert to grams
-        if zscore_enabled:
-            preds_main = preds_main * reg3_std[:num_outputs_main] + reg3_mean[:num_outputs_main]  # type: ignore[index]
-        if log_scale_meta:
-            preds_main = torch.expm1(preds_main).clamp_min(0.0)
+            for rel_path, vec in image_to_base_preds.items():
+                base_map: Dict[str, float] = {}
+                try:
+                    for idx, name in enumerate(target_bases):
+                        if idx < len(vec):
+                            base_map[name] = vec[idx]
+                except Exception:
+                    base_map = {}
+                total = base_map.get("Dry_Total_g", None)
+                clover = base_map.get("Dry_Clover_g", None)
+                dead = base_map.get("Dry_Dead_g", None)
+                green = base_map.get("Dry_Green_g", None)
+                if total is None:
+                    total = (clover or 0.0) + (dead or 0.0) + (green or 0.0)
+                if dead is None and total is not None and clover is not None and green is not None:
+                    dead = total - clover - green
+                if clover is None:
+                    clover = 0.0
+                if dead is None:
+                    dead = 0.0
+                if green is None:
+                    green = 0.0
+                gdm_val = clover + green
+                image_to_components[rel_path] = {
+                    "Dry_Total_g": float(total),
+                    "Dry_Clover_g": float(clover),
+                    "Dry_Dead_g": float(dead),
+                    "Dry_Green_g": float(green),
+                    "GDM_g": float(gdm_val),
+                }
 
-        if is_ratio_format:
-            preds_main_sum += preds_main
-            preds_ratio_sum += preds_ratio  # type: ignore[operator]
-        else:
-            preds_sum += preds_main
-        num_heads += 1
-
-    if num_heads == 0:
-        raise RuntimeError("No valid head weights found for inference.")
-
-    if is_ratio_format:
-        avg_main_gm2 = preds_main_sum / float(num_heads)  # (N,1)
-        avg_ratio_logits = preds_ratio_sum / float(num_heads)  # (N,3)
-        # Convert main reg output (g/m^2) to grams for Dry_Total_g
-        avg_main_g = avg_main_gm2 * float(area_m2)
-        # Ratio distribution over (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
-        p_ratio = F.softmax(avg_ratio_logits, dim=-1)
-        total_g = avg_main_g.squeeze(-1)
-        clover_g = total_g * p_ratio[:, 0]
-        dead_g = total_g * p_ratio[:, 1]
-        green_g = total_g * p_ratio[:, 2]
-        gdm_g = clover_g + green_g
-
-        # Build mapping from image path to full 5D components
-        image_to_components: Dict[str, Dict[str, float]] = {}
-        for rel_path, t, c, d, g, gdm_val in zip(
-            rels_in_order,
-            total_g.tolist(),
-            clover_g.tolist(),
-            dead_g.tolist(),
-            green_g.tolist(),
-            gdm_g.tolist(),
-        ):
-            image_to_components[rel_path] = {
-                "Dry_Total_g": float(t),
-                "Dry_Clover_g": float(c),
-                "Dry_Dead_g": float(d),
-                "Dry_Green_g": float(g),
-                "GDM_g": float(gdm_val),
-            }
+            if debug_mode and mc_samples_list:
+                all_samples = torch.cat(mc_samples_list, dim=0)  # (M, N, num_outputs_main)
+                output_names = [str(n) for n in target_bases[:num_outputs_main]]
+                debug_path = os.path.splitext(os.path.abspath(OUTPUT_SUBMISSION_PATH))[0] + "_mc_dropout_debug.json"
+                try:
+                    _write_mc_dropout_debug_csv(
+                        csv_path=debug_path,
+                        rel_paths=rels_in_order,
+                        all_samples=all_samples,
+                        mean=mean_main_g,
+                        var=var_phys,
+                        std=std_phys,
+                        output_names=output_names,
+                    )
+                    print(f"MC dropout debug CSV written to: {debug_path}")
+                except Exception as e:
+                    print(f"[WARN] Failed to write MC dropout debug CSV: {e}")
     else:
-        # Legacy 3-d head: outputs base targets in config-defined order, then derive 5D components.
-        avg_preds = (preds_sum / float(num_heads))
-        avg_preds = (avg_preds * float(area_m2)).tolist()
-        image_to_base_preds: Dict[str, Tuple[float, ...]] = {}
-        for rel_path, vec in zip(rels_in_order, avg_preds):
-            image_to_base_preds[rel_path] = tuple(float(v) for v in vec)
+        if num_heads == 0:
+            raise RuntimeError("No valid head weights found for inference.")
 
-        image_to_components = {}
-        for rel_path, vec in image_to_base_preds.items():
-            base_map: Dict[str, float] = {}
-            try:
-                for idx, name in enumerate(target_bases):
-                    base_map[name] = vec[idx]
-            except Exception:
-                base_map = {}
-            # Derive full 5D components from base_map using legacy rules
-            total = base_map.get("Dry_Total_g", None)
-            clover = base_map.get("Dry_Clover_g", None)
-            dead = base_map.get("Dry_Dead_g", None)
-            green = base_map.get("Dry_Green_g", None)
-            if total is None:
-                # Fallback: infer Dry_Total_g if not directly predicted
-                total = (clover or 0.0) + (dead or 0.0) + (green or 0.0)
-            if dead is None and total is not None and clover is not None and green is not None:
-                dead = total - clover - green
-            if clover is None:
-                clover = 0.0
-            if dead is None:
-                dead = 0.0
-            if green is None:
-                green = 0.0
-            gdm_val = clover + green
-            image_to_components[rel_path] = {
-                "Dry_Total_g": float(total),
-                "Dry_Clover_g": float(clover),
-                "Dry_Dead_g": float(dead),
-                "Dry_Green_g": float(green),
-                "GDM_g": float(gdm_val),
-            }
+        if is_ratio_format:
+            avg_main_gm2 = preds_main_sum / float(num_heads)  # (N,1)
+            avg_ratio_logits = preds_ratio_sum / float(num_heads)  # (N,3)
+            # Convert main reg output (g/m^2) to grams for Dry_Total_g
+            avg_main_g = avg_main_gm2 * float(area_m2)
+            # Ratio distribution over (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
+            p_ratio = F.softmax(avg_ratio_logits, dim=-1)
+            total_g = avg_main_g.squeeze(-1)
+            clover_g = total_g * p_ratio[:, 0]
+            dead_g = total_g * p_ratio[:, 1]
+            green_g = total_g * p_ratio[:, 2]
+            gdm_g = clover_g + green_g
+
+            # Build mapping from image path to full 5D components
+            for rel_path, t, c, d, g, gdm_val in zip(
+                rels_in_order,
+                total_g.tolist(),
+                clover_g.tolist(),
+                dead_g.tolist(),
+                green_g.tolist(),
+                gdm_g.tolist(),
+            ):
+                image_to_components[rel_path] = {
+                    "Dry_Total_g": float(t),
+                    "Dry_Clover_g": float(c),
+                    "Dry_Dead_g": float(d),
+                    "Dry_Green_g": float(g),
+                    "GDM_g": float(gdm_val),
+                }
+        else:
+            # Legacy 3-d head: outputs base targets in config-defined order, then derive 5D components.
+            avg_preds = (preds_sum / float(num_heads))
+            avg_preds = (avg_preds * float(area_m2)).tolist()
+            image_to_base_preds: Dict[str, Tuple[float, ...]] = {}
+            for rel_path, vec in zip(rels_in_order, avg_preds):
+                image_to_base_preds[rel_path] = tuple(float(v) for v in vec)
+
+            for rel_path, vec in image_to_base_preds.items():
+                base_map: Dict[str, float] = {}
+                try:
+                    for idx, name in enumerate(target_bases):
+                        base_map[name] = vec[idx]
+                except Exception:
+                    base_map = {}
+                # Derive full 5D components from base_map using legacy rules
+                total = base_map.get("Dry_Total_g", None)
+                clover = base_map.get("Dry_Clover_g", None)
+                dead = base_map.get("Dry_Dead_g", None)
+                green = base_map.get("Dry_Green_g", None)
+                if total is None:
+                    # Fallback: infer Dry_Total_g if not directly predicted
+                    total = (clover or 0.0) + (dead or 0.0) + (green or 0.0)
+                if dead is None and total is not None and clover is not None and green is not None:
+                    dead = total - clover - green
+                if clover is None:
+                    clover = 0.0
+                if dead is None:
+                    dead = 0.0
+                if green is None:
+                    green = 0.0
+                gdm_val = clover + green
+                image_to_components[rel_path] = {
+                    "Dry_Total_g": float(total),
+                    "Dry_Clover_g": float(clover),
+                    "Dry_Dead_g": float(dead),
+                    "Dry_Green_g": float(green),
+                    "GDM_g": float(gdm_val),
+                }
 
     # Build submission
     rows = []
@@ -660,6 +905,54 @@ def main():
         for sample_id, value in rows:
             f.write(f"{sample_id},{value}\n")
     print(f"Submission written to: {OUTPUT_SUBMISSION_PATH}")
+
+
+def _write_mc_dropout_debug_csv(
+    csv_path: str,
+    rel_paths: List[str],
+    all_samples: torch.Tensor,
+    mean: torch.Tensor,
+    var: torch.Tensor,
+    std: torch.Tensor,
+    output_names: List[str],
+) -> None:
+    """
+    Save MC dropout per-sample draws and summary statistics into a single JSON file.
+
+    Each row corresponds to one image (identified by image_path). For each output
+    dimension we record:
+      - mean_{name}, var_{name}, std_{name}
+      - mc{k}_{name} for k in [0, M-1] (per-draw predictions)
+    """
+    import numpy as np  # noqa: F401  # kept for potential future extensions
+
+    M, N, C = all_samples.shape
+    if N != len(rel_paths) or C != len(output_names):
+        raise ValueError("Mismatch between samples, paths, and output names for MC dropout debug export.")
+
+    mean_np = mean.detach().cpu().numpy()
+    var_np = var.detach().cpu().numpy()
+    std_np = std.detach().cpu().numpy()
+    samples_np = all_samples.detach().cpu().numpy()
+
+    rows: List[Dict[str, object]] = []
+    for idx, rel_path in enumerate(rel_paths):
+        row: Dict[str, object] = {"image_path": rel_path}
+        for c_idx, name in enumerate(output_names):
+            row[f"mean_{name}"] = float(mean_np[idx, c_idx])
+            row[f"var_{name}"] = float(var_np[idx, c_idx])
+            row[f"std_{name}"] = float(std_np[idx, c_idx])
+        for m in range(M):
+            for c_idx, name in enumerate(output_names):
+                row[f"mc{m}_{name}"] = float(samples_np[m, idx, c_idx])
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    out_dir = os.path.dirname(os.path.abspath(csv_path))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    # Write as JSON array of records for easier downstream parsing.
+    df.to_json(csv_path, orient="records", indent=2)
 
 
 if __name__ == "__main__":

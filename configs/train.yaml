@@ -1,5 +1,5 @@
 seed: 42
-version: ratio-mlp-320-manifold-mixup-extreme-swiglu
+version: ratio-mlp-2560-gelu-manifold-mixup-extreme-swa
 data:
   root: data
   train_csv: train.csv
@@ -97,9 +97,21 @@ model:
   log_scale_targets: false
   head:
     type: mlp
-    hidden_dims: [320]
+    hidden_dims: [2560]
+    activation: gelu
     dropout: 0.5
     use_output_softplus: true
+
+mc_dropout:
+  enabled: true
+  # Number of stochastic forward passes of the regression head with dropout enabled
+  # for Monte-Carlo dropout inference. When <= 1, falls back to deterministic head
+  # evaluation as in the original script.
+  num_samples: 256
+  # When true, infer_and_submit_pt.py will write an additional
+  # <submission>_mc_dropout_debug.json file with per-sample draws
+  # and mean/variance/std statistics for MC dropout predictions.
+  debug: false
 
 mtl:
   enabled: true

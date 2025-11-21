@@ -188,9 +188,8 @@ def load_head_module(cfg: Dict) -> nn.Module:
         embedding_dim=int(cfg["model"]["embedding_dim"]),
         num_outputs=3,
         head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-        # Default to SwiGLU when activation is not specified; keep legacy activations
-        # for old configs if the key is present.
-        head_activation=str(cfg["model"]["head"].get("activation", "swiglu")),
+        # Head activation is configurable via YAML; default to ReLU when unspecified.
+        head_activation=str(cfg["model"]["head"].get("activation", "relu")),
         dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
         use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
     )
