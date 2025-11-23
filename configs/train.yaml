@@ -1,5 +1,5 @@
 seed: 42
-version: moe
+version: ratio-adjust-1280-e15
 data:
   root: data
   train_csv: train.csv
@@ -71,14 +71,14 @@ data:
     # Feature-level manifold mixup on the shared bottleneck representation z
     manifold_mixup:
       enabled: true
-      prob: 1.0
+      prob: 0.9
       alpha: 1.0
     cutmix:
       enabled: false
       alpha: 0.5
       # minmax: [0.3, 0.7]  # optional clamp for bbox size; comment to disable
       use_prev_for_bsz1: true
-    no_augment_prob: 0.1
+    no_augment_prob: 0.05
   normalization:
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
@@ -99,13 +99,13 @@ model:
     # Head architecture type:
     # - mlp: legacy shared bottleneck MLP
     # - ple: PLE-style gated experts with shared + task-specific experts
-    type: ple
+    type: mlp
     # Hidden dimension of each expert's internal MLP.
     # When unspecified, defaults to bottleneck_dim / 4.
     ple_expert_hidden_dim: 640
-    hidden_dims: [640]
+    hidden_dims: [1280]
     activation: gelu
-    dropout: 0.5
+    dropout: 0.2
     use_output_softplus: true
 
 mc_dropout:
@@ -165,9 +165,9 @@ loss:
 
 optimizer:
   name: adamw
-  lr: 0.001
+  lr: 0.0005
   weight_decay: 0.01
-  uw_lr: 0.01
+  uw_lr: 0.001
   uw_weight_decay: 0.0
 
 scheduler:
@@ -197,7 +197,7 @@ trainer:
   swa:
     enabled: true
     swa_lrs: 0.0001
-    swa_epoch_start: 0.8
+    swa_epoch_start: 0.6
     annealing_epochs: 5
     annealing_strategy: cos
 

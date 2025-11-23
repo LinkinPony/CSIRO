@@ -403,22 +403,36 @@ def train_single_split(
 
     csv_logger, tb_logger = create_lightning_loggers(log_dir)
 
+    # Validation loader behaviour:
+    # - When train_all_mode=True, we typically want to evaluate only on the tiny
+    #   dummy validation split, so honour an explicit trainer.limit_val_batches
+    #   and otherwise default it to 1.
+    # - When train_all_mode=False (regular / k-fold training), we *ignore* any
+    #   user-provided trainer.limit_val_batches and always use the full
+    #   validation set (1.0). This matches the expectation that the config
+    #   field only affects train_all runs.
+    trainer_cfg = cfg.get("trainer", {})
+    limit_val_batches_cfg = trainer_cfg.get("limit_val_batches", None)
+    if train_all_mode:
+        # Honour an explicit value if provided; otherwise fall back to 1.
+        limit_val_batches = limit_val_batches_cfg if limit_val_batches_cfg is not None else 1
+    else:
+        limit_val_batches = 1.0
+
     trainer = pl.Trainer(
-        max_epochs=int(cfg["trainer"]["max_epochs"]),
-        accelerator=str(cfg["trainer"]["accelerator"]),
-        devices=cfg["trainer"]["devices"],
-        precision=cfg["trainer"]["precision"],
-        limit_train_batches=cfg["trainer"].get("limit_train_batches", 1.0),
-        limit_val_batches=cfg["trainer"].get(
-            "limit_val_batches", 1 if train_all_mode else 1.0
-        ),
+        max_epochs=int(trainer_cfg["max_epochs"]),
+        accelerator=str(trainer_cfg["accelerator"]),
+        devices=trainer_cfg["devices"],
+        precision=trainer_cfg["precision"],
+        limit_train_batches=trainer_cfg.get("limit_train_batches", 1.0),
+        limit_val_batches=limit_val_batches,
         callbacks=callbacks,
         logger=[csv_logger, tb_logger],
-        log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
-        accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
-        gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
+        log_every_n_steps=int(trainer_cfg["log_every_n_steps"]),
+        accumulate_grad_batches=int(trainer_cfg.get("accumulate_grad_batches", 1)),
+        gradient_clip_val=float(trainer_cfg.get("gradient_clip_val", 0.0)),
         gradient_clip_algorithm=str(
-            cfg["trainer"].get("gradient_clip_algorithm", "norm")
+            trainer_cfg.get("gradient_clip_algorithm", "norm")
         ),
         enable_checkpointing=True,
     )
