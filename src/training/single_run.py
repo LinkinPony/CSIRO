@@ -396,15 +396,31 @@ def train_single_split(
 
     csv_logger, tb_logger = create_lightning_loggers(log_dir)
 
+    # Configure validation batch limiting:
+    # - In train_all mode: use the config value if provided, otherwise default to 1
+    #   so that validation only uses the dummy batch.
+    # - In normal / k-fold mode: a config value of 1 is treated as "full validation"
+    #   (1.0 fraction), so that `limit_val_batches: 1` in the YAML does not disable
+    #   proper validation when train_all is False.
+    raw_limit_val = cfg["trainer"].get("limit_val_batches", None)
+    if train_all_mode:
+        limit_val_batches = raw_limit_val if raw_limit_val is not None else 1
+    else:
+        if raw_limit_val is None:
+            limit_val_batches = 1.0
+        else:
+            if isinstance(raw_limit_val, (int, float)) and float(raw_limit_val) == 1.0:
+                limit_val_batches = 1.0
+            else:
+                limit_val_batches = raw_limit_val
+
     trainer = pl.Trainer(
         max_epochs=int(cfg["trainer"]["max_epochs"]),
         accelerator=str(cfg["trainer"]["accelerator"]),
         devices=cfg["trainer"]["devices"],
         precision=cfg["trainer"]["precision"],
         limit_train_batches=cfg["trainer"].get("limit_train_batches", 1.0),
-        limit_val_batches=cfg["trainer"].get(
-            "limit_val_batches", 1 if train_all_mode else 1.0
-        ),
+        limit_val_batches=limit_val_batches,
         callbacks=callbacks,
         logger=[csv_logger, tb_logger],
         log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),

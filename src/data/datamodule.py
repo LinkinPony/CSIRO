@@ -288,12 +288,15 @@ class PastureDataModule(LightningDataModule):
         ndvi_series = df.groupby("image_id")["Pre_GSHH_NDVI"].first()
         species_series = df.groupby("image_id")["Species"].first()
         state_series = df.groupby("image_id")["State"].first()
+        # Sampling date per image (used for grouped k-fold splitting by date+state)
+        date_series = df.groupby("image_id")["Sampling_Date"].first()
         merged = pivot.join(image_path_series, how="inner")
         merged = (
             merged.join(height_series, how="left")
             .join(ndvi_series, how="left")
             .join(species_series, how="left")
             .join(state_series, how="left")
+            .join(date_series, how="left")
         )
         # Ensure all supervised primary targets are present
         merged = merged.dropna(subset=self.target_order)
@@ -318,6 +321,7 @@ class PastureDataModule(LightningDataModule):
             "Pre_GSHH_NDVI",
             "Species",
             "State",
+            "Sampling_Date",
             "image_path",
             "image_id",
         ]

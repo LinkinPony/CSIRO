@@ -1,5 +1,5 @@
 seed: 42
-version: ratio-mlp-2560-gelu-manifold-mixup-extreme-swa
+version: ratio-mlp-2560-relu-manifold-mixup-extreme-swa-kfold
 data:
   root: data
   train_csv: train.csv
@@ -98,7 +98,7 @@ model:
   head:
     type: mlp
     hidden_dims: [2560]
-    activation: gelu
+    activation: relu
     dropout: 0.5
     use_output_softplus: true
 
@@ -127,7 +127,7 @@ mtl:
     ndvi_dense: 0.0
 
 train_all:
-  enabled: true
+  enabled: false
 
 peft:
   enabled: true
