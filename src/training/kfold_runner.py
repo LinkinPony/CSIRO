@@ -236,15 +236,62 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
     # 1) Aggregate per-fold metrics into a JSON file with:
     #    - metrics at the epoch with minimal val_loss ("best")
     #    - metrics at the final epoch ("last")
+    #      For "last", we optionally recompute metrics by re-running validation
+    #      through the same inference path as infer_and_submit_pt.py so that the
+    #      reported numbers match the actual offline inference behaviour.
     try:
         import pandas as pd  # type: ignore[import]
         import json
         from package_artifacts import (  # type: ignore[import]
             find_latest_metrics_csv,
             pick_best_epoch_from_metrics,
+            _export_swa_head_from_checkpoint,
+            list_head_checkpoints,
+            pick_latest_head,
         )
+        # Utilities from sanity_check drive infer_and_submit_pt.py on arbitrary splits.
+        from sanity_check import (  # type: ignore[import]
+            compute_metrics as _sc_compute_metrics,
+            _write_test_csv_for_images as _sc_write_test_csv_for_images,
+            _run_infer_module as _sc_run_infer_module,
+            _read_submission_as_wide as _sc_read_submission_as_wide,
+        )
+        import torch  # type: ignore[import]
 
-        per_fold_records = []
+        project_dir = Path(__file__).resolve().parents[2]
+        data_root = project_dir / str(cfg["data"]["root"])
+        target_order = list(cfg["data"]["target_order"])
+
+        # Resolve DINOv3 weights for offline evaluation (used for "last" metrics).
+        dino_weights_path: Optional[Path] = None
+        model_weights_path = cfg.get("model", {}).get("weights_path", None)
+        if model_weights_path:
+            mw = Path(str(model_weights_path))
+            if not mw.is_absolute():
+                mw = project_dir / mw
+            if mw.is_file():
+                dino_weights_path = mw
+        if dino_weights_path is None:
+            try:
+                dino_dir = project_dir / "dinov3_weights"
+                pt_candidates = sorted(dino_dir.glob("*.pt"))
+                if pt_candidates:
+                    dino_weights_path = pt_candidates[0]
+            except Exception:
+                dino_weights_path = None
+        if dino_weights_path is None:
+            logger.warning(
+                "DINOv3 weights not found; offline 'last' k-fold metrics "
+                "will fall back to training-time metrics."
+            )
+
+        # Temporary roots for per-fold head exports and inference outputs.
+        eval_head_root = ckpt_dir / "kfold_eval_heads_last"
+        infer_tmp_root = log_dir / "kfold_eval_infer"
+        eval_head_root.mkdir(parents=True, exist_ok=True)
+        infer_tmp_root.mkdir(parents=True, exist_ok=True)
+
+        per_fold_records: list[dict] = []
         best_rows = []
         last_rows = []
         for fold_idx in range(num_folds):
@@ -307,7 +354,118 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
             last_row = metrics_df.iloc[metrics_df["epoch"].idxmax()]
 
             best_metrics = _extract_metrics(best_row)
+            # Start from training-time "last" metrics, then optionally override them
+            # with metrics recomputed via the offline inference pipeline.
             last_metrics = _extract_metrics(last_row)
+
+            # Optionally recompute "last" metrics by running infer_and_submit_pt.py on
+            # this fold's validation split, using the fold's final head derived from
+            # last.ckpt (or the latest head-epoch*.pt as a fallback).
+            if dino_weights_path is not None:
+                try:
+                    fold_splits_dir = splits_root / f"fold_{fold_idx}"
+                    val_csv_path = fold_splits_dir / "val.csv"
+                    if val_csv_path.is_file():
+                        vdf = pd.read_csv(str(val_csv_path))
+                        merged_val = vdf.merge(
+                            full_df, on=["image_id", "image_path"], how="inner"
+                        )
+                        if not merged_val.empty:
+                            image_paths = merged_val["image_path"].astype(str).tolist()
+                            targets = torch.from_numpy(
+                                merged_val[target_order].to_numpy(dtype=np.float32)
+                            )
+
+                            # Build a temporary test.csv under the dataset root so that
+                            # infer_and_submit_pt.py can resolve image paths.
+                            test_csv_path = data_root / f"kfold_last_fold_{fold_idx}_test.csv"
+                            _sc_write_test_csv_for_images(
+                                image_paths=image_paths,
+                                target_order=target_order,
+                                out_csv_path=test_csv_path,
+                            )
+
+                            # Determine head weights for this fold, preferring SWA export.
+                            fold_root_ckpt_dir = ckpt_dir / f"fold_{fold_idx}"
+                            fold_eval_head_dir = eval_head_root / f"fold_{fold_idx}"
+                            head_path: Optional[Path] = None
+
+                            last_ckpt = fold_root_ckpt_dir / "last.ckpt"
+                            try:
+                                swa_res = _export_swa_head_from_checkpoint(
+                                    last_ckpt, fold_eval_head_dir
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Fold {fold_idx}: SWA head export for offline metrics failed: {e}"
+                                )
+                                swa_res = None
+
+                            if swa_res is not None:
+                                _, head_path = swa_res
+                            else:
+                                head_dir = fold_root_ckpt_dir / "head"
+                                head_files = list_head_checkpoints(head_dir)
+                                chosen_head = pick_latest_head(head_files)
+                                if chosen_head is not None:
+                                    head_path = chosen_head
+
+                            if head_path is not None and head_path.is_file():
+                                # Run the single-source inference script on this fold's val split.
+                                sub_csv_path = (
+                                    infer_tmp_root / f"fold_{fold_idx}_last_submission.csv"
+                                )
+                                _sc_run_infer_module(
+                                    project_dir=str(project_dir),
+                                    head_path_or_dir=head_path,
+                                    dino_weights_path=str(dino_weights_path),
+                                    input_csv_path=test_csv_path,
+                                    output_submission_path=sub_csv_path,
+                                )
+
+                                wide_preds = _sc_read_submission_as_wide(
+                                    sub_csv_path, test_csv_path
+                                )
+                                # Map predictions back to the original image order.
+                                pred_map = {
+                                    str(row["image_path"]): [
+                                        float(row.get(t, 0.0)) for t in target_order
+                                    ]
+                                    for _, row in wide_preds.iterrows()
+                                }
+                                preds_list = [
+                                    pred_map.get(p, [0.0] * len(target_order))
+                                    for p in image_paths
+                                ]
+                                preds_mat = torch.tensor(
+                                    preds_list, dtype=torch.float32
+                                )
+
+                                extra = _sc_compute_metrics(
+                                    preds=preds_mat, targets=targets
+                                )
+                                # Overwrite last_metrics with offline metrics while
+                                # preserving the epoch index (final epoch).
+                                last_metrics = {
+                                    "epoch": last_metrics.get(
+                                        "epoch",
+                                        int(metrics_df["epoch"].max())
+                                        if "epoch" in metrics_df.columns
+                                        else -1,
+                                    ),
+                                    # For alignment with training logs, treat MSE as val_loss here.
+                                    "val_loss": float(
+                                        extra.get("mse", extra.get("rmse", 0.0))
+                                    ),
+                                    "val_mae": float(extra.get("mae", 0.0)),
+                                    "val_mse": float(extra.get("mse", 0.0)),
+                                    "val_r2": float(extra.get("r2", 0.0)),
+                                }
+                except Exception as e:
+                    logger.warning(
+                        f"Fold {fold_idx}: offline 'last' metrics computation failed; "
+                        f"falling back to training-time metrics. Reason: {e}"
+                    )
 
             best_rows.append(best_metrics)
             last_rows.append(last_metrics)
