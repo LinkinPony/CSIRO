@@ -1,5 +1,5 @@
 seed: 42
-version: ratio-mlp-2560-gelu-manifold-mixup-extreme-swa-no-irish-kfold
+version: ratio-mlp-2560-manifold-mixup
 data:
   root: data
   train_csv: train.csv
@@ -98,7 +98,7 @@ model:
   head:
     type: mlp
     hidden_dims: [2560]
-    activation: gelu
+    activation: relu
     dropout: 0.5
     use_output_softplus: true
 
@@ -144,6 +144,7 @@ peft:
   lora_weight_decay: 0.0
 
 loss:
+  #uw
   weighting: uw
   # Enable/disable the biomass ratio head (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
   use_ratio_head: true
@@ -172,7 +173,7 @@ scheduler:
 kfold:
   enabled: true
   k: 5
-  even_split: false
+  even_split: true
 
 trainer:
   max_epochs: 15
