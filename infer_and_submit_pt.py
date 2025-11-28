@@ -32,6 +32,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from PIL import Image
 import pandas as pd
+import json
 
 from torch import nn
 import torch.nn.functional as F
@@ -271,6 +272,124 @@ def discover_head_weight_paths(path: str) -> List[str]:
     raise FileNotFoundError(f"Cannot find head weights at: {path}")
 
 
+def _read_ensemble_manifest_if_exists(
+    project_dir: str,
+    head_base: str,
+) -> Optional[Tuple[List[Tuple[str, float]], str]]:
+    """
+    Read configs/ensemble.json if present and return:
+      - list of (absolute_head_path, weight)
+      - aggregation strategy: 'mean' or 'weighted_mean'
+    Relative head paths are resolved against:
+      1) HEAD_WEIGHTS_PT_PATH if it's a directory
+      2) dirname(HEAD_WEIGHTS_PT_PATH) if it's a file
+      3) project_dir as last resort
+    """
+    try:
+        manifest_path = os.path.join(project_dir, "configs", "ensemble.json")
+        if not os.path.isfile(manifest_path):
+            return None
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            return None
+        heads = obj.get("heads", [])
+        if not isinstance(heads, list) or len(heads) == 0:
+            # Empty heads list -> ignore manifest
+            return None
+        # Determine resolution base for relative paths
+        if os.path.isdir(head_base):
+            base_dir = head_base
+        elif os.path.isfile(head_base):
+            base_dir = os.path.dirname(head_base)
+        else:
+            base_dir = project_dir
+        entries: List[Tuple[str, float]] = []
+        for h in heads:
+            if not isinstance(h, dict):
+                continue
+            p = h.get("path", None)
+            if not isinstance(p, str) or len(p.strip()) == 0:
+                continue
+            w = h.get("weight", 1.0)
+            try:
+                w = float(w)
+            except Exception:
+                w = 1.0
+            abs_path = p if os.path.isabs(p) else os.path.abspath(os.path.join(base_dir, p))
+            if os.path.isfile(abs_path):
+                entries.append((abs_path, w))
+        if not entries:
+            return None
+        agg = str(obj.get("aggregation", "") or "").strip().lower()
+        if agg not in ("mean", "weighted_mean"):
+            # Default: weighted_mean when any weight != 1, else mean
+            has_non_one = any(abs(w - 1.0) > 1e-8 for _, w in entries)
+            agg = "weighted_mean" if has_non_one else "mean"
+        return entries, agg
+    except Exception:
+        return None
+
+
+def _read_ensemble_enabled_flag(project_dir: str) -> bool:
+    """
+    Read configs/ensemble.json and return 'enabled' flag (default: False).
+    """
+    try:
+        manifest_path = os.path.join(project_dir, "configs", "ensemble.json")
+        if not os.path.isfile(manifest_path):
+            return False
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            return False
+        return bool(obj.get("enabled", False))
+    except Exception:
+        return False
+
+
+def _read_packaged_ensemble_manifest_if_exists(
+    head_base: str,
+) -> Optional[Tuple[List[Tuple[str, float]], str]]:
+    """
+    Read weights/head/ensemble.json if present and return:
+      - list of (absolute_head_path, weight=1.0)
+      - aggregation strategy ('mean', default)
+    Paths inside packaged manifest are expected to be relative to head_base.
+    """
+    try:
+        if not isinstance(head_base, str) or len(head_base) == 0:
+            return None
+        base_dir = head_base if os.path.isdir(head_base) else os.path.dirname(head_base)
+        manifest_path = os.path.join(base_dir, "ensemble.json")
+        if not os.path.isfile(manifest_path):
+            return None
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            return None
+        heads = obj.get("heads", [])
+        if not isinstance(heads, list) or len(heads) == 0:
+            return None
+        entries: List[Tuple[str, float]] = []
+        for h in heads:
+            if not isinstance(h, dict):
+                continue
+            p = h.get("path", None)
+            if not isinstance(p, str) or len(p.strip()) == 0:
+                continue
+            abs_path = p if os.path.isabs(p) else os.path.abspath(os.path.join(base_dir, p))
+            if os.path.isfile(abs_path):
+                entries.append((abs_path, 1.0))
+        if not entries:
+            return None
+        agg = str(obj.get("aggregation", "") or "").strip().lower()
+        if agg not in ("mean", "weighted_mean"):
+            agg = "mean"
+        return entries, agg
+    except Exception:
+        return None
+
 def _load_zscore_json_for_head(head_pt_path: str) -> Optional[dict]:
     """
     Try to locate z_score.json for a given head.
@@ -429,8 +548,24 @@ def main():
             "dinov3 is not available locally. Ensure DINOV3_PATH points to third_party/dinov3/dinov3."
         )
 
-    # Discover head weights early and read meta to determine head format
-    head_weight_paths = discover_head_weight_paths(HEAD_WEIGHTS_PT_PATH)
+    # Discover head weights:
+    # If configs/ensemble.json enabled, prefer packaged manifest weights/head/ensemble.json; otherwise scan directory.
+    ensemble_enabled = _read_ensemble_enabled_flag(_PROJECT_DIR_ABS)
+    if ensemble_enabled:
+        pkg_manifest = _read_packaged_ensemble_manifest_if_exists(HEAD_WEIGHTS_PT_PATH)
+        if pkg_manifest is not None:
+            head_entries, aggregation = pkg_manifest
+            head_weight_paths = [p for (p, _w) in head_entries]
+            weight_map = {p: 1.0 for p in head_weight_paths}
+            use_weighted = False
+        else:
+            head_weight_paths = discover_head_weight_paths(HEAD_WEIGHTS_PT_PATH)
+            weight_map = {p: 1.0 for p in head_weight_paths}
+            use_weighted = False
+    else:
+        head_weight_paths = discover_head_weight_paths(HEAD_WEIGHTS_PT_PATH)
+        weight_map = {p: 1.0 for p in head_weight_paths}
+        use_weighted = False
 
     # Inspect first head file to infer packed head shape (main + optional ratio outputs)
     first_state, first_meta, _ = load_head_state(head_weight_paths[0])
@@ -442,84 +577,131 @@ def main():
     ratio_components = first_meta.get("ratio_components", [])
     is_ratio_format = num_outputs_ratio > 0 and head_total_outputs == (num_outputs_main + num_outputs_ratio)
 
-    # Build backbone architecture locally (no torch.hub), then load state_dict
-    backbone = _make_backbone(pretrained=False)
+    # Build weighted/mean ensemble by running per-head feature extraction (supports per-head LoRA)
+    # Validate heads are mutually compatible
+    # Reference embedding/backbone from config for sanity checks
+    cfg_embedding_dim = int(cfg["model"]["embedding_dim"])
+
+    # Accumulators will be allocated after first head to know N
+    rels_in_order_ref: Optional[List[str]] = None
+    preds_main_sum: Optional[torch.Tensor] = None
+    preds_ratio_sum: Optional[torch.Tensor] = None
+    preds_sum_legacy: Optional[torch.Tensor] = None
+    weight_total: float = 0.0
+    num_heads_used: int = 0
+
+    # Preload DINO backbone state (reused per-head)
     dino_state = torch.load(DINO_WEIGHTS_PT_PATH, map_location="cpu")
     if isinstance(dino_state, dict) and "state_dict" in dino_state:
         dino_state = dino_state["state_dict"]
-    try:
-        backbone.load_state_dict(dino_state, strict=True)
-    except Exception:
-        backbone.load_state_dict(dino_state, strict=False)
 
-    # If any head carries a PEFT payload, inject LoRA adapters into the backbone and load adapter weights
-    try:
-        # Load first head file to inspect for peft payload
-        peft_payload: Optional[dict] = None
-        if head_weight_paths:
-            _obj = torch.load(head_weight_paths[0], map_location="cpu")
-            if isinstance(_obj, dict) and ("peft" in _obj):
-                peft_payload = _obj.get("peft")
-        if peft_payload is not None and isinstance(peft_payload, dict):
-            peft_cfg_dict = peft_payload.get("config", None)
-            peft_state = peft_payload.get("state_dict", None)
-            if peft_cfg_dict and peft_state:
-                # Import PEFT lazily and wrap backbone
-                try:
-                    from peft.config import PeftConfig  # type: ignore
-                    from peft.mapping_func import get_peft_model  # type: ignore
-                    from peft.utils.save_and_load import set_peft_model_state_dict  # type: ignore
-                except Exception:
-                    # Fallback via our integration helper to ensure third_party path is added
-                    LoraConfig, get_peft_model_alt, _, _ = _import_peft()  # noqa: F841
-                    from peft.config import PeftConfig  # type: ignore
-                    from peft.utils.save_and_load import set_peft_model_state_dict  # type: ignore
-                    get_peft_model = get_peft_model_alt  # type: ignore
-
-                peft_config = PeftConfig.from_peft_type(**peft_cfg_dict)
-                backbone = get_peft_model(backbone, peft_config)
-                # Load adapter weights into wrapped model
-                set_peft_model_state_dict(backbone, peft_state, adapter_name="default")
-                backbone.eval()
-    except Exception as _e:
-        # If PEFT injection fails, continue without adapters
-        print(f"[WARN] PEFT injection skipped: {_e}")
-
-    feature_extractor = DinoV3FeatureExtractor(backbone)
-
-    # 1) Extract DINOv3 features ONCE for all images
-    rels_in_order, features_cpu = extract_features_for_images(
-        feature_extractor=feature_extractor,
-        dataset_root=dataset_root,
-        image_paths=unique_image_paths,
-        image_size=image_size,
-        mean=mean,
-        std=std,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
-
-    # 2) Use discovered heads (single or per-fold) and ensemble predictions by averaging
-
-    N = features_cpu.shape[0]
-    if is_ratio_format:
-        # New format: head outputs [main_reg, ratio_logits...]
-        preds_main_sum = torch.zeros((N, num_outputs_main), dtype=torch.float32)
-        preds_ratio_sum = torch.zeros((N, num_outputs_ratio), dtype=torch.float32)
-    else:
-        # Legacy format: 3-d head for base targets
-        preds_sum = torch.zeros((N, num_outputs_main), dtype=torch.float32)
-    num_heads = 0
-
+    # Ensure all heads agree on ratio format
     for head_pt in head_weight_paths:
-        # Read head state and meta (to detect log-scale setting if bundled)
-        state, meta, _peft = load_head_state(head_pt)
+        _, meta_chk, _ = load_head_state(head_pt)
+        if not isinstance(meta_chk, dict):
+            meta_chk = {}
+        n_main = int(meta_chk.get("num_outputs_main", meta_chk.get("num_outputs", 3)))
+        n_ratio = int(meta_chk.get("num_outputs_ratio", 0))
+        total = int(meta_chk.get("head_total_outputs", n_main + n_ratio))
+        is_ratio_this = n_ratio > 0 and total == (n_main + n_ratio)
+        if is_ratio_this != is_ratio_format:
+            raise RuntimeError(f"Head format mismatch: {head_pt} ratio_format={is_ratio_this} != first_head={is_ratio_format}")
+
+    # Run per-head
+    for head_pt in head_weight_paths:
+        w = float(weight_map.get(head_pt, 1.0))
+        # Load head state and meta
+        state, meta, peft_payload = load_head_state(head_pt)
         if not isinstance(meta, dict):
             meta = {}
+
+        # Use meta to build head architecture (do not rely on YAML defaults)
+        head_num_main = int(meta.get("num_outputs_main", meta.get("num_outputs", num_outputs_main)))
+        head_num_ratio = int(meta.get("num_outputs_ratio", num_outputs_ratio))
+        head_total = int(meta.get("head_total_outputs", head_num_main + head_num_ratio))
+        head_hidden_dims = list(meta.get("head_hidden_dims", first_meta.get("head_hidden_dims", list(cfg["model"]["head"].get("hidden_dims", [512, 256])))))
+        head_activation = str(meta.get("head_activation", first_meta.get("head_activation", str(cfg["model"]["head"].get("activation", "relu")))))
+        head_dropout = float(meta.get("head_dropout", first_meta.get("head_dropout", float(cfg["model"]["head"].get("dropout", 0.0)))))
+        head_embedding_dim = int(meta.get("embedding_dim", cfg_embedding_dim))
+
+        # Sanity: require embedding_dim in meta to match config embedding (backbone choice)
+        if head_embedding_dim != cfg_embedding_dim:
+            raise RuntimeError(
+                f"Head {head_pt} embedding_dim({head_embedding_dim}) != cfg.model.embedding_dim({cfg_embedding_dim}); "
+                "mixing heads trained on different backbones is unsupported in a single run."
+            )
+
+        # Build a fresh backbone per head, load base DINO weights
+        backbone = _make_backbone(pretrained=False)
+        try:
+            backbone.load_state_dict(dino_state, strict=True)
+        except Exception:
+            backbone.load_state_dict(dino_state, strict=False)
+
+        # Inject per-head LoRA adapters if bundle contains PEFT payload
+        try:
+            if peft_payload is not None and isinstance(peft_payload, dict):
+                peft_cfg_dict = peft_payload.get("config", None)
+                peft_state = peft_payload.get("state_dict", None)
+                if peft_cfg_dict and peft_state:
+                    try:
+                        from peft.config import PeftConfig  # type: ignore
+                        from peft.mapping_func import get_peft_model  # type: ignore
+                        from peft.utils.save_and_load import set_peft_model_state_dict  # type: ignore
+                    except Exception:
+                        LoraConfig, get_peft_model_alt, _, _ = _import_peft()  # noqa: F841
+                        from peft.config import PeftConfig  # type: ignore
+                        from peft.utils.save_and_load import set_peft_model_state_dict  # type: ignore
+                        get_peft_model = get_peft_model_alt  # type: ignore
+                    peft_config = PeftConfig.from_peft_type(**peft_cfg_dict)
+                    backbone = get_peft_model(backbone, peft_config)
+                    set_peft_model_state_dict(backbone, peft_state, adapter_name="default")
+                    backbone.eval()
+        except Exception as _e:
+            print(f"[WARN] PEFT injection skipped for {head_pt}: {_e}")
+
+        feature_extractor = DinoV3FeatureExtractor(backbone)
+        # Extract features for this head (per-head features to respect its LoRA)
+        rels_in_order, features_cpu = extract_features_for_images(
+            feature_extractor=feature_extractor,
+            dataset_root=dataset_root,
+            image_paths=unique_image_paths,
+            image_size=image_size,
+            mean=mean,
+            std=std,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        )
+        if rels_in_order_ref is None:
+            rels_in_order_ref = rels_in_order
+        else:
+            # Basic consistency check
+            if rels_in_order_ref != rels_in_order:
+                raise RuntimeError("Image order mismatch across heads; aborting.")
+
+        # Build head module according to its own meta
+        head_module = build_head_layer(
+            embedding_dim=head_embedding_dim,
+            num_outputs=head_total if is_ratio_format else head_num_main,
+            head_hidden_dims=head_hidden_dims,
+            head_activation=head_activation,
+            dropout=head_dropout,
+            use_output_softplus=False,
+        )
+        head_module.load_state_dict(state, strict=True)
+        preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
+
+        if is_ratio_format:
+            preds_main = preds_all[:, :head_num_main]
+            preds_ratio = preds_all[:, head_num_main : head_num_main + head_num_ratio]
+        else:
+            preds_main = preds_all
+            preds_ratio = None
+
+        # Per-head normalization inversion (main outputs only)
         # Decide log-scale for main reg3 outputs
         log_scale_cfg = bool(cfg["model"].get("log_scale_targets", False))
         log_scale_meta = bool(meta.get("log_scale_targets", log_scale_cfg))
-        # Load z-score for this head (optional)
         zscore = _load_zscore_json_for_head(head_pt)
         reg3_mean = None
         reg3_std = None
@@ -530,48 +712,35 @@ def main():
             except Exception:
                 reg3_mean, reg3_std = None, None
         zscore_enabled = reg3_mean is not None and reg3_std is not None
-
-        # For packed heads we always export without a terminal Softplus.
-        # Prefer the activation used during training (stored in meta), and fall back
-        # to config only if missing for backward compatibility.
-        head_activation = str(meta.get("head_activation", cfg["model"]["head"].get("activation", "relu")))
-        head_module = build_head_layer(
-            embedding_dim=int(cfg["model"]["embedding_dim"]),
-            num_outputs=head_total_outputs if is_ratio_format else num_outputs_main,
-            head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
-            head_activation=head_activation,
-            dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
-            use_output_softplus=False,
-        )
-        head_module.load_state_dict(state, strict=True)
-        preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
-
-        if is_ratio_format:
-            preds_main = preds_all[:, :num_outputs_main]
-            preds_ratio = preds_all[:, num_outputs_main : num_outputs_main + num_outputs_ratio]
-        else:
-            preds_main = preds_all
-            preds_ratio = None
-
-        # Invert z-score and log-scale for main reg3 outputs only, then convert to grams
         if zscore_enabled:
-            preds_main = preds_main * reg3_std[:num_outputs_main] + reg3_mean[:num_outputs_main]  # type: ignore[index]
+            preds_main = preds_main * reg3_std[:head_num_main] + reg3_mean[:head_num_main]  # type: ignore[index]
         if log_scale_meta:
             preds_main = torch.expm1(preds_main).clamp_min(0.0)
 
+        # Allocate accumulators lazily
+        N = preds_main.shape[0]
         if is_ratio_format:
-            preds_main_sum += preds_main
-            preds_ratio_sum += preds_ratio  # type: ignore[operator]
+            if preds_main_sum is None:
+                preds_main_sum = torch.zeros((N, head_num_main), dtype=torch.float32)
+                preds_ratio_sum = torch.zeros((N, head_num_ratio), dtype=torch.float32)
+            preds_main_sum += (preds_main * (w if use_weighted else 1.0))
+            preds_ratio_sum += (preds_ratio * (w if use_weighted else 1.0))  # type: ignore[operator]
         else:
-            preds_sum += preds_main
-        num_heads += 1
+            if preds_sum_legacy is None:
+                preds_sum_legacy = torch.zeros((N, head_num_main), dtype=torch.float32)
+            preds_sum_legacy += (preds_main * (w if use_weighted else 1.0))
+        weight_total += (w if use_weighted else 1.0)
+        num_heads_used += 1
 
-    if num_heads == 0:
+    if num_heads_used == 0:
         raise RuntimeError("No valid head weights found for inference.")
 
+    # Aggregate
     if is_ratio_format:
-        avg_main_gm2 = preds_main_sum / float(num_heads)  # (N,1)
-        avg_ratio_logits = preds_ratio_sum / float(num_heads)  # (N,3)
+        assert preds_main_sum is not None and preds_ratio_sum is not None
+        denom = float(weight_total if use_weighted else max(1, num_heads_used))
+        avg_main_gm2 = preds_main_sum / denom
+        avg_ratio_logits = preds_ratio_sum / denom
         # Convert main reg output (g/m^2) to grams for Dry_Total_g
         avg_main_g = avg_main_gm2 * float(area_m2)
         # Ratio distribution over (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
@@ -584,8 +753,9 @@ def main():
 
         # Build mapping from image path to full 5D components
         image_to_components: Dict[str, Dict[str, float]] = {}
+        assert rels_in_order_ref is not None
         for rel_path, t, c, d, g, gdm_val in zip(
-            rels_in_order,
+            rels_in_order_ref,
             total_g.tolist(),
             clover_g.tolist(),
             dead_g.tolist(),
@@ -600,11 +770,13 @@ def main():
                 "GDM_g": float(gdm_val),
             }
     else:
-        # Legacy 3-d head: outputs base targets in config-defined order, then derive 5D components.
-        avg_preds = (preds_sum / float(num_heads))
+        assert preds_sum_legacy is not None
+        denom = float(weight_total if use_weighted else max(1, num_heads_used))
+        avg_preds = (preds_sum_legacy / denom)
         avg_preds = (avg_preds * float(area_m2)).tolist()
+        assert rels_in_order_ref is not None
         image_to_base_preds: Dict[str, Tuple[float, ...]] = {}
-        for rel_path, vec in zip(rels_in_order, avg_preds):
+        for rel_path, vec in zip(rels_in_order_ref, avg_preds):
             image_to_base_preds[rel_path] = tuple(float(v) for v in vec)
 
         image_to_components = {}

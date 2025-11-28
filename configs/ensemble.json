@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "versions": [
+    "ratio",
+    "ratio-mlp-2560-gelu-manifold-mixup-extreme-swa",
+    "ratio-e20",
+    "ratio-epoch-10",
+    "ratio-mlp-2560-manifold-mixup-extreme-19260817"
+  ]
+}
+

@@ -1,5 +1,5 @@
-seed: 19260817
-version: ratio-mlp-2560-manifold-mixup-extreme-19260817
+seed: 42
+version: ratio-change
 data:
   root: data
   train_csv: train.csv
