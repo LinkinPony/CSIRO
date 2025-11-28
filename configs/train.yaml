@@ -1,5 +1,5 @@
-seed: 42
-version: ratio-mlp-2560-manifold-mixup
+seed: 19260817
+version: ratio-mlp-2560-manifold-mixup-extreme-19260817
 data:
   root: data
   train_csv: train.csv
@@ -102,17 +102,6 @@ model:
     dropout: 0.5
     use_output_softplus: true
 
-mc_dropout:
-  enabled: true
-  # Number of stochastic forward passes of the regression head with dropout enabled
-  # for Monte-Carlo dropout inference. When <= 1, falls back to deterministic head
-  # evaluation as in the original script.
-  num_samples: 256
-  # When true, infer_and_submit_pt.py will write an additional
-  # <submission>_mc_dropout_debug.json file with per-sample draws
-  # and mean/variance/std statistics for MC dropout predictions.
-  debug: false
-
 mtl:
   enabled: true
   tasks:
@@ -127,7 +116,7 @@ mtl:
     ndvi_dense: 0.0
 
 train_all:
-  enabled: false
+  enabled: true
 
 peft:
   enabled: true
@@ -144,7 +133,6 @@ peft:
   lora_weight_decay: 0.0
 
 loss:
-  #uw
   weighting: uw
   # Enable/disable the biomass ratio head (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
   use_ratio_head: true
@@ -173,7 +161,7 @@ scheduler:
 kfold:
   enabled: true
   k: 5
-  even_split: true
+  even_split: false
 
 trainer:
   max_epochs: 15
@@ -223,7 +211,7 @@ ndvi_dense:
     vertical_flip_prob: 0.0
 
 irish_glass_clover:
-  enabled: false
+  enabled: true
   # Root directory containing data.csv and images/ for the Irish Glass Clover dataset
   root: data/irish_glass_clover
   csv: data.csv

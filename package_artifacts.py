@@ -330,40 +330,6 @@ def main():
     train_all_cfg = cfg.get("train_all", {})
     train_all_enabled = bool(train_all_cfg.get("enabled", False))
 
-    # Special case: k-fold training with an additional train_all run
-    # -----------------------------------------------------------------
-    # The kfold runner can optionally launch a final "train_all" pass on
-    # the full dataset even when cfg.train_all.enabled is False, writing
-    # checkpoints under:
-    #   <ckpt_dir>/<version>/train_all/
-    # and logs under:
-    #   <log_dir>/<version>/train_all/
-    #
-    # When this happens and train_all is *disabled in the config*, we
-    # want package_artifacts.py to package the weights from this
-    # train_all run instead of the per-fold k-fold heads.
-    #
-    # Concretely: if the config says train_all.enabled == False but a
-    # "train_all" subdirectory exists in the checkpoint directory, we
-    # switch to treating this as a single-run export rooted at
-    #   ckpt_dir/train_all and log_dir/train_all.
-    train_all_ckpt_dir = ckpt_dir / "train_all"
-    train_all_log_dir = log_dir / "train_all"
-    if (not train_all_enabled) and train_all_ckpt_dir.is_dir():
-        # Prefer the train_all run for packaging.
-        print(
-            "[INFO] Detected 'train_all' checkpoint directory while "
-            "train_all.enabled is False in config; packaging this full-data "
-            "train_all model instead of per-fold k-fold heads."
-        )
-        ckpt_dir = train_all_ckpt_dir
-        # Restrict metrics/z_score search to the train_all log subtree when present.
-        if train_all_log_dir.is_dir():
-            log_dir = train_all_log_dir
-        # Force the logic below to take the single-run export path.
-        kfold_enabled = False
-        train_all_enabled = False
-
     select_best = bool(getattr(args, "best", False))
     use_swa = not bool(getattr(args, "no_swa", False))
 

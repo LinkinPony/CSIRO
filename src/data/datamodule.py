@@ -201,6 +201,8 @@ class PastureDataModule(LightningDataModule):
         irish_csv: Optional[str] = None,
         irish_image_dir: str = "images",
         irish_image_size: Optional[Union[int, Tuple[int, int]]] = None,
+        # Optional random seed for internal train/val split reproducibility
+        random_seed: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.data_root = data_root
@@ -216,6 +218,8 @@ class PastureDataModule(LightningDataModule):
         self.sample_area_m2 = float(sample_area_m2) if sample_area_m2 is not None else 1.0
         self._zscore_output_path: Optional[str] = str(zscore_output_path) if zscore_output_path else None
         self._log_scale_targets: bool = bool(log_scale_targets)
+        # Optional RNG seed for reproducible random splitting when predefined splits are not provided
+        self._random_seed: Optional[int] = (int(random_seed) if random_seed is not None else None)
         merged_aug = _merge_augment_cfg(augment_cfg=augment_cfg, train_scale=train_scale, hflip_prob=hflip_prob)
         self.train_tf, self.val_tf = build_aug_transforms(
             image_size=image_size, mean=mean, std=std, augment_cfg=merged_aug
@@ -288,15 +292,12 @@ class PastureDataModule(LightningDataModule):
         ndvi_series = df.groupby("image_id")["Pre_GSHH_NDVI"].first()
         species_series = df.groupby("image_id")["Species"].first()
         state_series = df.groupby("image_id")["State"].first()
-        # Sampling date per image (used for grouped k-fold splitting by date+state)
-        date_series = df.groupby("image_id")["Sampling_Date"].first()
         merged = pivot.join(image_path_series, how="inner")
         merged = (
             merged.join(height_series, how="left")
             .join(ndvi_series, how="left")
             .join(species_series, how="left")
             .join(state_series, how="left")
-            .join(date_series, how="left")
         )
         # Ensure all supervised primary targets are present
         merged = merged.dropna(subset=self.target_order)
@@ -321,7 +322,6 @@ class PastureDataModule(LightningDataModule):
             "Pre_GSHH_NDVI",
             "Species",
             "State",
-            "Sampling_Date",
             "image_path",
             "image_id",
         ]
@@ -338,7 +338,11 @@ class PastureDataModule(LightningDataModule):
             return
 
         merged = self._read_and_pivot()
-        rng = np.random.default_rng(seed=42)
+        # Use provided random seed if available; otherwise use an unseeded RNG
+        if self._random_seed is not None:
+            rng = np.random.default_rng(seed=int(self._random_seed))
+        else:
+            rng = np.random.default_rng()
         indices = np.arange(len(merged))
         rng.shuffle(indices)
         n_val = max(1, int(len(indices) * self.val_split))
