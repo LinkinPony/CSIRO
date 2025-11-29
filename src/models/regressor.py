@@ -111,6 +111,8 @@ class BiomassRegressor(LightningModule):
         head_hidden_dims: Optional[List[int]] = None,
         head_activation: str = "relu",
         use_output_softplus: bool = True,
+        # Optional patch-based main regression path (per-patch prediction then average)
+        use_patch_reg3: bool = False,
         log_scale_targets: bool = False,
         # Normalization and scaling
         area_m2: float = 1.0,
@@ -189,8 +191,15 @@ class BiomassRegressor(LightningModule):
         hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
         act_name = (head_activation or "").lower()
         layers: List[nn.Module] = []
-        # Backbone feature now returns CLS concat mean(patch) → 2 * embedding_dim
-        in_dim = embedding_dim * 2
+        # For legacy heads, the backbone feature is CLS concat mean(patch) → 2 * embedding_dim.
+        # When use_patch_reg3 is enabled, the main regression path and packed head operate
+        # directly on patch-token dimensionality (embedding_dim), and global features are
+        # reduced to this size before entering the bottleneck.
+        use_patch = bool(use_patch_reg3)
+        if use_patch:
+            in_dim = embedding_dim
+        else:
+            in_dim = embedding_dim * 2
         if dropout and dropout > 0:
             layers.append(nn.Dropout(dropout))
 
@@ -233,6 +242,16 @@ class BiomassRegressor(LightningModule):
         self.reg3_heads = nn.ModuleList(
             [nn.Linear(bottleneck_dim, 1) for _ in range(self.num_outputs)]
         )
+
+        # Whether to use per-patch regression (scheme A: only main task uses patch path).
+        # When enabled, the main reg3 prediction is obtained by:
+        #   1) Extracting CLS and patch tokens from the backbone,
+        #   2) Concatenating CLS with each patch token -> (B, N, 2C),
+        #   3) Applying shared_bottleneck + reg3_heads per patch,
+        #   4) Averaging predictions over patches to obtain a per-image output.
+        # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue
+        # to use the global CLS + mean(patch) bottleneck.
+        self.use_patch_reg3: bool = bool(use_patch_reg3)
 
         self.mtl_enabled: bool = bool(mtl_enabled)
         # Per-task toggles (gated by global MTL flag)
@@ -369,11 +388,51 @@ class BiomassRegressor(LightningModule):
             preds.append(head(z))
         return torch.cat(preds, dim=-1)
 
+    def _compute_reg3_from_images(self, images: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Compute main reg3 prediction logits (before optional Softplus) and global bottleneck
+        features from input images.
+
+        Returns:
+            pred_reg3_logits: (B, num_outputs) in normalized domain (g/m^2 or z-score)
+            z_global:         (B, bottleneck_dim) shared bottleneck from CLS+mean(patch)
+        """
+        if not self.use_patch_reg3:
+            # Legacy path: CLS concat mean(patch) -> shared_bottleneck -> reg3_heads
+            features = self.feature_extractor(images)
+            z = self.shared_bottleneck(features)
+            pred_reg3_logits = self._forward_reg3_logits(z)
+            return pred_reg3_logits, z
+
+        # Patch-based path for main regression: reuse a single backbone forward to get
+        # both CLS and patch tokens, then:
+        #   - build a global feature from patch tokens only (mean over patches),
+        #   - build per-patch features that depend only on patch tokens (Dry_Total_g path),
+        #     both using patch-token dimensionality (embedding_dim) as the bottleneck input.
+        cls_tokens, pt = self.feature_extractor.forward_cls_and_tokens(images)
+        if pt.dim() != 3:
+            raise RuntimeError(f"Unexpected patch tokens shape in patch-mode reg3: {tuple(pt.shape)}")
+        B, N, C = pt.shape
+        # Global bottleneck uses only the mean patch token (patch-only, C-dim).
+        patch_mean = pt.mean(dim=1)  # (B, C)
+        z_global = self.shared_bottleneck(patch_mean)  # (B, bottleneck_dim)
+
+        # Build per-patch features for the main regression path: each patch token (C-dim)
+        # is fed through the shared bottleneck, and predictions are averaged over patches.
+        patch_features_flat = pt.reshape(B * N, C)  # (B*N, C)
+        z_patches_flat = self.shared_bottleneck(patch_features_flat)  # (B*N, bottleneck_dim)
+        pred_patches_flat = self._forward_reg3_logits(z_patches_flat)  # (B*N, num_outputs)
+        pred_patches = pred_patches_flat.view(B, N, self.num_outputs)  # (B, N, num_outputs)
+        # Average over patches to obtain per-image logits.
+        pred_reg3_logits = pred_patches.mean(dim=1)  # (B, num_outputs)
+        return pred_reg3_logits, z_global
+
     def forward(self, images: Tensor) -> Tensor:
-        # Return main 3-d regression prediction in original grams (g)
-        features = self.feature_extractor(images)
-        z = self.shared_bottleneck(features)
-        out = self._forward_reg3_logits(z)
+        # Return main regression prediction in original grams (g).
+        # When use_patch_reg3 is enabled, this corresponds to the per-patch prediction
+        # averaged over all patches; otherwise it is the legacy CLS+mean(patch) head.
+        pred_reg3_logits, _ = self._compute_reg3_from_images(images)
+        out = pred_reg3_logits
         if self.out_softplus is not None:
             out = self.out_softplus(out)
         # Invert normalization and scaling to grams
@@ -515,8 +574,18 @@ class BiomassRegressor(LightningModule):
             except Exception:
                 pass
 
-        features = self.feature_extractor(images)
-        z = self.shared_bottleneck(features)
+        # Main regression path (reg3). When use_patch_reg3 is enabled, this returns
+        # per-patch predictions averaged over patches together with a global bottleneck
+        # feature built from CLS + mean(patch). Auxiliary heads and ratio/5D always
+        # use the global bottleneck z.
+        pred_reg3 = None
+        z = None
+        if self.use_patch_reg3:
+            pred_reg3, z = self._compute_reg3_from_images(images)
+        else:
+            features = self.feature_extractor(images)
+            z = self.shared_bottleneck(features)
+            pred_reg3 = self._forward_reg3_logits(z)
         # Apply manifold mixup on bottleneck features if chosen
         if use_mixup and self._manifold_mixup is not None and (stage == "train") and (not is_ndvi_only):
             try:
@@ -543,14 +612,13 @@ class BiomassRegressor(LightningModule):
             return {"loss": total_ndvi}
 
         # y_reg3 provided by dataset is already in normalized domain (z-score on g/m^2 when enabled)
-        y_reg3: Tensor = batch["y_reg3"]  # (B,3)
+        y_reg3: Tensor = batch["y_reg3"]  # (B, num_outputs)
         reg3_mask: Optional[Tensor] = batch.get("reg3_mask", None)
         y_height: Tensor = batch["y_height"]  # (B,1)
         y_ndvi: Tensor = batch["y_ndvi"]  # (B,1)
         y_species: Tensor = batch["y_species"]  # (B,)
         y_state: Tensor = batch["y_state"]  # (B,)
 
-        pred_reg3 = self._forward_reg3_logits(z)
         if self.out_softplus is not None:
             pred_reg3 = self.out_softplus(pred_reg3)
 

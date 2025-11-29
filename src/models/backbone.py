@@ -37,8 +37,14 @@ class DinoV3FeatureExtractor(nn.Module):
             feats = self.backbone.forward_features(images)
         return feats
 
-    def _forward_impl(self, images: Tensor) -> Tensor:
-        feats = self._forward_features_dict(images)
+    def _extract_cls_and_pt(self, feats):
+        """
+        Helper to extract CLS token and patch tokens from a forward_features-style output.
+
+        Returns:
+            cls: Tensor of shape (B, C)
+            pt:  Tensor of shape (B, N, C)
+        """
         # CLS token (B, C)
         cls = feats.get("x_norm_clstoken", None)
         if cls is None:
@@ -56,6 +62,11 @@ class DinoV3FeatureExtractor(nn.Module):
             raise RuntimeError("Backbone did not return patch tokens in forward_features output")
         if pt.dim() != 3:
             raise RuntimeError(f"Unexpected patch tokens shape: {tuple(pt.shape)}")
+        return cls, pt
+
+    def _forward_impl(self, images: Tensor) -> Tensor:
+        feats = self._forward_features_dict(images)
+        cls, pt = self._extract_cls_and_pt(feats)
         # Mean over patch tokens (B, C)
         patch_mean = pt.mean(dim=1)
         # Concatenate CLS with mean patch token -> (B, 2C)
@@ -66,6 +77,22 @@ class DinoV3FeatureExtractor(nn.Module):
             with torch.inference_mode():
                 return self._forward_impl(images)
         return self._forward_impl(images)
+
+    def forward_cls_and_tokens(self, images: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Return CLS token and patch tokens from the backbone in a single forward pass.
+
+        Returns:
+            cls: Tensor of shape (B, C)
+            pt:  Tensor of shape (B, N, C)
+        """
+        if self.inference_only:
+            with torch.inference_mode():
+                feats = self._forward_features_dict(images)
+        else:
+            feats = self._forward_features_dict(images)
+        cls, pt = self._extract_cls_and_pt(feats)
+        return cls, pt
 
     def forward_patch_tokens(self, images: Tensor) -> Tuple[Tensor, int]:
         """
@@ -82,22 +109,8 @@ class DinoV3FeatureExtractor(nn.Module):
 
     def _forward_patch_tokens_impl(self, images: Tensor) -> Tuple[Tensor, int]:
         feats = self._forward_features_dict(images)
-        # Try common keys
-        pt = None
-        for k in ("x_norm_patchtokens", "x_norm_patch_tokens", "x_patch_tokens", "x_tokens"):
-            if isinstance(feats, dict) and k in feats:
-                pt = feats[k]
-                break
-        if pt is None:
-            # Fallback: some implementations return tuple (cls, patches)
-            if isinstance(feats, (list, tuple)) and len(feats) >= 2:
-                pt = feats[1]
-        if pt is None:
-            # As last resort, try to reconstruct from a known attribute
-            raise RuntimeError("Backbone did not return patch tokens in forward_features output")
+        _, pt = self._extract_cls_and_pt(feats)
         # pt: (B, N, C)
-        if pt.dim() != 3:
-            raise RuntimeError(f"Unexpected patch tokens shape: {tuple(pt.shape)}")
         B, N, C = pt.shape
         # Assume square grid
         side = int(math.sqrt(N))

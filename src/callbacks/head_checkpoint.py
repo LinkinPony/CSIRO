@@ -58,6 +58,9 @@ class HeadCheckpoint(Callback):
             # leave any required non-linearity to the inference script, which
             # handles only the main regression output.
             use_output_softplus_eff = False
+            # Patch-mode heads use patch-token dimensionality as input (embedding_dim),
+            # whereas legacy heads expect CLS+mean(patch) with 2 * embedding_dim.
+            use_patch_reg3 = bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False
             head_module = build_head_layer(
                 embedding_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)),
                 num_outputs=head_total_outputs,
@@ -65,6 +68,7 @@ class HeadCheckpoint(Callback):
                 head_activation=str(getattr(pl_module.hparams, "head_activation", "relu")),
                 dropout=float(getattr(pl_module.hparams, "dropout", 0.0)),
                 use_output_softplus=use_output_softplus_eff,
+                input_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)) if use_patch_reg3 else None,
             )
 
             def collect_linears(m: nn.Module):
@@ -158,6 +162,9 @@ class HeadCheckpoint(Callback):
                 # used for offline inference is exported without a terminal Softplus.
                 "use_output_softplus": False,
                 "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,
+                # Whether the main regression head was trained using per-patch predictions
+                # averaged over patches (scheme A), or using a single CLS+mean(patch) feature.
+                "use_patch_reg3": bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False,
                 # Order of ratio components packed in the head (if any)
                 "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
             },

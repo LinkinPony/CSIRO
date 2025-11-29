@@ -1,5 +1,5 @@
 seed: 42
-version: ensemble-2560-colorjitter-no-hue
+version: patch-reg3-seprate_head
 data:
   root: data
   train_csv: train.csv
@@ -104,10 +104,16 @@ model:
   log_scale_targets: false
   head:
     type: mlp
-    hidden_dims: [2560]
+    hidden_dims: [1280]
     activation: relu
     dropout: 0.2
     use_output_softplus: true
+    # When enabled, use a patch-based main regression path:
+    #   - For each patch token, apply the shared MLP head (CLS concatenated with patch token),
+    #   - Average per-patch predictions to obtain the image-level output.
+    # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
+    # the global CLS + mean(patch) bottleneck.
+    use_patch_reg3: true
 
 mtl:
   enabled: true

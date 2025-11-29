@@ -37,11 +37,17 @@ def build_head_layer(
     head_activation: str = "relu",
     dropout: float = 0.0,
     use_output_softplus: bool = True,
+    input_dim: Optional[int] = None,
 ) -> nn.Sequential:
     hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
     layers: List[nn.Module] = []
-    # Feature extractor provides CLS concat mean(patch) → 2 * embedding_dim
-    in_dim = embedding_dim * 2
+    # Default assumption for legacy heads: feature extractor provides
+    # CLS concat mean(patch) → 2 * embedding_dim. When input_dim is
+    # explicitly provided (e.g., patch-only heads), it overrides this.
+    if input_dim is not None:
+        in_dim = int(input_dim)
+    else:
+        in_dim = embedding_dim * 2
     act_name = (head_activation or "").lower()
 
     if dropout and dropout > 0:

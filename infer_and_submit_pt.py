@@ -174,8 +174,7 @@ class DinoV3FeatureExtractor(nn.Module):
             p.requires_grad = False
         self.backbone.eval()
 
-    @torch.inference_mode()
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def _forward_features_dict(self, images: torch.Tensor):
         try:
             backbone_dtype = next(self.backbone.parameters()).dtype
         except StopIteration:
@@ -194,7 +193,16 @@ class DinoV3FeatureExtractor(nn.Module):
                 feats = forward_features(images)
         except Exception:
             feats = self.backbone.forward_features(images)
-        # Build CLS + mean(patch) features
+        return feats
+
+    def _extract_cls_and_pt(self, feats):
+        """
+        Helper to extract CLS token and patch tokens from a forward_features-style output.
+
+        Returns:
+            cls: Tensor of shape (B, C)
+            pt:  Tensor of shape (B, N, C)
+        """
         cls = feats.get("x_norm_clstoken", None)
         if cls is None:
             raise RuntimeError("Backbone did not return 'x_norm_clstoken' in forward_features output")
@@ -209,8 +217,31 @@ class DinoV3FeatureExtractor(nn.Module):
             raise RuntimeError("Backbone did not return patch tokens in forward_features output")
         if pt.dim() != 3:
             raise RuntimeError(f"Unexpected patch tokens shape: {tuple(pt.shape)}")
+        return cls, pt
+
+    @torch.inference_mode()
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Default forward used by legacy heads: returns CLS + mean(patch) features
+        of shape (B, 2 * C), matching the training-time feature extractor.
+        """
+        feats = self._forward_features_dict(images)
+        cls, pt = self._extract_cls_and_pt(feats)
         patch_mean = pt.mean(dim=1)
         return torch.cat([cls, patch_mean], dim=-1)
+
+    @torch.inference_mode()
+    def forward_cls_and_tokens(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return CLS token and patch tokens from the backbone in a single forward pass.
+
+        Returns:
+            cls: Tensor of shape (B, C)
+            pt:  Tensor of shape (B, N, C)
+        """
+        feats = self._forward_features_dict(images)
+        cls, pt = self._extract_cls_and_pt(feats)
+        return cls, pt
 
 
 class OfflineRegressor(nn.Module):
@@ -460,6 +491,92 @@ def predict_from_features(features_cpu: torch.Tensor, head: nn.Module, batch_siz
     return torch.cat(preds_list, dim=0) if preds_list else torch.empty((0, 0), dtype=torch.float32)
 
 
+def predict_main_and_ratio_patch_mode(
+    backbone: nn.Module,
+    head: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: int,
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+    head_num_main: int,
+    head_num_ratio: int,
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Patch-mode inference for a single head:
+      - For each image, obtain CLS and patch tokens from the DINO backbone.
+      - For each patch, apply the packed head on the patch token only (embedding_dim channels)
+        and average per-patch main outputs to obtain image-level main predictions.
+      - For ratio outputs (if present), apply the same head on the mean patch token.
+
+    Returns:
+        rels_in_order: list of image paths in dataloader order
+        preds_main:    Tensor of shape (N_images, head_num_main)
+        preds_ratio:   Tensor of shape (N_images, head_num_ratio) or None when head_num_ratio == 0
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    feature_extractor = DinoV3FeatureExtractor(backbone)
+    feature_extractor.eval().to(device)
+    head = head.eval().to(device)
+
+    rels: List[str] = []
+    preds_main_list: List[torch.Tensor] = []
+    preds_ratio_list: List[torch.Tensor] = []
+
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device, non_blocking=True)
+            cls, pt = feature_extractor.forward_cls_and_tokens(images)
+            if pt.dim() != 3:
+                raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt.shape)}")
+            B, N, C = pt.shape
+
+            if head_num_main > 0:
+                patch_features_flat = pt.reshape(B * N, C)  # (B*N, C) patch-only information
+                out_all_patch = head(patch_features_flat)  # (B*N, head_total)
+                out_main_patch = out_all_patch[:, :head_num_main]
+                out_main_patch = out_main_patch.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+            else:
+                out_main_patch = torch.empty((B, 0), dtype=torch.float32, device=device)
+
+            # --- Ratio logits (if any) from global patch-mean features ---
+            if head_num_ratio > 0:
+                patch_mean = pt.mean(dim=1)  # (B, C)
+                out_all_global = head(patch_mean)  # (B, head_total)
+                out_ratio = out_all_global[:, head_num_main : head_num_main + head_num_ratio]  # (B, head_num_ratio)
+            else:
+                out_ratio = None
+
+            preds_main_list.append(out_main_patch.detach().cpu().float())
+            if out_ratio is not None:
+                preds_ratio_list.append(out_ratio.detach().cpu().float())
+            rels.extend(list(rel_paths))
+
+    preds_main = (
+        torch.cat(preds_main_list, dim=0)
+        if preds_main_list
+        else torch.empty((0, head_num_main), dtype=torch.float32)
+    )
+    preds_ratio: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_list:
+        preds_ratio = torch.cat(preds_ratio_list, dim=0)
+    else:
+        preds_ratio = None
+    return rels, preds_main, preds_ratio
+
+
 def predict_for_images(
     model: nn.Module,
     dataset_root: str,
@@ -576,6 +693,8 @@ def main():
     head_total_outputs = int(first_meta.get("head_total_outputs", num_outputs_main + num_outputs_ratio))
     ratio_components = first_meta.get("ratio_components", [])
     is_ratio_format = num_outputs_ratio > 0 and head_total_outputs == (num_outputs_main + num_outputs_ratio)
+    # Whether this head was trained with patch-based main regression (per-patch predictions averaged).
+    use_patch_reg3 = bool(first_meta.get("use_patch_reg3", False))
 
     # Build weighted/mean ensemble by running per-head feature extraction (supports per-head LoRA)
     # Validate heads are mutually compatible
@@ -660,26 +779,7 @@ def main():
         except Exception as _e:
             print(f"[WARN] PEFT injection skipped for {head_pt}: {_e}")
 
-        feature_extractor = DinoV3FeatureExtractor(backbone)
-        # Extract features for this head (per-head features to respect its LoRA)
-        rels_in_order, features_cpu = extract_features_for_images(
-            feature_extractor=feature_extractor,
-            dataset_root=dataset_root,
-            image_paths=unique_image_paths,
-            image_size=image_size,
-            mean=mean,
-            std=std,
-            batch_size=batch_size,
-            num_workers=num_workers,
-        )
-        if rels_in_order_ref is None:
-            rels_in_order_ref = rels_in_order
-        else:
-            # Basic consistency check
-            if rels_in_order_ref != rels_in_order:
-                raise RuntimeError("Image order mismatch across heads; aborting.")
-
-        # Build head module according to its own meta
+        # Build head module according to its own meta (packed main + optional ratio outputs)
         head_module = build_head_layer(
             embedding_dim=head_embedding_dim,
             num_outputs=head_total if is_ratio_format else head_num_main,
@@ -687,16 +787,56 @@ def main():
             head_activation=head_activation,
             dropout=head_dropout,
             use_output_softplus=False,
+            # For patch-mode heads, the packed MLP expects patch-token dimensionality
+            # (embedding_dim) as input. Legacy heads default to CLS+mean(patch) with
+            # 2 * embedding_dim and therefore do not override input_dim.
+            input_dim=head_embedding_dim if use_patch_reg3 else None,
         )
         head_module.load_state_dict(state, strict=True)
-        preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
 
-        if is_ratio_format:
-            preds_main = preds_all[:, :head_num_main]
-            preds_ratio = preds_all[:, head_num_main : head_num_main + head_num_ratio]
+        if use_patch_reg3:
+            # Patch-based main regression: compute per-patch predictions and average,
+            # while ratio logits (if any) are computed from CLS + mean(patch) features.
+            rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_patch_mode(
+                backbone=backbone,
+                head=head_module,
+                dataset_root=dataset_root,
+                image_paths=unique_image_paths,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                head_num_main=head_num_main,
+                head_num_ratio=head_num_ratio if is_ratio_format else 0,
+            )
         else:
-            preds_main = preds_all
-            preds_ratio = None
+            feature_extractor = DinoV3FeatureExtractor(backbone)
+            # Extract CLS + mean(patch) features for this head (per-head features to respect its LoRA)
+            rels_in_order, features_cpu = extract_features_for_images(
+                feature_extractor=feature_extractor,
+                dataset_root=dataset_root,
+                image_paths=unique_image_paths,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+                batch_size=batch_size,
+                num_workers=num_workers,
+            )
+            preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
+            if is_ratio_format:
+                preds_main = preds_all[:, :head_num_main]
+                preds_ratio = preds_all[:, head_num_main : head_num_main + head_num_ratio]
+            else:
+                preds_main = preds_all
+                preds_ratio = None
+
+        if rels_in_order_ref is None:
+            rels_in_order_ref = rels_in_order
+        else:
+            # Basic consistency check
+            if rels_in_order_ref != rels_in_order:
+                raise RuntimeError("Image order mismatch across heads; aborting.")
 
         # Per-head normalization inversion (main outputs only)
         # Decide log-scale for main reg3 outputs
