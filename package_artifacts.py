@@ -41,6 +41,52 @@ def load_cfg(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _find_config_snapshot_for_version(
+    base_cfg: dict,
+    repo_root: Path,
+    version: str,
+) -> Path | None:
+    """
+    Locate a snapshot of the training config for a given version.
+    Priority:
+      1) outputs/<version>/train.yaml
+      2) outputs/<version>/fold_0/train.yaml   (train_all or special cases)
+    Falls back to None if not found.
+    """
+    base_log_dir = Path(base_cfg["logging"]["log_dir"]).expanduser()
+    # Root version log dir (without train_all folding)
+    v_root = base_log_dir / version if version else base_log_dir
+    cand1 = v_root / "train.yaml"
+    if cand1.is_file():
+        return cand1
+    cand2 = v_root / "fold_0" / "train.yaml"
+    if cand2.is_file():
+        return cand2
+    return None
+
+
+def _copy_snapshot_into_weights(
+    snapshot_path: Path | None,
+    repo_root: Path,
+    weights_dir: Path,
+) -> None:
+    """
+    Copy config snapshot into weights/configs/train.yaml, overriding the repo copy.
+    If snapshot_path is None or missing, leave the repo copy as-is.
+    """
+    try:
+        dst_cfg_dir = weights_dir / "configs"
+        dst_cfg_dir.mkdir(parents=True, exist_ok=True)
+        if snapshot_path is not None and snapshot_path.is_file():
+            import shutil as _shutil
+
+            dst_cfg_path = dst_cfg_dir / "train.yaml"
+            _shutil.copyfile(str(snapshot_path), str(dst_cfg_path))
+            print(f"[CFG] Using snapshot config for inference: {snapshot_path} -> {dst_cfg_path}")
+    except Exception as e:
+        print(f"[CFG] Failed to copy config snapshot into weights/: {e}")
+
+
 def load_ensemble_cfg(repo_root: Path) -> dict:
     """
     Read configs/ensemble.json if present. Returns dict with at least:
@@ -364,6 +410,9 @@ def main():
         use_swa = not bool(getattr(args, "no_swa", False))
 
         packaged_head_rel_paths: list[str] = []
+        # Track a canonical version for config snapshot (first in list)
+        canonical_ver: str = versions[0]
+        canonical_snapshot: Path | None = _find_config_snapshot_for_version(cfg, repo_root, canonical_ver)
         for ver in versions:
             # Resolve per-version dirs without mutating base cfg
             tmp_cfg = dict(cfg or {})
@@ -548,6 +597,8 @@ def main():
 
         # Copy configs and src into weights/
         copy_tree(repo_root / "configs", weights_dir / "configs")
+        # Override configs/train.yaml with snapshot from canonical version if available
+        _copy_snapshot_into_weights(canonical_snapshot, repo_root, weights_dir)
         copy_tree(repo_root / "src", weights_dir / "src")
         copy_optional_third_party(repo_root, weights_dir)
         scripts_copied = copy_top_level_scripts(repo_root, weights_dir)
@@ -770,6 +821,11 @@ def main():
 
     # Copy configs and src into weights/
     copy_tree(repo_root / "configs", weights_dir / "configs")
+    # For single-version packaging, prefer snapshot from this cfg.version if available
+    snapshot_ver = cfg.get("version", None)
+    snapshot_ver = None if snapshot_ver in (None, "", "null") else str(snapshot_ver)
+    snapshot_path = _find_config_snapshot_for_version(cfg, repo_root, snapshot_ver) if snapshot_ver else None
+    _copy_snapshot_into_weights(snapshot_path, repo_root, weights_dir)
     copy_tree(repo_root / "src", weights_dir / "src")
     copy_optional_third_party(repo_root, weights_dir)
     scripts_copied = copy_top_level_scripts(repo_root, weights_dir)

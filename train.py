@@ -53,6 +53,17 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Snapshot training config into log_dir for reproducible packaging/inference ---
+    try:
+        import shutil as _shutil
+
+        snapshot_path = log_dir / "train.yaml"
+        # Always overwrite to reflect the exact config used for this run
+        _shutil.copyfile(str(args.config), str(snapshot_path))
+    except Exception as e:
+        # Do not fail training if snapshotting fails; just warn.
+        print(f"[WARN] Failed to snapshot training config to {log_dir}/train.yaml: {e}")
+
     init_logging(log_dir, use_loguru=cfg["logging"].get("use_loguru", True))
     logger.info("Loaded config from {}", args.config)
 

@@ -1,5 +1,5 @@
 seed: 42
-version: ratio-change
+version: ensemble-2560-colorjitter-no-hue
 data:
   root: data
   train_csv: train.csv
@@ -23,6 +23,13 @@ data:
   augment:
     random_resized_crop_scale: [0.8, 1.0]
     horizontal_flip_prob: 0.5
+    color_jitter:
+      enabled: true
+      prob: 0.8
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      hue: 0.00
     vertical_flip:
       enabled: true
       prob: 0.5
@@ -99,7 +106,7 @@ model:
     type: mlp
     hidden_dims: [2560]
     activation: relu
-    dropout: 0.5
+    dropout: 0.2
     use_output_softplus: true
 
 mtl:

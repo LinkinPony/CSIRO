@@ -211,6 +211,44 @@ class RandomLightSpot:
         return composite.convert("RGB")
 
 
+def _maybe_add_color_jitter(cfg: Dict[str, Any], transforms_list: List[Any]) -> None:
+    """
+    Optionally add ColorJitter based on config.
+
+    Expected config structure under `data.augment`:
+
+    color_jitter:
+      enabled: true
+      prob: 0.8
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.02
+    """
+    cj_cfg: Dict[str, Any] = dict(cfg.get("color_jitter", {}))
+    if not bool(cj_cfg.get("enabled", False)):
+        return
+
+    p = float(cj_cfg.get("prob", 0.8))
+    brightness = cj_cfg.get("brightness", 0.0)
+    contrast = cj_cfg.get("contrast", 0.0)
+    saturation = cj_cfg.get("saturation", 0.0)
+    hue = cj_cfg.get("hue", 0.0)
+
+    # If all parameters are zero/None, skip to avoid a no-op transform.
+    if not any(x for x in [brightness, contrast, saturation, hue]):
+        return
+
+    jitter = T.ColorJitter(
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        hue=hue,
+    )
+    # Apply with probability p on PIL images before ToTensor.
+    transforms_list.append(T.RandomApply([jitter], p=p))
+
+
 def _maybe_add_affine(cfg: Dict[str, Any], transforms_list: List[Any]) -> None:
     affine_cfg: Dict[str, Any] = dict(cfg.get("random_affine", {}))
     if not bool(affine_cfg.get("enabled", False)):
@@ -327,6 +365,7 @@ def build_train_transform(
 
     _maybe_add_vertical_flip(cfg, pre_tensor)
     _maybe_add_affine(cfg, pre_tensor)
+    _maybe_add_color_jitter(cfg, pre_tensor)
     _maybe_add_visual_overlays(cfg, pre_tensor)
 
     # 2) Convert to tensor for tensor-domain ops

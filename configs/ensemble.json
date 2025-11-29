@@ -1,11 +1,11 @@
 {
-  "enabled": true,
+  "enabled": false,
   "versions": [
-    "ratio",
-    "ratio-mlp-2560-gelu-manifold-mixup-extreme-swa",
-    "ratio-e20",
-    "ratio-epoch-10",
-    "ratio-mlp-2560-manifold-mixup-extreme-19260817"
+    "ensemble-640-colorjitter",
+    "ensemble-1280-colorjitter",
+    "ensemble-640-slight-aug",
+    "ensemble-1280-slight-aug",
+    "ensemble-2560-slight-aug"
   ]
 }
 
