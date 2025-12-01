@@ -688,25 +688,23 @@ def main():
     first_state, first_meta, _ = load_head_state(head_weight_paths[0])
     if not isinstance(first_meta, dict):
         first_meta = {}
-    num_outputs_main = int(first_meta.get("num_outputs_main", first_meta.get("num_outputs", 3)))
-    num_outputs_ratio = int(first_meta.get("num_outputs_ratio", 0))
-    head_total_outputs = int(first_meta.get("head_total_outputs", num_outputs_main + num_outputs_ratio))
-    ratio_components = first_meta.get("ratio_components", [])
-    is_ratio_format = num_outputs_ratio > 0 and head_total_outputs == (num_outputs_main + num_outputs_ratio)
-    # Whether this head was trained with patch-based main regression (per-patch predictions averaged).
-    use_patch_reg3 = bool(first_meta.get("use_patch_reg3", False))
+    # Default head shape (fallback when individual head meta is missing)
+    num_outputs_main_default = int(first_meta.get("num_outputs_main", first_meta.get("num_outputs", 3)))
+    num_outputs_ratio_default = int(first_meta.get("num_outputs_ratio", 0))
+    head_total_outputs_default = int(first_meta.get("head_total_outputs", num_outputs_main_default + num_outputs_ratio_default))
+    ratio_components_default = first_meta.get("ratio_components", [])
+    use_patch_reg3_default = bool(first_meta.get("use_patch_reg3", False))
 
-    # Build weighted/mean ensemble by running per-head feature extraction (supports per-head LoRA)
-    # Validate heads are mutually compatible
-    # Reference embedding/backbone from config for sanity checks
+    # Build weighted/mean ensemble by running per-head feature extraction (supports per-head LoRA).
+    # Only require that all heads share the same embedding_dim (backbone choice); ratio/patch
+    # settings are handled independently per head.
     cfg_embedding_dim = int(cfg["model"]["embedding_dim"])
 
-    # Accumulators will be allocated after first head to know N
+    # Reference image order and per-image accumulators of 5D components:
+    # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
     rels_in_order_ref: Optional[List[str]] = None
-    preds_main_sum: Optional[torch.Tensor] = None
-    preds_ratio_sum: Optional[torch.Tensor] = None
-    preds_sum_legacy: Optional[torch.Tensor] = None
-    weight_total: float = 0.0
+    image_to_sum: Dict[str, torch.Tensor] = {}
+    image_to_weight: Dict[str, float] = {}
     num_heads_used: int = 0
 
     # Preload DINO backbone state (reused per-head)
@@ -714,19 +712,7 @@ def main():
     if isinstance(dino_state, dict) and "state_dict" in dino_state:
         dino_state = dino_state["state_dict"]
 
-    # Ensure all heads agree on ratio format
-    for head_pt in head_weight_paths:
-        _, meta_chk, _ = load_head_state(head_pt)
-        if not isinstance(meta_chk, dict):
-            meta_chk = {}
-        n_main = int(meta_chk.get("num_outputs_main", meta_chk.get("num_outputs", 3)))
-        n_ratio = int(meta_chk.get("num_outputs_ratio", 0))
-        total = int(meta_chk.get("head_total_outputs", n_main + n_ratio))
-        is_ratio_this = n_ratio > 0 and total == (n_main + n_ratio)
-        if is_ratio_this != is_ratio_format:
-            raise RuntimeError(f"Head format mismatch: {head_pt} ratio_format={is_ratio_this} != first_head={is_ratio_format}")
-
-    # Run per-head
+    # Run per-head (each head can independently choose ratio/patch configuration)
     for head_pt in head_weight_paths:
         w = float(weight_map.get(head_pt, 1.0))
         # Load head state and meta
@@ -735,8 +721,8 @@ def main():
             meta = {}
 
         # Use meta to build head architecture (do not rely on YAML defaults)
-        head_num_main = int(meta.get("num_outputs_main", meta.get("num_outputs", num_outputs_main)))
-        head_num_ratio = int(meta.get("num_outputs_ratio", num_outputs_ratio))
+        head_num_main = int(meta.get("num_outputs_main", meta.get("num_outputs", num_outputs_main_default)))
+        head_num_ratio = int(meta.get("num_outputs_ratio", num_outputs_ratio_default))
         head_total = int(meta.get("head_total_outputs", head_num_main + head_num_ratio))
         head_hidden_dims = list(meta.get("head_hidden_dims", first_meta.get("head_hidden_dims", list(cfg["model"]["head"].get("hidden_dims", [512, 256])))))
         head_activation = str(meta.get("head_activation", first_meta.get("head_activation", str(cfg["model"]["head"].get("activation", "relu")))))
@@ -780,9 +766,13 @@ def main():
             print(f"[WARN] PEFT injection skipped for {head_pt}: {_e}")
 
         # Build head module according to its own meta (packed main + optional ratio outputs)
+        # Determine whether this specific head was trained with patch-based main regression.
+        use_patch_reg3_head = bool(meta.get("use_patch_reg3", use_patch_reg3_default))
+        # Determine whether this head uses the ratio format.
+        head_is_ratio = bool(head_num_ratio > 0 and head_total == (head_num_main + head_num_ratio))
         head_module = build_head_layer(
             embedding_dim=head_embedding_dim,
-            num_outputs=head_total if is_ratio_format else head_num_main,
+            num_outputs=head_total if head_is_ratio else head_num_main,
             head_hidden_dims=head_hidden_dims,
             head_activation=head_activation,
             dropout=head_dropout,
@@ -790,13 +780,13 @@ def main():
             # For patch-mode heads, the packed MLP expects patch-token dimensionality
             # (embedding_dim) as input. Legacy heads default to CLS+mean(patch) with
             # 2 * embedding_dim and therefore do not override input_dim.
-            input_dim=head_embedding_dim if use_patch_reg3 else None,
+            input_dim=head_embedding_dim if use_patch_reg3_head else None,
         )
         head_module.load_state_dict(state, strict=True)
 
-        if use_patch_reg3:
+        if use_patch_reg3_head:
             # Patch-based main regression: compute per-patch predictions and average,
-            # while ratio logits (if any) are computed from CLS + mean(patch) features.
+            # while ratio logits (if any) are computed from patch-mean features.
             rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_patch_mode(
                 backbone=backbone,
                 head=head_module,
@@ -808,7 +798,7 @@ def main():
                 batch_size=batch_size,
                 num_workers=num_workers,
                 head_num_main=head_num_main,
-                head_num_ratio=head_num_ratio if is_ratio_format else 0,
+                head_num_ratio=head_num_ratio if head_is_ratio else 0,
             )
         else:
             feature_extractor = DinoV3FeatureExtractor(backbone)
@@ -824,7 +814,7 @@ def main():
                 num_workers=num_workers,
             )
             preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
-            if is_ratio_format:
+            if head_is_ratio:
                 preds_main = preds_all[:, :head_num_main]
                 preds_ratio = preds_all[:, head_num_main : head_num_main + head_num_ratio]
             else:
@@ -857,100 +847,88 @@ def main():
         if log_scale_meta:
             preds_main = torch.expm1(preds_main).clamp_min(0.0)
 
-        # Allocate accumulators lazily
-        N = preds_main.shape[0]
-        if is_ratio_format:
-            if preds_main_sum is None:
-                preds_main_sum = torch.zeros((N, head_num_main), dtype=torch.float32)
-                preds_ratio_sum = torch.zeros((N, head_num_ratio), dtype=torch.float32)
-            preds_main_sum += (preds_main * (w if use_weighted else 1.0))
-            preds_ratio_sum += (preds_ratio * (w if use_weighted else 1.0))  # type: ignore[operator]
+        # Convert main predictions from g/m^2 to grams for this head
+        preds_main_g = preds_main * float(area_m2)  # (N, head_num_main)
+
+        # Build this head's 5D components in grams:
+        # order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
+        N = preds_main_g.shape[0]
+        if head_is_ratio and preds_ratio is not None and head_num_main >= 1 and head_num_ratio >= 1:
+            # Ratio-format head: main_g (Dry_Total_g) + ratio logits for 3 components.
+            total_g = preds_main_g[:, 0].view(N)  # (N,)
+            p_ratio = F.softmax(preds_ratio, dim=-1)  # (N, head_num_ratio)
+            zeros = torch.zeros_like(total_g)
+            comp_clover = (total_g * p_ratio[:, 0]) if head_num_ratio > 0 else zeros
+            comp_dead = (total_g * p_ratio[:, 1]) if head_num_ratio > 1 else zeros
+            comp_green = (total_g * p_ratio[:, 2]) if head_num_ratio > 2 else zeros
+            comp_gdm = comp_clover + comp_green
+            comps_5d = torch.stack(
+                [comp_clover, comp_dead, comp_green, comp_gdm, total_g],
+                dim=-1,
+            )  # (N, 5)
         else:
-            if preds_sum_legacy is None:
-                preds_sum_legacy = torch.zeros((N, head_num_main), dtype=torch.float32)
-            preds_sum_legacy += (preds_main * (w if use_weighted else 1.0))
-        weight_total += (w if use_weighted else 1.0)
+            # Legacy-format head: directly predict base targets (e.g., Dry_Total_g or 3D components).
+            comps_list: List[torch.Tensor] = []
+            for idx_row in range(N):
+                base_map: Dict[str, float] = {}
+                vec_row = preds_main_g[idx_row].tolist()
+                # Map available outputs onto target_bases
+                for k, name in enumerate(target_bases):
+                    if k < len(vec_row):
+                        base_map[name] = float(vec_row[k])
+                total = base_map.get("Dry_Total_g", None)
+                clover = base_map.get("Dry_Clover_g", None)
+                dead = base_map.get("Dry_Dead_g", None)
+                green = base_map.get("Dry_Green_g", None)
+                if total is None:
+                    total = (clover or 0.0) + (dead or 0.0) + (green or 0.0)
+                if dead is None and total is not None and clover is not None and green is not None:
+                    dead = total - clover - green
+                if clover is None:
+                    clover = 0.0
+                if dead is None:
+                    dead = 0.0
+                if green is None:
+                    green = 0.0
+                gdm_val = clover + green
+                comps_list.append(
+                    torch.tensor(
+                        [clover, dead, green, gdm_val, total],
+                        dtype=torch.float32,
+                    )
+                )
+            comps_5d = torch.stack(comps_list, dim=0) if comps_list else torch.zeros((0, 5), dtype=torch.float32)
+
+        # Accumulate this head's 5D components into global ensemble sums.
+        w_eff = float(w if use_weighted else 1.0)
+        for idx_row, rel in enumerate(rels_in_order):
+            comp_vec = comps_5d[idx_row]
+            if rel not in image_to_sum:
+                image_to_sum[rel] = torch.zeros(5, dtype=torch.float32)
+                image_to_weight[rel] = 0.0
+            image_to_sum[rel] += (comp_vec * w_eff)
+            image_to_weight[rel] += w_eff
+
         num_heads_used += 1
 
     if num_heads_used == 0:
         raise RuntimeError("No valid head weights found for inference.")
 
-    # Aggregate
-    if is_ratio_format:
-        assert preds_main_sum is not None and preds_ratio_sum is not None
-        denom = float(weight_total if use_weighted else max(1, num_heads_used))
-        avg_main_gm2 = preds_main_sum / denom
-        avg_ratio_logits = preds_ratio_sum / denom
-        # Convert main reg output (g/m^2) to grams for Dry_Total_g
-        avg_main_g = avg_main_gm2 * float(area_m2)
-        # Ratio distribution over (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
-        p_ratio = F.softmax(avg_ratio_logits, dim=-1)
-        total_g = avg_main_g.squeeze(-1)
-        clover_g = total_g * p_ratio[:, 0]
-        dead_g = total_g * p_ratio[:, 1]
-        green_g = total_g * p_ratio[:, 2]
-        gdm_g = clover_g + green_g
-
-        # Build mapping from image path to full 5D components
-        image_to_components: Dict[str, Dict[str, float]] = {}
-        assert rels_in_order_ref is not None
-        for rel_path, t, c, d, g, gdm_val in zip(
-            rels_in_order_ref,
-            total_g.tolist(),
-            clover_g.tolist(),
-            dead_g.tolist(),
-            green_g.tolist(),
-            gdm_g.tolist(),
-        ):
-            image_to_components[rel_path] = {
-                "Dry_Total_g": float(t),
-                "Dry_Clover_g": float(c),
-                "Dry_Dead_g": float(d),
-                "Dry_Green_g": float(g),
-                "GDM_g": float(gdm_val),
-            }
-    else:
-        assert preds_sum_legacy is not None
-        denom = float(weight_total if use_weighted else max(1, num_heads_used))
-        avg_preds = (preds_sum_legacy / denom)
-        avg_preds = (avg_preds * float(area_m2)).tolist()
-        assert rels_in_order_ref is not None
-        image_to_base_preds: Dict[str, Tuple[float, ...]] = {}
-        for rel_path, vec in zip(rels_in_order_ref, avg_preds):
-            image_to_base_preds[rel_path] = tuple(float(v) for v in vec)
-
-        image_to_components = {}
-        for rel_path, vec in image_to_base_preds.items():
-            base_map: Dict[str, float] = {}
-            try:
-                for idx, name in enumerate(target_bases):
-                    base_map[name] = vec[idx]
-            except Exception:
-                base_map = {}
-            # Derive full 5D components from base_map using legacy rules
-            total = base_map.get("Dry_Total_g", None)
-            clover = base_map.get("Dry_Clover_g", None)
-            dead = base_map.get("Dry_Dead_g", None)
-            green = base_map.get("Dry_Green_g", None)
-            if total is None:
-                # Fallback: infer Dry_Total_g if not directly predicted
-                total = (clover or 0.0) + (dead or 0.0) + (green or 0.0)
-            if dead is None and total is not None and clover is not None and green is not None:
-                dead = total - clover - green
-            if clover is None:
-                clover = 0.0
-            if dead is None:
-                dead = 0.0
-            if green is None:
-                green = 0.0
-            gdm_val = clover + green
-            image_to_components[rel_path] = {
-                "Dry_Total_g": float(total),
-                "Dry_Clover_g": float(clover),
-                "Dry_Dead_g": float(dead),
-                "Dry_Green_g": float(green),
-                "GDM_g": float(gdm_val),
-            }
+    # Aggregate per-image 5D components across heads.
+    image_to_components: Dict[str, Dict[str, float]] = {}
+    for rel_path, sum_vec in image_to_sum.items():
+        denom = float(image_to_weight.get(rel_path, 0.0))
+        if denom <= 0.0:
+            continue
+        avg_vec = (sum_vec / denom).tolist()
+        clover_g, dead_g, green_g, gdm_g, total_g = avg_vec
+        image_to_components[rel_path] = {
+            "Dry_Total_g": float(total_g),
+            "Dry_Clover_g": float(clover_g),
+            "Dry_Dead_g": float(dead_g),
+            "Dry_Green_g": float(green_g),
+            "GDM_g": float(gdm_g),
+        }
 
     # Build submission
     rows = []

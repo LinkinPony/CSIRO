@@ -1,11 +1,10 @@
 {
   "enabled": false,
   "versions": [
-    "ensemble-640-colorjitter",
-    "ensemble-1280-colorjitter",
-    "ensemble-640-slight-aug",
-    "ensemble-1280-slight-aug",
-    "ensemble-2560-slight-aug"
+    "patch-reg3-seprate_head",
+    "patch-reg3-seprate_head-repeat",
+    "ratio",
+    "ratio-mlp-2560-manifold-mixup-extreme"
   ]
 }
 

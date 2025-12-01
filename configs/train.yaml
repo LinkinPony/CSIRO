@@ -1,5 +1,5 @@
 seed: 42
-version: patch-reg3-seprate_head
+version: patch-reg3-1280-change-size
 data:
   root: data
   train_csv: train.csv
@@ -9,7 +9,7 @@ data:
     csiro:
       width_m: 0.7
       length_m: 0.3
-  image_size: [960, 480]
+  image_size: [1120, 480]
   batch_size: 1
   val_batch_size: 1
   num_workers: 20
@@ -231,4 +231,4 @@ irish_glass_clover:
   image_dir: images
   # Separate image size for this dataset (H, W). Augmentation config is reused from `data.augment`.
   # You can adjust this to match the native resolution of the Irish images.
-  image_size: [640, 640]
+  image_size: [800, 800]
