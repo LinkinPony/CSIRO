@@ -1,5 +1,5 @@
 seed: 42
-version: patch-reg3-1280-change-size
+version: multilayer-patch-7-15-23-31
 data:
   root: data
   train_csv: train.csv
@@ -114,6 +114,14 @@ model:
     # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
     # the global CLS + mean(patch) bottleneck.
     use_patch_reg3: true
+  # Optional: use multiple backbone layers with shared bottleneck and
+  # layer-specific heads whose predictions are averaged across layers.
+  # When disabled, the model falls back to using only the last layer features.
+  backbone_layers:
+    enabled: true
+    # Indices refer to DINOv3 transformer blocks (0-based). For dinov3_vith16plus
+    # the depth is 32, so valid indices are in [0, 31]. Example: use the last 4 layers.
+    indices: [7, 15, 23, 31]
 
 mtl:
   enabled: true

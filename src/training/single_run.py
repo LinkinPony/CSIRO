@@ -275,6 +275,11 @@ def train_single_split(
         )
     )
 
+    # Multi-layer backbone / layer-wise head configuration (optional)
+    backbone_layers_cfg = cfg["model"].get("backbone_layers", {}) if isinstance(cfg.get("model", {}), dict) else {}
+    use_layerwise_heads = bool(backbone_layers_cfg.get("enabled", False))
+    backbone_layer_indices = backbone_layers_cfg.get("indices", None)
+
     model = BiomassRegressor(
         backbone_name=str(cfg["model"]["backbone"]),
         embedding_dim=int(cfg["model"]["embedding_dim"]),
@@ -360,6 +365,9 @@ def train_single_split(
         enable_5d_loss=loss_5d_enabled,
         loss_5d_weight=mse_5d_weight,
         biomass_5d_weights=mse_5d_weights_per_target,
+        # Multi-layer heads
+        use_layerwise_heads=use_layerwise_heads,
+        backbone_layer_indices=list(backbone_layer_indices) if isinstance(backbone_layer_indices, (list, tuple)) else None,
     )
 
     head_ckpt_dir = ckpt_dir / "head"

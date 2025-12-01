@@ -11,6 +11,7 @@ from loguru import logger
 from .backbone import build_feature_extractor
 from .peft_integration import inject_lora_into_feature_extractor, get_lora_param_list
 from .head_builder import build_head_layer, SwiGLU
+from .layer_utils import average_layerwise_predictions, normalize_layer_indices
 from src.training.cutmix import CutMixBatchAugment
 
 
@@ -156,6 +157,9 @@ class BiomassRegressor(LightningModule):
         enable_5d_loss: bool = True,
         loss_5d_weight: float = 1.0,
         biomass_5d_weights: Optional[List[float]] = None,
+        # Multi-layer backbone features / layer-wise heads
+        use_layerwise_heads: bool = False,
+        backbone_layer_indices: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -252,6 +256,18 @@ class BiomassRegressor(LightningModule):
         # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue
         # to use the global CLS + mean(patch) bottleneck.
         self.use_patch_reg3: bool = bool(use_patch_reg3)
+
+        # --- Multi-layer backbone configuration ---
+        self.use_layerwise_heads: bool = bool(use_layerwise_heads)
+        if self.use_layerwise_heads:
+            indices = normalize_layer_indices(backbone_layer_indices or [])
+            if len(indices) == 0:
+                raise ValueError("When use_layerwise_heads is True, backbone_layer_indices must be non-empty.")
+            self.backbone_layer_indices: List[int] = indices
+            self.num_layers: int = len(indices)
+        else:
+            self.backbone_layer_indices = []
+            self.num_layers = 0
 
         self.mtl_enabled: bool = bool(mtl_enabled)
         # Per-task toggles (gated by global MTL flag)
@@ -378,15 +394,66 @@ class BiomassRegressor(LightningModule):
         # --- Manifold mixup on bottleneck representation ---
         self._manifold_mixup = ManifoldMixup.from_cfg(manifold_mixup_cfg)
 
-    def _forward_reg3_logits(self, z: Tensor) -> Tensor:
+        # --- Layer-wise heads per backbone layer (optional) ---
+        # These heads share the same shared_bottleneck but have independent final linear layers.
+        if self.use_layerwise_heads:
+            L = self.num_layers
+            # Main reg3 heads: [L][num_outputs] scalar heads
+            self.layer_reg3_heads = nn.ModuleList(
+                nn.ModuleList([nn.Linear(bottleneck_dim, 1) for _ in range(self.num_outputs)])
+                for _ in range(L)
+            )
+            # Ratio heads (if enabled): one per layer
+            if self.enable_ratio_head:
+                self.layer_ratio_heads = nn.ModuleList(
+                    nn.Linear(bottleneck_dim, self.num_ratio_outputs) for _ in range(L)
+                )
+            else:
+                self.layer_ratio_heads = None  # type: ignore[assignment]
+            # Auxiliary tasks
+            self.layer_height_heads = (
+                nn.ModuleList(nn.Linear(bottleneck_dim, 1) for _ in range(L))
+                if self.enable_height
+                else None  # type: ignore[assignment]
+            )
+            self.layer_ndvi_heads = (
+                nn.ModuleList(nn.Linear(bottleneck_dim, 1) for _ in range(L))
+                if self.enable_ndvi
+                else None  # type: ignore[assignment]
+            )
+            self.layer_species_heads = (
+                nn.ModuleList(nn.Linear(bottleneck_dim, self.num_species_classes) for _ in range(L))
+                if self.enable_species and self.num_species_classes > 0
+                else None  # type: ignore[assignment]
+            )
+            self.layer_state_heads = (
+                nn.ModuleList(nn.Linear(bottleneck_dim, self.num_state_classes) for _ in range(L))
+                if self.enable_state and self.num_state_classes > 0
+                else None  # type: ignore[assignment]
+            )
+        else:
+            self.layer_reg3_heads = None  # type: ignore[assignment]
+            self.layer_ratio_heads = None  # type: ignore[assignment]
+            self.layer_height_heads = None  # type: ignore[assignment]
+            self.layer_ndvi_heads = None  # type: ignore[assignment]
+            self.layer_species_heads = None  # type: ignore[assignment]
+            self.layer_state_heads = None  # type: ignore[assignment]
+
+    def _forward_reg3_logits_for_heads(self, z: Tensor, heads: List[nn.Linear]) -> Tensor:
         """
         Compute main reg3 prediction in normalized domain (g/m^2 or z-score),
         by aggregating three independent scalar heads into a (B, num_outputs) tensor.
         """
         preds: List[Tensor] = []
-        for head in self.reg3_heads:
+        for head in heads:
             preds.append(head(z))
         return torch.cat(preds, dim=-1)
+
+    def _forward_reg3_logits(self, z: Tensor) -> Tensor:
+        """
+        Convenience wrapper for single set of reg3 heads (no layer-wise structure).
+        """
+        return self._forward_reg3_logits_for_heads(z, list(self.reg3_heads))
 
     def _compute_reg3_from_images(self, images: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -427,11 +494,85 @@ class BiomassRegressor(LightningModule):
         pred_reg3_logits = pred_patches.mean(dim=1)  # (B, num_outputs)
         return pred_reg3_logits, z_global
 
+    def _compute_reg3_and_z_multilayer(
+        self,
+        images: Tensor,
+    ) -> Tuple[Tensor, Tensor, List[Tensor]]:
+        """
+        Multi-layer main regression path:
+          - For each selected backbone layer, build a bottleneck feature z_l,
+          - Apply a layer-specific reg3 head on z_l (or per-patch z_l when use_patch_reg3 is enabled),
+          - Average predictions and bottleneck features over layers.
+
+        Returns:
+            pred_reg3_logits: (B, num_outputs) averaged over layers
+            z_global:         (B, bottleneck_dim) averaged bottleneck over layers
+            z_layers:         list of (B, bottleneck_dim) per-layer bottlenecks
+        """
+        if not self.use_layerwise_heads:
+            raise RuntimeError("_compute_reg3_and_z_multilayer called but use_layerwise_heads is False")
+        if len(self.backbone_layer_indices) == 0:
+            raise RuntimeError("backbone_layer_indices is empty in multi-layer path")
+
+        # Obtain CLS and patch tokens for all requested layers in a single backbone forward.
+        cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
+            images, self.backbone_layer_indices
+        )
+        if len(cls_list) != len(pt_list):
+            raise RuntimeError("Mismatch between CLS and patch token lists in multi-layer path")
+
+        z_layers: List[Tensor] = []
+        pred_layers: List[Tensor] = []
+
+        if not self.use_patch_reg3:
+            # CLS + mean(patch) per layer
+            for layer_idx, (cls, pt) in enumerate(zip(cls_list, pt_list)):
+                if pt.dim() != 3:
+                    raise RuntimeError(f"Unexpected patch tokens shape in multi-layer reg3: {tuple(pt.shape)}")
+                patch_mean = pt.mean(dim=1)  # (B, C)
+                feats = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
+                z_l = self.shared_bottleneck(feats)  # (B, bottleneck_dim)
+                z_layers.append(z_l)
+                # Select layer-specific reg3 heads if available; otherwise fall back to shared heads.
+                if self.layer_reg3_heads is not None:
+                    heads_l = list(self.layer_reg3_heads[layer_idx])
+                else:
+                    heads_l = list(self.reg3_heads)
+                pred_l = self._forward_reg3_logits_for_heads(z_l, heads_l)  # (B, num_outputs)
+                pred_layers.append(pred_l)
+        else:
+            # Patch-based reg3 per layer: per-patch predictions then averaged, then averaged over layers.
+            for layer_idx, (cls, pt) in enumerate(zip(cls_list, pt_list)):
+                if pt.dim() != 3:
+                    raise RuntimeError(f"Unexpected patch tokens shape in multi-layer patch-mode reg3: {tuple(pt.shape)}")
+                B, N, C = pt.shape
+                patch_mean = pt.mean(dim=1)  # (B, C)
+                z_global_l = self.shared_bottleneck(patch_mean)  # (B, bottleneck_dim)
+                z_layers.append(z_global_l)
+
+                patch_features_flat = pt.reshape(B * N, C)
+                z_patches_flat = self.shared_bottleneck(patch_features_flat)  # (B*N, bottleneck_dim)
+                if self.layer_reg3_heads is not None:
+                    heads_l = list(self.layer_reg3_heads[layer_idx])
+                else:
+                    heads_l = list(self.reg3_heads)
+                pred_patches_flat = self._forward_reg3_logits_for_heads(z_patches_flat, heads_l)  # (B*N, num_outputs)
+                pred_patches = pred_patches_flat.view(B, N, self.num_outputs)
+                pred_l = pred_patches.mean(dim=1)  # (B, num_outputs)
+                pred_layers.append(pred_l)
+
+        pred_reg3_logits = average_layerwise_predictions(pred_layers)
+        z_global = average_layerwise_predictions(z_layers)
+        return pred_reg3_logits, z_global, z_layers
+
     def forward(self, images: Tensor) -> Tensor:
         # Return main regression prediction in original grams (g).
         # When use_patch_reg3 is enabled, this corresponds to the per-patch prediction
         # averaged over all patches; otherwise it is the legacy CLS+mean(patch) head.
-        pred_reg3_logits, _ = self._compute_reg3_from_images(images)
+        if self.use_layerwise_heads:
+            pred_reg3_logits, _, _ = self._compute_reg3_and_z_multilayer(images)
+        else:
+            pred_reg3_logits, _ = self._compute_reg3_from_images(images)
         out = pred_reg3_logits
         if self.out_softplus is not None:
             out = self.out_softplus(out)
@@ -577,15 +718,20 @@ class BiomassRegressor(LightningModule):
         # Main regression path (reg3). When use_patch_reg3 is enabled, this returns
         # per-patch predictions averaged over patches together with a global bottleneck
         # feature built from CLS + mean(patch). Auxiliary heads and ratio/5D always
-        # use the global bottleneck z.
-        pred_reg3 = None
-        z = None
-        if self.use_patch_reg3:
-            pred_reg3, z = self._compute_reg3_from_images(images)
+        # use the global bottleneck z. When use_layerwise_heads is enabled, both
+        # reg3 and z are obtained by averaging per-layer predictions/features.
+        pred_reg3: Tensor
+        z: Tensor
+        z_layers: Optional[List[Tensor]] = None
+        if self.use_layerwise_heads:
+            pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(images)
         else:
-            features = self.feature_extractor(images)
-            z = self.shared_bottleneck(features)
-            pred_reg3 = self._forward_reg3_logits(z)
+            if self.use_patch_reg3:
+                pred_reg3, z = self._compute_reg3_from_images(images)
+            else:
+                features = self.feature_extractor(images)
+                z = self.shared_bottleneck(features)
+                pred_reg3 = self._forward_reg3_logits(z)
         # Apply manifold mixup on bottleneck features if chosen
         if use_mixup and self._manifold_mixup is not None and (stage == "train") and (not is_ndvi_only):
             try:
@@ -594,14 +740,20 @@ class BiomassRegressor(LightningModule):
                 pass
         if is_ndvi_only:
             # NDVI-only batch (no reg3 supervision). Optimize NDVI scalar head only.
-            if not self.enable_ndvi or self.ndvi_head is None:
+            if not self.enable_ndvi or (self.ndvi_head is None and (not self.use_layerwise_heads or self.layer_ndvi_heads is None)):
                 # If NDVI task is disabled, skip by returning zero loss
                 zero = (z.sum() * 0.0)
                 self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
                 self.log(f"{stage}_loss", zero, on_step=False, on_epoch=True, prog_bar=True)
                 return {"loss": zero}
             y_ndvi_only: Tensor = batch["y_ndvi"]  # (B,1)
-            pred_ndvi_only = self.ndvi_head(z)
+            if self.use_layerwise_heads and self.layer_ndvi_heads is not None and z_layers is not None:
+                preds_layers_ndvi: List[Tensor] = []
+                for idx, head in enumerate(self.layer_ndvi_heads):
+                    preds_layers_ndvi.append(head(z_layers[idx]))
+                pred_ndvi_only = average_layerwise_predictions(preds_layers_ndvi)
+            else:
+                pred_ndvi_only = self.ndvi_head(z)  # type: ignore[operator]
             loss_ndvi_only = F.mse_loss(pred_ndvi_only, y_ndvi_only)
             self.log(f"{stage}_loss_ndvi", loss_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse_ndvi", loss_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
@@ -651,7 +803,13 @@ class BiomassRegressor(LightningModule):
             ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
             if y_ratio is not None and ratio_mask is not None:
                 # Predict logits for (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
-                ratio_logits = self.ratio_head(z)  # type: ignore[operator]
+                if self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
+                    logits_per_layer: List[Tensor] = []
+                    for idx, head in enumerate(self.layer_ratio_heads):
+                        logits_per_layer.append(head(z_layers[idx]))
+                    ratio_logits = average_layerwise_predictions(logits_per_layer)
+                else:
+                    ratio_logits = self.ratio_head(z)  # type: ignore[operator]
                 log_p_pred = F.log_softmax(ratio_logits, dim=-1)
                 # Ensure target is a proper distribution
                 p_true = y_ratio.clamp_min(0.0)
@@ -674,7 +832,13 @@ class BiomassRegressor(LightningModule):
             # Convert main reg3 prediction back to g/m^2 (Dry_Total_g)
             pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
             # Ratio predictions (probabilities over 3 components)
-            ratio_logits = self.ratio_head(z)  # type: ignore[operator]
+            if self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
+                logits_per_layer_5d: List[Tensor] = []
+                for idx, head in enumerate(self.layer_ratio_heads):
+                    logits_per_layer_5d.append(head(z_layers[idx]))
+                ratio_logits = average_layerwise_predictions(logits_per_layer_5d)
+            else:
+                ratio_logits = self.ratio_head(z)  # type: ignore[operator]
             p_pred = F.softmax(ratio_logits, dim=-1)  # (B,3)
             # Component g/m^2
             comp_gm2 = p_pred * pred_total_gm2  # (B,3)
@@ -768,10 +932,36 @@ class BiomassRegressor(LightningModule):
             }
 
         # Otherwise, compute enabled auxiliary task heads and losses
-        pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
-        pred_ndvi = self.ndvi_head(z) if self.enable_ndvi else None  # type: ignore[assignment]
-        logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
-        logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
+        pred_height = None
+        pred_ndvi = None
+        logits_species = None
+        logits_state = None
+        if self.use_layerwise_heads and z_layers is not None:
+            if self.enable_height and self.layer_height_heads is not None:
+                height_preds_layers: List[Tensor] = []
+                for idx, head in enumerate(self.layer_height_heads):
+                    height_preds_layers.append(head(z_layers[idx]))
+                pred_height = average_layerwise_predictions(height_preds_layers)
+            if self.enable_ndvi and self.layer_ndvi_heads is not None:
+                ndvi_preds_layers: List[Tensor] = []
+                for idx, head in enumerate(self.layer_ndvi_heads):
+                    ndvi_preds_layers.append(head(z_layers[idx]))
+                pred_ndvi = average_layerwise_predictions(ndvi_preds_layers)
+            if self.enable_species and self.layer_species_heads is not None:
+                species_logits_layers: List[Tensor] = []
+                for idx, head in enumerate(self.layer_species_heads):
+                    species_logits_layers.append(head(z_layers[idx]))
+                logits_species = average_layerwise_predictions(species_logits_layers)
+            if self.enable_state and self.layer_state_heads is not None:
+                state_logits_layers: List[Tensor] = []
+                for idx, head in enumerate(self.layer_state_heads):
+                    state_logits_layers.append(head(z_layers[idx]))
+                logits_state = average_layerwise_predictions(state_logits_layers)
+        else:
+            pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
+            pred_ndvi = self.ndvi_head(z) if self.enable_ndvi else None  # type: ignore[assignment]
+            logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
+            logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
 
         # Collect losses in consistent order for UW/equal weighting
         named_losses: List[Tuple[str, Tensor]] = []

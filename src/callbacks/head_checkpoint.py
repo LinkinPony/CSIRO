@@ -61,9 +61,17 @@ class HeadCheckpoint(Callback):
             # Patch-mode heads use patch-token dimensionality as input (embedding_dim),
             # whereas legacy heads expect CLS+mean(patch) with 2 * embedding_dim.
             use_patch_reg3 = bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False
+            use_layerwise_heads = bool(getattr(pl_module.hparams, "use_layerwise_heads", False)) if hasattr(pl_module, "hparams") else False
+            backbone_layer_indices = list(getattr(pl_module.hparams, "backbone_layer_indices", [])) if hasattr(pl_module, "hparams") else []
+
+            # For backward compatibility, when layer-wise heads are disabled we continue
+            # to use a simple MLP head built via build_head_layer. When layer-wise heads
+            # are enabled, we still export a packed MLP head, but its final linear layer
+            # contains concatenated per-layer weights. The inference script remains
+            # responsible for interpreting these weights correctly; here we only pack.
             head_module = build_head_layer(
                 embedding_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)),
-                num_outputs=head_total_outputs,
+                num_outputs=head_total_outputs if not use_layerwise_heads else head_total_outputs * max(1, len(backbone_layer_indices)),
                 head_hidden_dims=list(getattr(pl_module.hparams, "head_hidden_dims", [])),
                 head_activation=str(getattr(pl_module.hparams, "head_activation", "relu")),
                 dropout=float(getattr(pl_module.hparams, "dropout", 0.0)),
@@ -89,29 +97,63 @@ class HeadCheckpoint(Callback):
                             t.bias.copy_(s.bias.data)
 
                 # Aggregate final layer from scalar reg heads and optional ratio head
-                # into a single Linear(out_features=head_total_outputs).
+                # into a single Linear(out_features=head_total_outputs * num_layers_when_applicable).
                 final_linear = tgt_linears[-1]
-                reg3_heads = list(getattr(pl_module, "reg3_heads"))
-                if final_linear.out_features != head_total_outputs:
-                    raise RuntimeError("Final inference head out_features does not match packed outputs")
-                with torch.no_grad():
-                    row = 0
-                    # Pack main reg3 scalar heads first
-                    for h in reg3_heads:
-                        if not isinstance(h, nn.Linear) or h.out_features != 1:
-                            raise RuntimeError("reg3_heads must contain nn.Linear modules with out_features=1")
-                        final_linear.weight[row : row + 1, :].copy_(h.weight.data)
-                        if final_linear.bias is not None and h.bias is not None:
-                            final_linear.bias[row] = h.bias.data[0]
-                        row += 1
-                    # Pack ratio head logits (if present) into remaining rows
-                    if num_ratio_outputs > 0 and isinstance(ratio_head, nn.Linear):
-                        if ratio_head.out_features != num_ratio_outputs:
-                            raise RuntimeError("ratio_head.out_features mismatch")
-                        final_linear.weight[row : row + num_ratio_outputs, :].copy_(ratio_head.weight.data)
-                        if final_linear.bias is not None and ratio_head.bias is not None:
-                            final_linear.bias[row : row + num_ratio_outputs].copy_(ratio_head.bias.data)
-                state_dict_to_save = head_module.state_dict()
+                if use_layerwise_heads and hasattr(pl_module, "layer_reg3_heads") and getattr(pl_module, "layer_reg3_heads") is not None:
+                    # Layer-wise packing: we stack per-layer heads along the output dimension.
+                    layer_reg3_heads = list(getattr(pl_module, "layer_reg3_heads"))
+                    layer_ratio_heads = list(getattr(pl_module, "layer_ratio_heads")) if hasattr(pl_module, "layer_ratio_heads") and getattr(pl_module, "layer_ratio_heads") is not None else []
+                    num_layers = len(layer_reg3_heads)
+                    expected_out = head_total_outputs * num_layers
+                    if final_linear.out_features != expected_out:
+                        raise RuntimeError("Final inference head out_features does not match packed layer-wise outputs")
+                    with torch.no_grad():
+                        row = 0
+                        # For each layer, pack its reg3 heads then optional ratio head.
+                        for l_idx, reg3_list in enumerate(layer_reg3_heads):
+                            for h in reg3_list:
+                                if not isinstance(h, nn.Linear) or h.out_features != 1:
+                                    raise RuntimeError("layer_reg3_heads must contain nn.Linear modules with out_features=1")
+                                final_linear.weight[row : row + 1, :].copy_(h.weight.data)
+                                if final_linear.bias is not None and h.bias is not None:
+                                    final_linear.bias[row] = h.bias.data[0]
+                                row += 1
+                            if num_ratio_outputs > 0:
+                                # Use layer-specific ratio heads when available; otherwise fall back to shared ratio_head.
+                                ratio_src = None
+                                if l_idx < len(layer_ratio_heads) and isinstance(layer_ratio_heads[l_idx], nn.Linear):
+                                    ratio_src = layer_ratio_heads[l_idx]
+                                elif isinstance(ratio_head, nn.Linear):
+                                    ratio_src = ratio_head
+                                if ratio_src is None or ratio_src.out_features != num_ratio_outputs:
+                                    raise RuntimeError("ratio_head / layer_ratio_heads out_features mismatch for packing")
+                                final_linear.weight[row : row + num_ratio_outputs, :].copy_(ratio_src.weight.data)
+                                if final_linear.bias is not None and ratio_src.bias is not None:
+                                    final_linear.bias[row : row + num_ratio_outputs].copy_(ratio_src.bias.data)
+                                row += num_ratio_outputs
+                    state_dict_to_save = head_module.state_dict()
+                else:
+                    reg3_heads = list(getattr(pl_module, "reg3_heads"))
+                    if final_linear.out_features != head_total_outputs:
+                        raise RuntimeError("Final inference head out_features does not match packed outputs")
+                    with torch.no_grad():
+                        row = 0
+                        # Pack main reg3 scalar heads first
+                        for h in reg3_heads:
+                            if not isinstance(h, nn.Linear) or h.out_features != 1:
+                                raise RuntimeError("reg3_heads must contain nn.Linear modules with out_features=1")
+                            final_linear.weight[row : row + 1, :].copy_(h.weight.data)
+                            if final_linear.bias is not None and h.bias is not None:
+                                final_linear.bias[row] = h.bias.data[0]
+                            row += 1
+                        # Pack ratio head logits (if present) into remaining rows
+                        if num_ratio_outputs > 0 and isinstance(ratio_head, nn.Linear):
+                            if ratio_head.out_features != num_ratio_outputs:
+                                raise RuntimeError("ratio_head.out_features mismatch")
+                            final_linear.weight[row : row + num_ratio_outputs, :].copy_(ratio_head.weight.data)
+                            if final_linear.bias is not None and ratio_head.bias is not None:
+                                final_linear.bias[row : row + num_ratio_outputs].copy_(ratio_head.bias.data)
+                    state_dict_to_save = head_module.state_dict()
 
             else:
                 # Legacy path: shared_bottleneck + single reg_head or a monolithic pl_module.head
@@ -165,6 +207,10 @@ class HeadCheckpoint(Callback):
                 # Whether the main regression head was trained using per-patch predictions
                 # averaged over patches (scheme A), or using a single CLS+mean(patch) feature.
                 "use_patch_reg3": bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False,
+                # Multi-layer configuration: whether layer-wise heads were used and which
+                # backbone blocks were selected.
+                "use_layerwise_heads": bool(getattr(pl_module.hparams, "use_layerwise_heads", False)) if hasattr(pl_module, "hparams") else False,
+                "backbone_layer_indices": list(getattr(pl_module.hparams, "backbone_layer_indices", [])) if hasattr(pl_module, "hparams") else [],
                 # Order of ratio components packed in the head (if any)
                 "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
             },

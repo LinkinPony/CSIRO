@@ -195,6 +195,38 @@ class DinoV3FeatureExtractor(nn.Module):
             feats = self.backbone.forward_features(images)
         return feats
 
+    def _get_intermediate_layers_raw(self, images: torch.Tensor, layer_indices):
+        """
+        Call DINOv3-style get_intermediate_layers on the underlying backbone,
+        handling PEFT-wrapped models where the method may live on base_model.
+        """
+        try:
+            backbone_dtype = next(self.backbone.parameters()).dtype
+        except StopIteration:
+            backbone_dtype = images.dtype
+        if images.dtype != backbone_dtype:
+            images = images.to(dtype=backbone_dtype)
+
+        backbone = self.backbone
+        get_intermediate = getattr(backbone, "get_intermediate_layers", None)
+        if get_intermediate is None and hasattr(backbone, "base_model"):
+            get_intermediate = getattr(backbone.base_model, "get_intermediate_layers", None)  # type: ignore[attr-defined]
+        if get_intermediate is None:
+            raise RuntimeError(
+                "Backbone does not implement get_intermediate_layers; "
+                "multi-layer feature extraction is unsupported for this backbone."
+            )
+
+        outs = get_intermediate(
+            images,
+            n=layer_indices,
+            reshape=False,
+            return_class_token=True,
+            return_extra_tokens=False,
+            norm=True,
+        )
+        return outs
+
     def _extract_cls_and_pt(self, feats):
         """
         Helper to extract CLS token and patch tokens from a forward_features-style output.
@@ -218,6 +250,36 @@ class DinoV3FeatureExtractor(nn.Module):
         if pt.dim() != 3:
             raise RuntimeError(f"Unexpected patch tokens shape: {tuple(pt.shape)}")
         return cls, pt
+
+    @torch.inference_mode()
+    def forward_layers_cls_and_tokens(self, images: torch.Tensor, layer_indices):
+        """
+        Return CLS and patch tokens for a set of backbone layers.
+
+        Args:
+            images:        (B, 3, H, W)
+            layer_indices: iterable of int, backbone block indices
+
+        Returns:
+            cls_list: list of Tensors, each (B, C)
+            pt_list : list of Tensors, each (B, N, C)
+        """
+        indices = sorted({int(i) for i in layer_indices})
+        if len(indices) == 0:
+            raise ValueError("layer_indices must contain at least one index")
+        outs = self._get_intermediate_layers_raw(images, indices)
+        cls_list: List[torch.Tensor] = []
+        pt_list: List[torch.Tensor] = []
+        for out in outs:
+            # get_intermediate_layers with return_class_token=True returns tuples
+            # of the form (patch_tokens, class_token).
+            if isinstance(out, (list, tuple)) and len(out) >= 2:
+                pt, cls = out[0], out[1]
+            else:
+                raise RuntimeError("Unexpected output format from get_intermediate_layers")
+            pt_list.append(pt)
+            cls_list.append(cls)
+        return cls_list, pt_list
 
     @torch.inference_mode()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -477,7 +539,17 @@ def extract_features_for_images(
     return rels, features
 
 
-def predict_from_features(features_cpu: torch.Tensor, head: nn.Module, batch_size: int) -> torch.Tensor:
+def predict_from_features(
+    features_cpu: torch.Tensor,
+    head: nn.Module,
+    batch_size: int,
+    *,
+    head_num_main: int,
+    head_num_ratio: int,
+    head_total: int,
+    use_layerwise_heads: bool,
+    num_layers: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     head = head.eval().to(device)
     N = features_cpu.shape[0]
@@ -487,8 +559,49 @@ def predict_from_features(features_cpu: torch.Tensor, head: nn.Module, batch_siz
             chunk = features_cpu[i : i + max(1, batch_size)].to(device, non_blocking=True)
             out = head(chunk)
             preds_list.append(out.detach().cpu().float())
-    # Do not assume a fixed output dimension; fall back to (0, 0) when empty.
-    return torch.cat(preds_list, dim=0) if preds_list else torch.empty((0, 0), dtype=torch.float32)
+    if not preds_list:
+        empty_main = torch.empty((0, head_num_main), dtype=torch.float32)
+        empty_ratio = torch.empty((0, head_num_ratio), dtype=torch.float32) if head_num_ratio > 0 else None
+        return empty_main, empty_ratio
+
+    preds_all = torch.cat(preds_list, dim=0)  # (N, D)
+
+    # Legacy_single-layer: interpret outputs directly.
+    if not use_layerwise_heads or num_layers <= 1:
+        if head_num_ratio > 0 and head_total == head_num_main + head_num_ratio:
+            preds_main = preds_all[:, :head_num_main]
+            preds_ratio = preds_all[:, head_num_main : head_num_main + head_num_ratio]
+        else:
+            preds_main = preds_all
+            preds_ratio = None
+        return preds_main, preds_ratio
+
+    # Layer-wise packed outputs: final linear layer concatenates per-layer
+    # [main, ratio] predictions along the feature dimension.
+    if head_num_ratio > 0 and head_total == head_num_main + head_num_ratio:
+        # preds_all: (N, head_total * num_layers)
+        if preds_all.shape[1] != head_total * num_layers:
+            raise RuntimeError(
+                f"Unexpected packed head dimension: got {preds_all.shape[1]}, "
+                f"expected {head_total * num_layers}"
+            )
+        preds_all_L = preds_all.view(N, num_layers, head_total)
+        main_layers = preds_all_L[:, :, :head_num_main]  # (N, L, head_num_main)
+        ratio_layers = preds_all_L[:, :, head_num_main : head_num_main + head_num_ratio]  # (N, L, head_num_ratio)
+        preds_main = main_layers.mean(dim=1)  # (N, head_num_main)
+        preds_ratio = ratio_layers.mean(dim=1)  # (N, head_num_ratio)
+    else:
+        # No dedicated ratio outputs: only main predictions are packed.
+        if preds_all.shape[1] != head_num_main * num_layers:
+            raise RuntimeError(
+                f"Unexpected packed head dimension (no-ratio): got {preds_all.shape[1]}, "
+                f"expected {head_num_main * num_layers}"
+            )
+        preds_all_L = preds_all.view(N, num_layers, head_num_main)
+        preds_main = preds_all_L.mean(dim=1)
+        preds_ratio = None
+
+    return preds_main, preds_ratio
 
 
 def predict_main_and_ratio_patch_mode(
@@ -503,6 +616,10 @@ def predict_main_and_ratio_patch_mode(
     num_workers: int,
     head_num_main: int,
     head_num_ratio: int,
+    head_total: int,
+    use_layerwise_heads: bool,
+    num_layers: int,
+    layer_indices: Optional[List[int]] = None,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Patch-mode inference for a single head:
@@ -538,26 +655,86 @@ def predict_main_and_ratio_patch_mode(
     with torch.inference_mode():
         for images, rel_paths in dl:
             images = images.to(device, non_blocking=True)
-            cls, pt = feature_extractor.forward_cls_and_tokens(images)
-            if pt.dim() != 3:
-                raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt.shape)}")
-            B, N, C = pt.shape
 
-            if head_num_main > 0:
-                patch_features_flat = pt.reshape(B * N, C)  # (B*N, C) patch-only information
-                out_all_patch = head(patch_features_flat)  # (B*N, head_total)
-                out_main_patch = out_all_patch[:, :head_num_main]
-                out_main_patch = out_main_patch.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
-            else:
-                out_main_patch = torch.empty((B, 0), dtype=torch.float32, device=device)
+            # Multi-layer path: use DINO get_intermediate_layers to obtain per-layer
+            # CLS and patch tokens, then apply the packed head on each layer-specific
+            # patch feature and slice out that layer's segment in the final linear.
+            if use_layerwise_heads and num_layers > 1 and layer_indices is not None and len(layer_indices) > 0:
+                cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
+                if len(cls_list) != len(pt_list) or len(cls_list) != num_layers:
+                    raise RuntimeError("Mismatch between CLS/patch token lists and num_layers in patch-mode multi-layer inference")
 
-            # --- Ratio logits (if any) from global patch-mean features ---
-            if head_num_ratio > 0:
-                patch_mean = pt.mean(dim=1)  # (B, C)
-                out_all_global = head(patch_mean)  # (B, head_total)
-                out_ratio = out_all_global[:, head_num_main : head_num_main + head_num_ratio]  # (B, head_num_ratio)
+                main_layers_batch: List[torch.Tensor] = []
+                ratio_layers_batch: List[torch.Tensor] = []
+
+                for l_idx, (cls_l, pt_l) in enumerate(zip(cls_list, pt_list)):
+                    if pt_l.dim() != 3:
+                        raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt_l.shape)}")
+                    B, N, C = pt_l.shape
+
+                    if head_num_main > 0:
+                        patch_features_flat = pt_l.reshape(B * N, C)  # (B*N, C)
+                        out_all_patch = head(patch_features_flat)  # (B*N, head_total * L)
+                        expected_dim = head_total * num_layers
+                        if out_all_patch.shape[1] != expected_dim:
+                            raise RuntimeError(
+                                f"Unexpected packed head dimension in patch-mode multi-layer: got {out_all_patch.shape[1]}, "
+                                f"expected {expected_dim}"
+                            )
+                        offset = l_idx * head_total
+                        layer_slice = out_all_patch[:, offset : offset + head_total]  # (B*N, head_total)
+                        layer_main = layer_slice[:, :head_num_main]  # (B*N, head_num_main)
+                        layer_main = layer_main.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+                        main_layers_batch.append(layer_main)
+                    else:
+                        # No main outputs; keep empty tensor for consistency
+                        main_layers_batch.append(torch.empty((B, 0), dtype=torch.float32, device=device))
+
+                    if head_num_ratio > 0:
+                        patch_mean_l = pt_l.mean(dim=1)  # (B, C)
+                        out_all_global = head(patch_mean_l)  # (B, head_total * L)
+                        if out_all_global.shape[1] != expected_dim:
+                            raise RuntimeError(
+                                f"Unexpected packed head dimension for ratio logits in patch-mode multi-layer: got {out_all_global.shape[1]}, "
+                                f"expected {expected_dim}"
+                            )
+                        layer_slice_g = out_all_global[:, offset : offset + head_total]  # (B, head_total)
+                        layer_ratio = layer_slice_g[:, head_num_main : head_num_main + head_num_ratio]  # (B, head_num_ratio)
+                        ratio_layers_batch.append(layer_ratio)
+
+                # Average over layers
+                out_main_patch = (
+                    torch.stack(main_layers_batch, dim=0).mean(dim=0)
+                    if len(main_layers_batch) > 0
+                    else torch.empty((images.size(0), 0), dtype=torch.float32, device=device)
+                )
+                if head_num_ratio > 0 and len(ratio_layers_batch) > 0:
+                    out_ratio = torch.stack(ratio_layers_batch, dim=0).mean(dim=0)
+                else:
+                    out_ratio = None
+
             else:
-                out_ratio = None
+                # Legacy single-layer path: use last-layer CLS and patch tokens only.
+                cls, pt = feature_extractor.forward_cls_and_tokens(images)
+                if pt.dim() != 3:
+                    raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt.shape)}")
+                B, N, C = pt.shape
+
+                if head_num_main > 0:
+                    patch_features_flat = pt.reshape(B * N, C)  # (B*N, C) patch-only information
+                    out_all_patch = head(patch_features_flat)  # (B*N, head_total)
+                    out_main_patch = out_all_patch[:, :head_num_main]
+                    out_main_patch = out_main_patch.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+                else:
+                    out_main_patch = torch.empty((B, 0), dtype=torch.float32, device=device)
+
+                # --- Ratio logits (if any) from global patch-mean features ---
+                if head_num_ratio > 0:
+                    patch_mean = pt.mean(dim=1)  # (B, C)
+                    out_all_global = head(patch_mean)  # (B, head_total)
+                    out_ratio = out_all_global[:, head_num_main : head_num_main + head_num_ratio]  # (B, head_num_ratio)
+                else:
+                    out_ratio = None
 
             preds_main_list.append(out_main_patch.detach().cpu().float())
             if out_ratio is not None:
@@ -574,6 +751,119 @@ def predict_main_and_ratio_patch_mode(
         preds_ratio = torch.cat(preds_ratio_list, dim=0)
     else:
         preds_ratio = None
+    return rels, preds_main, preds_ratio
+
+
+def predict_main_and_ratio_global_multilayer(
+    backbone: nn.Module,
+    head: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: int,
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+    head_num_main: int,
+    head_num_ratio: int,
+    head_total: int,
+    layer_indices: List[int],
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+    """
+    Global (CLS+mean(patch)) multi-layer inference for a single head:
+      - For each image, obtain per-layer CLS and patch tokens from the DINO backbone
+        using get_intermediate_layers.
+      - For each layer, build CLS+mean(patch) features, apply the packed head,
+        slice that layer's segment, and then average predictions over layers.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    feature_extractor = DinoV3FeatureExtractor(backbone)
+    feature_extractor.eval().to(device)
+    head = head.eval().to(device)
+
+    num_layers = len(layer_indices)
+    if num_layers <= 0:
+        raise ValueError("layer_indices must contain at least one layer for multi-layer inference")
+
+    rels: List[str] = []
+    preds_main_list: List[torch.Tensor] = []
+    preds_ratio_list: List[torch.Tensor] = []
+
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device, non_blocking=True)
+            cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
+            if len(cls_list) != len(pt_list) or len(cls_list) != num_layers:
+                raise RuntimeError("Mismatch between CLS/patch token lists and num_layers in global multi-layer inference")
+
+            main_layers_batch: List[torch.Tensor] = []
+            ratio_layers_batch: List[torch.Tensor] = []
+
+            for l_idx, (cls_l, pt_l) in enumerate(zip(cls_list, pt_list)):
+                if pt_l.dim() != 3:
+                    raise RuntimeError(f"Unexpected patch tokens shape in global multi-layer inference: {tuple(pt_l.shape)}")
+                B, N, C = pt_l.shape
+                patch_mean_l = pt_l.mean(dim=1)  # (B, C)
+                feats_l = torch.cat([cls_l, patch_mean_l], dim=-1)  # (B, 2C)
+
+                out_all = head(feats_l)  # (B, head_total * num_layers)
+                expected_dim = head_total * num_layers
+                if out_all.shape[1] != expected_dim:
+                    raise RuntimeError(
+                        f"Unexpected packed head dimension in global multi-layer: got {out_all.shape[1]}, "
+                        f"expected {expected_dim}"
+                    )
+                offset = l_idx * head_total
+                layer_slice = out_all[:, offset : offset + head_total]  # (B, head_total)
+
+                if head_num_main > 0:
+                    layer_main = layer_slice[:, :head_num_main]  # (B, head_num_main)
+                else:
+                    layer_main = torch.empty((B, 0), dtype=torch.float32, device=device)
+                main_layers_batch.append(layer_main)
+
+                if head_num_ratio > 0:
+                    layer_ratio = layer_slice[:, head_num_main : head_num_main + head_num_ratio]  # (B, head_num_ratio)
+                    ratio_layers_batch.append(layer_ratio)
+
+            # Average over layers
+            B = images.size(0)
+            preds_main_batch = (
+                torch.stack(main_layers_batch, dim=0).mean(dim=0)
+                if len(main_layers_batch) > 0
+                else torch.empty((B, 0), dtype=torch.float32, device=device)
+            )
+            if head_num_ratio > 0 and len(ratio_layers_batch) > 0:
+                preds_ratio_batch = torch.stack(ratio_layers_batch, dim=0).mean(dim=0)
+            else:
+                preds_ratio_batch = None
+
+            preds_main_list.append(preds_main_batch.detach().cpu().float())
+            if preds_ratio_batch is not None:
+                preds_ratio_list.append(preds_ratio_batch.detach().cpu().float())
+            rels.extend(list(rel_paths))
+
+    preds_main = (
+        torch.cat(preds_main_list, dim=0)
+        if preds_main_list
+        else torch.empty((0, head_num_main), dtype=torch.float32)
+    )
+    preds_ratio: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_list:
+        preds_ratio = torch.cat(preds_ratio_list, dim=0)
+    else:
+        preds_ratio = None
+
     return rels, preds_main, preds_ratio
 
 
@@ -694,6 +984,8 @@ def main():
     head_total_outputs_default = int(first_meta.get("head_total_outputs", num_outputs_main_default + num_outputs_ratio_default))
     ratio_components_default = first_meta.get("ratio_components", [])
     use_patch_reg3_default = bool(first_meta.get("use_patch_reg3", False))
+    use_layerwise_heads_default = bool(first_meta.get("use_layerwise_heads", False))
+    backbone_layer_indices_default = list(first_meta.get("backbone_layer_indices", []))
 
     # Build weighted/mean ensemble by running per-head feature extraction (supports per-head LoRA).
     # Only require that all heads share the same embedding_dim (backbone choice); ratio/patch
@@ -768,11 +1060,18 @@ def main():
         # Build head module according to its own meta (packed main + optional ratio outputs)
         # Determine whether this specific head was trained with patch-based main regression.
         use_patch_reg3_head = bool(meta.get("use_patch_reg3", use_patch_reg3_default))
+        # Determine whether this head uses layer-wise heads and which backbone layers.
+        use_layerwise_heads_head = bool(meta.get("use_layerwise_heads", use_layerwise_heads_default))
+        backbone_layer_indices_head = list(meta.get("backbone_layer_indices", backbone_layer_indices_default))
         # Determine whether this head uses the ratio format.
         head_is_ratio = bool(head_num_ratio > 0 and head_total == (head_num_main + head_num_ratio))
+        # When layer-wise heads are used, the packed head stores concatenated per-layer
+        # outputs in its final linear layer. The inference pipeline remains compatible
+        # by interpreting these outputs accordingly when producing final predictions.
+        effective_outputs = head_total if not use_layerwise_heads_head else head_total * max(1, len(backbone_layer_indices_head))
         head_module = build_head_layer(
             embedding_dim=head_embedding_dim,
-            num_outputs=head_total if head_is_ratio else head_num_main,
+            num_outputs=effective_outputs if head_is_ratio else (head_num_main if not use_layerwise_heads_head else head_num_main * max(1, len(backbone_layer_indices_head))),
             head_hidden_dims=head_hidden_dims,
             head_activation=head_activation,
             dropout=head_dropout,
@@ -785,8 +1084,10 @@ def main():
         head_module.load_state_dict(state, strict=True)
 
         if use_patch_reg3_head:
-            # Patch-based main regression: compute per-patch predictions and average,
-            # while ratio logits (if any) are computed from patch-mean features.
+            # Patch-based main regression: compute per-patch predictions and average.
+            # When layer-wise heads are enabled, use multiple backbone layers with
+            # per-layer predictions averaged across layers; otherwise fall back to
+            # last-layer-only behavior.
             rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_patch_mode(
                 backbone=backbone,
                 head=head_module,
@@ -799,27 +1100,52 @@ def main():
                 num_workers=num_workers,
                 head_num_main=head_num_main,
                 head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                head_total=head_total,
+                use_layerwise_heads=use_layerwise_heads_head,
+                num_layers=max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1,
+                layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
             )
         else:
-            feature_extractor = DinoV3FeatureExtractor(backbone)
-            # Extract CLS + mean(patch) features for this head (per-head features to respect its LoRA)
-            rels_in_order, features_cpu = extract_features_for_images(
-                feature_extractor=feature_extractor,
-                dataset_root=dataset_root,
-                image_paths=unique_image_paths,
-                image_size=image_size,
-                mean=mean,
-                std=std,
-                batch_size=batch_size,
-                num_workers=num_workers,
-            )
-            preds_all = predict_from_features(features_cpu=features_cpu, head=head_module, batch_size=batch_size)
-            if head_is_ratio:
-                preds_main = preds_all[:, :head_num_main]
-                preds_ratio = preds_all[:, head_num_main : head_num_main + head_num_ratio]
+            if use_layerwise_heads_head and len(backbone_layer_indices_head) > 0:
+                # Global multi-layer path: CLS+mean(patch) per layer with per-layer heads.
+                rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_global_multilayer(
+                    backbone=backbone,
+                    head=head_module,
+                    dataset_root=dataset_root,
+                    image_paths=unique_image_paths,
+                    image_size=image_size,
+                    mean=mean,
+                    std=std,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    head_num_main=head_num_main,
+                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                    head_total=head_total,
+                    layer_indices=backbone_layer_indices_head,
+                )
             else:
-                preds_main = preds_all
-                preds_ratio = None
+                # Legacy single-layer path: extract CLS+mean(patch) only from last layer.
+                feature_extractor = DinoV3FeatureExtractor(backbone)
+                rels_in_order, features_cpu = extract_features_for_images(
+                    feature_extractor=feature_extractor,
+                    dataset_root=dataset_root,
+                    image_paths=unique_image_paths,
+                    image_size=image_size,
+                    mean=mean,
+                    std=std,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                )
+                preds_main, preds_ratio = predict_from_features(
+                    features_cpu=features_cpu,
+                    head=head_module,
+                    batch_size=batch_size,
+                    head_num_main=head_num_main,
+                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                    head_total=head_total,
+                    use_layerwise_heads=False,
+                    num_layers=1,
+                )
 
         if rels_in_order_ref is None:
             rels_in_order_ref = rels_in_order

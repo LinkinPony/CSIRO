@@ -1,9 +1,10 @@
 {
   "enabled": false,
   "versions": [
-    "patch-reg3-seprate_head",
-    "patch-reg3-seprate_head-repeat",
-    "ratio",
+    "patch-reg3-1280-no-colorjitter",
+    "patch-reg3-1280-change-size",
+    "patch-reg3-1280-seed2",
+    "multilayer-patch-last4",
     "ratio-mlp-2560-manifold-mixup-extreme"
   ]
 }

@@ -4,6 +4,11 @@ import math
 import torch
 from torch import Tensor, nn
 
+from .layer_utils import (
+    normalize_layer_indices,
+    split_cls_and_patches_from_intermediate,
+)
+
 
 class DinoV3FeatureExtractor(nn.Module):
     def __init__(self, backbone: nn.Module, *, inference_only: bool = True) -> None:
@@ -37,6 +42,43 @@ class DinoV3FeatureExtractor(nn.Module):
             feats = self.backbone.forward_features(images)
         return feats
 
+    def _get_intermediate_layers_raw(self, images: Tensor, layer_indices):
+        """
+        Call DINOv3-style get_intermediate_layers on the underlying backbone,
+        handling PEFT-wrapped models where the method may live on base_model.
+        """
+        # Ensure dtype consistency with backbone parameters
+        try:
+            backbone_dtype = next(self.backbone.parameters()).dtype
+        except StopIteration:
+            backbone_dtype = images.dtype
+        if images.dtype != backbone_dtype:
+            images = images.to(dtype=backbone_dtype)
+
+        backbone = self.backbone
+        get_intermediate = getattr(backbone, "get_intermediate_layers", None)
+        if get_intermediate is None and hasattr(backbone, "base_model"):
+            get_intermediate = getattr(
+                backbone.base_model, "get_intermediate_layers", None  # type: ignore[attr-defined]
+            )
+        if get_intermediate is None:
+            raise RuntimeError(
+                "Backbone does not implement get_intermediate_layers; "
+                "multi-layer feature extraction is unsupported for this backbone."
+            )
+
+        # DINOv3 accepts either an int (last n layers) or a sequence of indices.
+        # Here we always pass a normalized list of indices defined by the caller.
+        outs = get_intermediate(
+            images,
+            n=layer_indices,
+            reshape=False,
+            return_class_token=True,
+            return_extra_tokens=False,
+            norm=True,
+        )
+        return outs
+
     def _extract_cls_and_pt(self, feats):
         """
         Helper to extract CLS token and patch tokens from a forward_features-style output.
@@ -63,6 +105,73 @@ class DinoV3FeatureExtractor(nn.Module):
         if pt.dim() != 3:
             raise RuntimeError(f"Unexpected patch tokens shape: {tuple(pt.shape)}")
         return cls, pt
+
+    def forward_layers_cls_and_tokens(
+        self,
+        images: Tensor,
+        layer_indices,
+    ):
+        """
+        Return CLS and patch tokens for a set of backbone layers.
+
+        Args:
+            images:        (B, 3, H, W)
+            layer_indices: iterable of int, backbone block indices
+
+        Returns:
+            cls_list: list of Tensors, each (B, C)
+            pt_list : list of Tensors, each (B, N, C)
+        """
+        indices = normalize_layer_indices(layer_indices)
+        if len(indices) == 0:
+            raise ValueError("layer_indices must contain at least one index")
+
+        if self.inference_only:
+            with torch.inference_mode():
+                outs = self._get_intermediate_layers_raw(images, indices)
+        else:
+            outs = self._get_intermediate_layers_raw(images, indices)
+
+        cls_list, pt_list = split_cls_and_patches_from_intermediate(outs)
+        return cls_list, pt_list
+
+    def forward_layers_patch_tokens(
+        self,
+        images: Tensor,
+        layer_indices,
+    ):
+        """
+        Convenience helper to obtain per-layer patch feature maps:
+
+        Returns:
+            patch_feats_per_layer: list of tensors, each (B, C, Hp, Wp)
+            patch_stride:          int, approximate patch stride (shared across layers)
+        """
+        cls_list, pt_list = self.forward_layers_cls_and_tokens(images, layer_indices)
+        # Use the first layer to infer spatial layout; assume it matches others.
+        if len(pt_list) == 0:
+            raise RuntimeError("No patch tokens returned from intermediate layers")
+        sample_pt = pt_list[0]
+        if sample_pt.dim() != 3:
+            raise RuntimeError(f"Unexpected patch tokens shape in multi-layer path: {tuple(sample_pt.shape)}")
+        B, N, C = sample_pt.shape
+        side = int(math.sqrt(N))
+        if side * side != N:
+            side = int(round(math.sqrt(N)))
+        if side <= 0:
+            raise RuntimeError(f"Cannot infer patch grid from N={N}")
+        patch_feats_per_layer = []
+        for pt in pt_list:
+            if pt.shape[1] != N or pt.shape[2] != C:
+                raise RuntimeError(
+                    f"Inconsistent patch token shape across layers: expected (B,{N},{C}), got {tuple(pt.shape)}"
+                )
+            feat = pt.transpose(1, 2).contiguous().view(B, C, side, side)
+            patch_feats_per_layer.append(feat)
+
+        in_h = images.shape[-2]
+        patch_stride = max(1, in_h // side)
+        return patch_feats_per_layer, patch_stride
 
     def _forward_impl(self, images: Tensor) -> Tensor:
         feats = self._forward_features_dict(images)
