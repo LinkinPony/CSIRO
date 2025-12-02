@@ -13,6 +13,7 @@ from .peft_integration import inject_lora_into_feature_extractor, get_lora_param
 from .head_builder import build_head_layer, SwiGLU
 from .layer_utils import average_layerwise_predictions, normalize_layer_indices
 from src.training.cutmix import CutMixBatchAugment
+from src.training.sam import SAM
 
 
 class ManifoldMixup:
@@ -160,8 +161,20 @@ class BiomassRegressor(LightningModule):
         # Multi-layer backbone features / layer-wise heads
         use_layerwise_heads: bool = False,
         backbone_layer_indices: Optional[List[int]] = None,
+        # Optimizer / SAM configuration
+        optimizer_name: Optional[str] = None,
+        use_sam: bool = False,
+        sam_rho: float = 0.05,
+        sam_adaptive: bool = False,
     ) -> None:
         super().__init__()
+        # Normalize optimizer hyperparameters before saving them.
+        if optimizer_name is None:
+            optimizer_name = "adamw"
+        opt_name = str(optimizer_name).lower()
+        if opt_name in ("sam", "sam_adamw", "adamw_sam"):
+            use_sam = True
+        optimizer_name = opt_name
         self.save_hyperparameters()
 
         feature_extractor = build_feature_extractor(
@@ -1063,9 +1076,16 @@ class BiomassRegressor(LightningModule):
         if not has_grad:
             # No gradients this step (e.g., auxiliary-only step got skipped); avoid scaler.step assertion
             return
-        # Proceed with default stepping
-        optimizer.step(closure=optimizer_closure)
-        optimizer.zero_grad(set_to_none=True)
+
+        # SAM requires a two-step update with an extra forward-backward pass.
+        if isinstance(optimizer, SAM):
+            optimizer.first_step(zero_grad=True)
+            optimizer_closure()
+            optimizer.second_step(zero_grad=True)
+        else:
+            # Proceed with default stepping
+            optimizer.step(closure=optimizer_closure)
+            optimizer.zero_grad(set_to_none=True)
 
     def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
         out = self._shared_step(batch, stage="val")
@@ -1140,7 +1160,18 @@ class BiomassRegressor(LightningModule):
                 "weight_decay": lora_wd,
             })
 
-        optimizer: Optimizer = AdamW(param_groups)
+        # Optimizer selection: plain AdamW or SAM-wrapped AdamW.
+        opt_name = str(getattr(self.hparams, "optimizer_name", "adamw")).lower()
+        use_sam_flag = bool(getattr(self.hparams, "use_sam", False))
+        if opt_name in ("sam", "sam_adamw", "adamw_sam"):
+            use_sam_flag = True
+
+        if use_sam_flag:
+            sam_rho = float(getattr(self.hparams, "sam_rho", 0.05))
+            sam_adaptive = bool(getattr(self.hparams, "sam_adaptive", False))
+            optimizer: Optimizer = SAM(param_groups, AdamW, rho=sam_rho, adaptive=sam_adaptive)
+        else:
+            optimizer = AdamW(param_groups)
 
         if self.hparams.scheduler_name and self.hparams.scheduler_name.lower() == "cosine":
             max_epochs: int = int(self.hparams.max_epochs or 10)

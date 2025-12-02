@@ -1059,7 +1059,15 @@ def main():
 
         # Build head module according to its own meta (packed main + optional ratio outputs)
         # Determine whether this specific head was trained with patch-based main regression.
-        use_patch_reg3_head = bool(meta.get("use_patch_reg3", use_patch_reg3_default))
+        # IMPORTANT: some older heads (e.g., pure ratio MLPs trained on global CLS+mean(patch))
+        # do not store `use_patch_reg3` in their meta. For such heads we must *not* inherit
+        # the default from the first (typically patch-based) head, otherwise we would
+        # incorrectly build a patch-mode MLP with input_dim=embedding_dim instead of
+        # 2 * embedding_dim, leading to shape mismatches when loading their checkpoints.
+        #
+        # Therefore, only heads that explicitly declare `use_patch_reg3: true` in meta
+        # are treated as patch-mode heads; all others default to the legacy global path.
+        use_patch_reg3_head = bool(meta.get("use_patch_reg3", False))
         # Determine whether this head uses layer-wise heads and which backbone layers.
         use_layerwise_heads_head = bool(meta.get("use_layerwise_heads", use_layerwise_heads_default))
         backbone_layer_indices_head = list(meta.get("backbone_layer_indices", backbone_layer_indices_default))

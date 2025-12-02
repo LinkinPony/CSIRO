@@ -280,6 +280,13 @@ def train_single_split(
     use_layerwise_heads = bool(backbone_layers_cfg.get("enabled", False))
     backbone_layer_indices = backbone_layers_cfg.get("indices", None)
 
+    # Optimizer / SAM configuration
+    optimizer_cfg = cfg.get("optimizer", {})
+    optimizer_name = str(optimizer_cfg.get("name", "adamw"))
+    use_sam = bool(optimizer_cfg.get("use_sam", False) or optimizer_name.lower() == "sam")
+    sam_rho = float(optimizer_cfg.get("sam_rho", 0.05))
+    sam_adaptive = bool(optimizer_cfg.get("sam_adaptive", False))
+
     model = BiomassRegressor(
         backbone_name=str(cfg["model"]["backbone"]),
         embedding_dim=int(cfg["model"]["embedding_dim"]),
@@ -368,6 +375,10 @@ def train_single_split(
         # Multi-layer heads
         use_layerwise_heads=use_layerwise_heads,
         backbone_layer_indices=list(backbone_layer_indices) if isinstance(backbone_layer_indices, (list, tuple)) else None,
+        optimizer_name=optimizer_name,
+        use_sam=use_sam,
+        sam_rho=sam_rho,
+        sam_adaptive=sam_adaptive,
     )
 
     head_ckpt_dir = ckpt_dir / "head"

@@ -1,5 +1,5 @@
-seed: 42
-version: multilayer-patch-7-15-23-31
+seed: 998244353
+version: multilayer-patch-last4-log-seed2
 data:
   root: data
   train_csv: train.csv
@@ -101,7 +101,7 @@ model:
   pretrained: true
   freeze_backbone: true
   embedding_dim: 1280
-  log_scale_targets: false
+  log_scale_targets: true
   head:
     type: mlp
     hidden_dims: [1280]
@@ -121,7 +121,7 @@ model:
     enabled: true
     # Indices refer to DINOv3 transformer blocks (0-based). For dinov3_vith16plus
     # the depth is 32, so valid indices are in [0, 31]. Example: use the last 4 layers.
-    indices: [7, 15, 23, 31]
+    indices: [28, 29, 30, 31]
 
 mtl:
   enabled: true
@@ -173,6 +173,11 @@ optimizer:
   weight_decay: 0.01
   uw_lr: 0.01
   uw_weight_decay: 0.0
+  # SAM optimizer (Sharpness-Aware Minimization) configuration.
+  # To enable SAM, either set `name: sam` or `use_sam: true`.
+  use_sam: false
+  sam_rho: 0.05
+  sam_adaptive: true
 
 scheduler:
   name: cosine
