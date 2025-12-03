@@ -1,12 +1,11 @@
 {
   "enabled": false,
   "versions": [
-    "patch-reg3-1280-no-colorjitter",
-    "patch-reg3-1280-change-size",
-    "patch-reg3-1280-seed2",
-    "multilayer-patch-last4",
     "ratio-mlp-2560-manifold-mixup-extreme",
-    "multilayer-patch-7-15-23-31"
+    "multilayer-patch-7-15-23-31",
+    "multilayer-patch-last4",
+    "multilayer-patch-last4-log",
+    "multilayer-patch-7-15-23-31-sam-0.01-small-lr"
   ]
 }
 

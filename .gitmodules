@@ -22,3 +22,9 @@
 [submodule "third_party/sam"]
 	path = third_party/sam
 	url = git@github.com:davda54/sam.git
+[submodule "third_party/GSAM"]
+	path = third_party/GSAM
+	url = git@github.com:juntang-zhuang/GSAM.git
+[submodule "third_party/F-SAM"]
+	path = third_party/F-SAM
+	url = git@github.com:nblt/F-SAM.git

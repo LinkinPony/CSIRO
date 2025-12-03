@@ -161,6 +161,9 @@ class BiomassRegressor(LightningModule):
         # Multi-layer backbone features / layer-wise heads
         use_layerwise_heads: bool = False,
         backbone_layer_indices: Optional[List[int]] = None,
+        # When True, each selected backbone layer uses its own bottleneck MLP.
+        # When False, all layers share a single bottleneck (legacy behavior).
+        use_separate_bottlenecks: bool = True,
         # Optimizer / SAM configuration
         optimizer_name: Optional[str] = None,
         use_sam: bool = False,
@@ -207,48 +210,54 @@ class BiomassRegressor(LightningModule):
         # Supports a legacy activation-based MLP and a SwiGLU variant.
         hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
         act_name = (head_activation or "").lower()
-        layers: List[nn.Module] = []
         # For legacy heads, the backbone feature is CLS concat mean(patch) → 2 * embedding_dim.
         # When use_patch_reg3 is enabled, the main regression path and packed head operate
         # directly on patch-token dimensionality (embedding_dim), and global features are
         # reduced to this size before entering the bottleneck.
         use_patch = bool(use_patch_reg3)
-        if use_patch:
-            in_dim = embedding_dim
-        else:
-            in_dim = embedding_dim * 2
-        if dropout and dropout > 0:
-            layers.append(nn.Dropout(dropout))
 
-        if act_name == "swiglu":
-            # SwiGLU bottleneck: for each hidden_dim we use Linear(in_dim, 2 * hidden_dim)
-            # followed by a SwiGLU gate, which halves the dimension back to hidden_dim.
-            for hd in hidden_dims:
-                layers.append(nn.Linear(in_dim, hd * 2))
-                layers.append(SwiGLU())
-                if dropout and dropout > 0:
-                    layers.append(nn.Dropout(dropout))
-                in_dim = hd
-        else:
-            # Legacy MLP: Linear + pointwise activation (ReLU/GELU/SiLU).
-            def _act():
-                name = act_name
-                if name == "relu":
+        def _build_bottleneck() -> nn.Sequential:
+            layers: List[nn.Module] = []
+            if use_patch:
+                in_dim = embedding_dim
+            else:
+                in_dim = embedding_dim * 2
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+
+            if act_name == "swiglu":
+                # SwiGLU bottleneck: for each hidden_dim we use Linear(in_dim, 2 * hidden_dim)
+                # followed by a SwiGLU gate, which halves the dimension back to hidden_dim.
+                for hd in hidden_dims:
+                    layers.append(nn.Linear(in_dim, hd * 2))
+                    layers.append(SwiGLU())
+                    if dropout and dropout > 0:
+                        layers.append(nn.Dropout(dropout))
+                    in_dim = hd
+            else:
+                # Legacy MLP: Linear + pointwise activation (ReLU/GELU/SiLU).
+                def _act():
+                    name = act_name
+                    if name == "relu":
+                        return nn.ReLU(inplace=True)
+                    if name == "gelu":
+                        return nn.GELU()
+                    if name in ("silu", "swish"):
+                        return nn.SiLU(inplace=True)
                     return nn.ReLU(inplace=True)
-                if name == "gelu":
-                    return nn.GELU()
-                if name in ("silu", "swish"):
-                    return nn.SiLU(inplace=True)
-                return nn.ReLU(inplace=True)
 
-            for hd in hidden_dims:
-                layers.append(nn.Linear(in_dim, hd))
-                layers.append(_act())
-                if dropout and dropout > 0:
-                    layers.append(nn.Dropout(dropout))
-                in_dim = hd
+                for hd in hidden_dims:
+                    layers.append(nn.Linear(in_dim, hd))
+                    layers.append(_act())
+                    if dropout and dropout > 0:
+                        layers.append(nn.Dropout(dropout))
+                    in_dim = hd
 
-        self.shared_bottleneck = nn.Sequential(*layers)
+            return nn.Sequential(*layers)
+
+        # Default shared bottleneck (used when not using per-layer bottlenecks, and
+        # also as a fallback when layer-wise bottlenecks are not constructed).
+        self.shared_bottleneck = _build_bottleneck()
 
         # Task heads
         bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
@@ -275,12 +284,25 @@ class BiomassRegressor(LightningModule):
         if self.use_layerwise_heads:
             indices = normalize_layer_indices(backbone_layer_indices or [])
             if len(indices) == 0:
-                raise ValueError("When use_layerwise_heads is True, backbone_layer_indices must be non-empty.")
+                raise ValueError(
+                    "When use_layerwise_heads is True, backbone_layer_indices must be non-empty."
+                )
             self.backbone_layer_indices: List[int] = indices
             self.num_layers: int = len(indices)
         else:
             self.backbone_layer_indices = []
             self.num_layers = 0
+
+        # Optional per-layer bottlenecks for multi-layer heads
+        self.use_separate_bottlenecks: bool = bool(use_separate_bottlenecks)
+        if self.use_layerwise_heads and self.use_separate_bottlenecks:
+            # One bottleneck MLP per selected backbone layer.
+            self.layer_bottlenecks = nn.ModuleList(
+                [_build_bottleneck() for _ in range(self.num_layers)]
+            )
+        else:
+            # Either multi-layer heads are disabled or we keep using the shared bottleneck.
+            self.layer_bottlenecks = None  # type: ignore[assignment]
 
         self.mtl_enabled: bool = bool(mtl_enabled)
         # Per-task toggles (gated by global MTL flag)
@@ -320,7 +342,9 @@ class BiomassRegressor(LightningModule):
         # (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) which are later combined with
         # Dry_Total_g for 5D weighted MSE loss.
         self.enable_ratio_head: bool = bool(enable_ratio_head)
-        self.ratio_kl_weight: float = float(max(0.0, ratio_kl_weight))
+        # Weight for the ratio loss (currently MSE in probability domain).
+        # Kept argument name `ratio_kl_weight` for backward compatibility with existing checkpoints/configs.
+        self.ratio_loss_weight: float = float(max(0.0, ratio_kl_weight))
         self.enable_5d_loss: bool = bool(enable_5d_loss)
         self.loss_5d_weight: float = float(max(0.0, loss_5d_weight))
         self.ratio_components: List[str] = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"]
@@ -382,7 +406,12 @@ class BiomassRegressor(LightningModule):
         # Per-task UW parameters (dynamic per batch to avoid size mismatch)
         self._uw_task_params: Optional[nn.ParameterDict] = None
         if self.mtl_enabled and self.loss_weighting == "uw":
+            # Treat main biomass reg3, ratio loss and 5D loss as three separate UW tasks.
             task_names: List[str] = ["reg3"]
+            if self.enable_ratio_head:
+                task_names.append("ratio")
+            if self.enable_5d_loss and self.enable_ratio_head:
+                task_names.append("biomass_5d")
             # Keep auxiliary tasks for MTL
             if self.enable_height:
                 task_names.append("height")
@@ -392,9 +421,6 @@ class BiomassRegressor(LightningModule):
                 task_names.append("species")
             if self.enable_state:
                 task_names.append("state")
-            # Ratio and 5D losses are conceptually part of the main biomass task,
-            # so they are folded into the single "reg3" UW head rather than
-            # having their own uncertainty parameters.
             pdict = nn.ParameterDict({name: nn.Parameter(torch.zeros(1)) for name in task_names})
             self._uw_task_params = pdict
 
@@ -523,7 +549,9 @@ class BiomassRegressor(LightningModule):
             z_layers:         list of (B, bottleneck_dim) per-layer bottlenecks
         """
         if not self.use_layerwise_heads:
-            raise RuntimeError("_compute_reg3_and_z_multilayer called but use_layerwise_heads is False")
+            raise RuntimeError(
+                "_compute_reg3_and_z_multilayer called but use_layerwise_heads is False"
+            )
         if len(self.backbone_layer_indices) == 0:
             raise RuntimeError("backbone_layer_indices is empty in multi-layer path")
 
@@ -544,7 +572,12 @@ class BiomassRegressor(LightningModule):
                     raise RuntimeError(f"Unexpected patch tokens shape in multi-layer reg3: {tuple(pt.shape)}")
                 patch_mean = pt.mean(dim=1)  # (B, C)
                 feats = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
-                z_l = self.shared_bottleneck(feats)  # (B, bottleneck_dim)
+                # Select per-layer bottleneck if available; otherwise fall back to shared one.
+                if self.layer_bottlenecks is not None:
+                    bottleneck = self.layer_bottlenecks[layer_idx]
+                else:
+                    bottleneck = self.shared_bottleneck
+                z_l = bottleneck(feats)  # (B, bottleneck_dim)
                 z_layers.append(z_l)
                 # Select layer-specific reg3 heads if available; otherwise fall back to shared heads.
                 if self.layer_reg3_heads is not None:
@@ -560,11 +593,16 @@ class BiomassRegressor(LightningModule):
                     raise RuntimeError(f"Unexpected patch tokens shape in multi-layer patch-mode reg3: {tuple(pt.shape)}")
                 B, N, C = pt.shape
                 patch_mean = pt.mean(dim=1)  # (B, C)
-                z_global_l = self.shared_bottleneck(patch_mean)  # (B, bottleneck_dim)
+                # Select per-layer bottleneck if available; otherwise fall back to shared one.
+                if self.layer_bottlenecks is not None:
+                    bottleneck = self.layer_bottlenecks[layer_idx]
+                else:
+                    bottleneck = self.shared_bottleneck
+                z_global_l = bottleneck(patch_mean)  # (B, bottleneck_dim)
                 z_layers.append(z_global_l)
 
                 patch_features_flat = pt.reshape(B * N, C)
-                z_patches_flat = self.shared_bottleneck(patch_features_flat)  # (B*N, bottleneck_dim)
+                z_patches_flat = bottleneck(patch_features_flat)  # (B*N, bottleneck_dim)
                 if self.layer_reg3_heads is not None:
                     heads_l = list(self.layer_reg3_heads[layer_idx])
                 else:
@@ -809,8 +847,8 @@ class BiomassRegressor(LightningModule):
             for i in range(per_dim_mse.shape[0]):
                 self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
 
-        # --- Ratio KL loss (CSIRO only; masked via ratio_mask) ---
-        loss_ratio_kl: Optional[Tensor] = None
+        # --- Ratio MSE loss (CSIRO only; masked via ratio_mask) ---
+        loss_ratio_mse: Optional[Tensor] = None
         if self.enable_ratio_head:
             y_ratio: Optional[Tensor] = batch.get("y_ratio", None)  # (B,3)
             ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
@@ -823,19 +861,20 @@ class BiomassRegressor(LightningModule):
                     ratio_logits = average_layerwise_predictions(logits_per_layer)
                 else:
                     ratio_logits = self.ratio_head(z)  # type: ignore[operator]
-                log_p_pred = F.log_softmax(ratio_logits, dim=-1)
+                # Predicted probabilities
+                p_pred = F.softmax(ratio_logits, dim=-1)
                 # Ensure target is a proper distribution
                 p_true = y_ratio.clamp_min(0.0)
                 denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                 p_true = p_true / denom
-                # KL divergence per sample, then masked average
-                kl_per_dim = F.kl_div(log_p_pred, p_true, reduction="none")
-                kl_per_sample = kl_per_dim.sum(dim=-1, keepdim=True)  # (B,1)
-                m = ratio_mask.to(device=kl_per_sample.device, dtype=kl_per_sample.dtype)
-                num = (kl_per_sample * m).sum()
+                # Per-sample MSE over the 3 ratio components, then masked average
+                diff_ratio = p_pred - p_true
+                mse_per_sample = (diff_ratio * diff_ratio).sum(dim=-1, keepdim=True)  # (B,1)
+                m = ratio_mask.to(device=mse_per_sample.device, dtype=mse_per_sample.dtype)
+                num = (mse_per_sample * m).sum()
                 den = m.sum().clamp_min(1.0)
-                loss_ratio_kl = (num / den) * self.ratio_kl_weight
-                self.log(f"{stage}_loss_ratio_kl", loss_ratio_kl, on_step=False, on_epoch=True, prog_bar=False)
+                loss_ratio_mse = (num / den)
+                self.log(f"{stage}_loss_ratio_mse", loss_ratio_mse, on_step=False, on_epoch=True, prog_bar=False)
 
         # --- 5D weighted MSE loss over physical components ---
         loss_5d: Optional[Tensor] = None
@@ -897,7 +936,6 @@ class BiomassRegressor(LightningModule):
             valid_weight = w * (per_dim_den > 0).to(dtype=w.dtype)
             total_w = valid_weight.sum().clamp_min(1e-8)
             loss_5d = (w * mse_per_dim).sum() / total_w
-            loss_5d = loss_5d * self.loss_5d_weight
 
             # Log per-component MSE and aggregated loss
             names_5d = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
@@ -905,10 +943,10 @@ class BiomassRegressor(LightningModule):
                 self.log(f"{stage}_mse_5d_{name}", mse_per_dim[i], on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_loss_5d_weighted", loss_5d, on_step=False, on_epoch=True, prog_bar=False)
 
-        # Aggregate reg3 losses: base MSE + optional ratio KL + optional 5D weighted MSE
+        # Aggregate reg3-related losses for logging (independent of UW task structure)
         loss_reg3_total = loss_reg3_mse
-        if loss_ratio_kl is not None:
-            loss_reg3_total = loss_reg3_total + loss_ratio_kl
+        if loss_ratio_mse is not None:
+            loss_reg3_total = loss_reg3_total + loss_ratio_mse
         if loss_5d is not None:
             loss_reg3_total = loss_reg3_total + loss_5d
         self.log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
@@ -978,7 +1016,12 @@ class BiomassRegressor(LightningModule):
 
         # Collect losses in consistent order for UW/equal weighting
         named_losses: List[Tuple[str, Tensor]] = []
-        named_losses.append(("reg3", loss_reg3_total))
+        # Treat reg3, ratio and 5D as separate UW tasks when enabled.
+        named_losses.append(("reg3", loss_reg3_mse))
+        if loss_ratio_mse is not None:
+            named_losses.append(("ratio", loss_ratio_mse))
+        if loss_5d is not None:
+            named_losses.append(("biomass_5d", loss_5d))
 
         if self.enable_height:
             loss_height = F.mse_loss(pred_height, y_height)  # type: ignore[arg-type]

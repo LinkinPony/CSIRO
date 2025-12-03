@@ -266,8 +266,6 @@ def train_single_split(
     loss_cfg = cfg.get("loss", {})
     ratio_head_enabled = bool(loss_cfg.get("use_ratio_head", True))
     loss_5d_enabled = bool(loss_cfg.get("use_5d_weighted_mse", True))
-    ratio_kl_weight = float(loss_cfg.get("ratio_kl_weight", 1.0))
-    mse_5d_weight = float(loss_cfg.get("mse_5d_weight", 1.0))
     mse_5d_weights_per_target = list(
         loss_cfg.get(
             "mse_5d_weights_per_target",
@@ -276,9 +274,18 @@ def train_single_split(
     )
 
     # Multi-layer backbone / layer-wise head configuration (optional)
-    backbone_layers_cfg = cfg["model"].get("backbone_layers", {}) if isinstance(cfg.get("model", {}), dict) else {}
+    backbone_layers_cfg = (
+        cfg["model"].get("backbone_layers", {})
+        if isinstance(cfg.get("model", {}), dict)
+        else {}
+    )
     use_layerwise_heads = bool(backbone_layers_cfg.get("enabled", False))
     backbone_layer_indices = backbone_layers_cfg.get("indices", None)
+    # When true (default), use an independent bottleneck MLP for each selected layer.
+    # When false, all layers share a single bottleneck (legacy behavior).
+    use_separate_bottlenecks = bool(
+        backbone_layers_cfg.get("separate_bottlenecks", True)
+    )
 
     # Optimizer / SAM configuration
     optimizer_cfg = cfg.get("optimizer", {})
@@ -368,13 +375,15 @@ def train_single_split(
         ),
         # Biomass ratio / 5D loss configuration
         enable_ratio_head=ratio_head_enabled,
-        ratio_kl_weight=ratio_kl_weight,
+        # Keep ratio_kl_weight argument for checkpoint compatibility; it is not used for manual task weighting.
         enable_5d_loss=loss_5d_enabled,
-        loss_5d_weight=mse_5d_weight,
         biomass_5d_weights=mse_5d_weights_per_target,
         # Multi-layer heads
         use_layerwise_heads=use_layerwise_heads,
-        backbone_layer_indices=list(backbone_layer_indices) if isinstance(backbone_layer_indices, (list, tuple)) else None,
+        backbone_layer_indices=list(backbone_layer_indices)
+        if isinstance(backbone_layer_indices, (list, tuple))
+        else None,
+        use_separate_bottlenecks=use_separate_bottlenecks,
         optimizer_name=optimizer_name,
         use_sam=use_sam,
         sam_rho=sam_rho,

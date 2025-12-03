@@ -7,7 +7,7 @@ import torch
 from lightning.pytorch.callbacks import Callback
 from torch import nn
 
-from src.models.head_builder import build_head_layer
+from src.models.head_builder import build_head_layer, MultiLayerHeadExport
 from src.models.peft_integration import export_lora_payload_if_any
 
 
@@ -63,27 +63,109 @@ class HeadCheckpoint(Callback):
             use_patch_reg3 = bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False
             use_layerwise_heads = bool(getattr(pl_module.hparams, "use_layerwise_heads", False)) if hasattr(pl_module, "hparams") else False
             backbone_layer_indices = list(getattr(pl_module.hparams, "backbone_layer_indices", [])) if hasattr(pl_module, "hparams") else []
+            use_separate_bottlenecks = bool(
+                getattr(pl_module.hparams, "use_separate_bottlenecks", False)
+            ) if hasattr(pl_module, "hparams") else False
 
             # For backward compatibility, when layer-wise heads are disabled we continue
             # to use a simple MLP head built via build_head_layer. When layer-wise heads
-            # are enabled, we still export a packed MLP head, but its final linear layer
-            # contains concatenated per-layer weights. The inference script remains
-            # responsible for interpreting these weights correctly; here we only pack.
-            head_module = build_head_layer(
-                embedding_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)),
-                num_outputs=head_total_outputs if not use_layerwise_heads else head_total_outputs * max(1, len(backbone_layer_indices)),
-                head_hidden_dims=list(getattr(pl_module.hparams, "head_hidden_dims", [])),
-                head_activation=str(getattr(pl_module.hparams, "head_activation", "relu")),
-                dropout=float(getattr(pl_module.hparams, "dropout", 0.0)),
-                use_output_softplus=use_output_softplus_eff,
-                input_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)) if use_patch_reg3 else None,
-            )
+            # are enabled and separate bottlenecks are *not* used, we still export a
+            # packed MLP head whose final Linear contains concatenated per-layer weights.
+            # When both layer-wise heads and separate bottlenecks are enabled, we export
+            # a dedicated MultiLayerHeadExport that mirrors the training-time structure.
+            if use_layerwise_heads and use_separate_bottlenecks and hasattr(pl_module, "layer_bottlenecks"):
+                # Multi-layer + per-layer bottlenecks: export explicit per-layer MLPs.
+                embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024))
+                head_hidden_dims = list(getattr(pl_module.hparams, "head_hidden_dims", []))
+                head_activation = str(getattr(pl_module.hparams, "head_activation", "relu"))
+                dropout = float(getattr(pl_module.hparams, "dropout", 0.0))
+
+                layer_bottlenecks = list(getattr(pl_module, "layer_bottlenecks", []))
+                layer_reg3_heads = list(getattr(pl_module, "layer_reg3_heads", []))
+                layer_ratio_heads = (
+                    list(getattr(pl_module, "layer_ratio_heads"))
+                    if hasattr(pl_module, "layer_ratio_heads") and getattr(pl_module, "layer_ratio_heads") is not None
+                    else []
+                )
+                num_layers = len(layer_bottlenecks)
+                if num_layers == 0:
+                    raise RuntimeError(
+                        "use_layerwise_heads and use_separate_bottlenecks are True, but layer_bottlenecks is empty."
+                    )
+
+                head_module = MultiLayerHeadExport(
+                    embedding_dim=embedding_dim,
+                    num_outputs_main=num_outputs_main,
+                    num_outputs_ratio=num_ratio_outputs,
+                    head_hidden_dims=head_hidden_dims,
+                    head_activation=head_activation,
+                    dropout=dropout,
+                    use_patch_reg3=use_patch_reg3,
+                    num_layers=num_layers,
+                )
+
+                # Copy per-layer bottlenecks and heads 1:1 into the export module.
+                with torch.no_grad():
+                    # Bottlenecks
+                    for idx in range(num_layers):
+                        src_b = layer_bottlenecks[idx]
+                        dst_b = head_module.layer_bottlenecks[idx]
+                        dst_b.load_state_dict(src_b.state_dict())
+
+                    # reg3 heads
+                    for l_idx in range(num_layers):
+                        src_reg3_list = list(layer_reg3_heads[l_idx])
+                        dst_reg3_list = list(head_module.layer_reg3_heads[l_idx])
+                        if len(src_reg3_list) != len(dst_reg3_list):
+                            raise RuntimeError("Mismatch in number of reg3 heads per layer during export")
+                        for s, t in zip(src_reg3_list, dst_reg3_list):
+                            if not isinstance(s, nn.Linear) or not isinstance(t, nn.Linear) or s.out_features != t.out_features:
+                                raise RuntimeError("Expected Linear reg3 heads when exporting MultiLayerHeadExport")
+                            t.weight.copy_(s.weight.data)
+                            if t.bias is not None and s.bias is not None:
+                                t.bias.copy_(s.bias.data)
+
+                    # Ratio heads (optional)
+                    if num_ratio_outputs > 0 and head_module.layer_ratio_heads is not None:
+                        if layer_ratio_heads and len(layer_ratio_heads) != num_layers:
+                            raise RuntimeError("Mismatch in number of ratio heads per layer during export")
+                        for l_idx in range(num_layers):
+                            # Prefer layer-specific ratio heads when available; otherwise fall back to shared ratio_head.
+                            if l_idx < len(layer_ratio_heads) and isinstance(layer_ratio_heads[l_idx], nn.Linear):
+                                src_r = layer_ratio_heads[l_idx]
+                            elif isinstance(ratio_head, nn.Linear):
+                                src_r = ratio_head
+                            else:
+                                raise RuntimeError("Missing ratio head for MultiLayerHeadExport")
+                            dst_r = head_module.layer_ratio_heads[l_idx]
+                            if not isinstance(dst_r, nn.Linear) or src_r.out_features != dst_r.out_features:
+                                raise RuntimeError("ratio_head out_features mismatch during export")
+                            dst_r.weight.copy_(src_r.weight.data)
+                            if dst_r.bias is not None and src_r.bias is not None:
+                                dst_r.bias.copy_(src_r.bias.data)
+
+                state_dict_to_save = head_module.state_dict()
+
+            else:
+                head_module = build_head_layer(
+                    embedding_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)),
+                    num_outputs=head_total_outputs
+                    if not use_layerwise_heads
+                    else head_total_outputs * max(1, len(backbone_layer_indices)),
+                    head_hidden_dims=list(getattr(pl_module.hparams, "head_hidden_dims", [])),
+                    head_activation=str(getattr(pl_module.hparams, "head_activation", "relu")),
+                    dropout=float(getattr(pl_module.hparams, "dropout", 0.0)),
+                    use_output_softplus=use_output_softplus_eff,
+                    input_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)) if use_patch_reg3 else None,
+                )
 
             def collect_linears(m: nn.Module):
                 return [mod for mod in m.modules() if isinstance(mod, nn.Linear)]
 
             # New-style model: shared_bottleneck + reg3_heads (one or more independent 1-d heads)
-            if hasattr(pl_module, "shared_bottleneck") and hasattr(pl_module, "reg3_heads"):
+            if hasattr(pl_module, "shared_bottleneck") and hasattr(pl_module, "reg3_heads") and not (
+                use_layerwise_heads and use_separate_bottlenecks and hasattr(pl_module, "layer_bottlenecks")
+            ):
                 bottleneck_linears = collect_linears(pl_module.shared_bottleneck)
                 tgt_linears = collect_linears(head_module)
                 if len(tgt_linears) != len(bottleneck_linears) + 1:
@@ -211,6 +293,8 @@ class HeadCheckpoint(Callback):
                 # backbone blocks were selected.
                 "use_layerwise_heads": bool(getattr(pl_module.hparams, "use_layerwise_heads", False)) if hasattr(pl_module, "hparams") else False,
                 "backbone_layer_indices": list(getattr(pl_module.hparams, "backbone_layer_indices", [])) if hasattr(pl_module, "hparams") else [],
+                # Whether per-layer bottlenecks were used together with layer-wise heads.
+                "use_separate_bottlenecks": bool(getattr(pl_module.hparams, "use_separate_bottlenecks", False)) if hasattr(pl_module, "hparams") else False,
                 # Order of ratio components packed in the head (if any)
                 "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
             },

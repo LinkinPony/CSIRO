@@ -63,7 +63,7 @@ if not os.path.isdir(_SRC_DIR):
 if _PROJECT_DIR_ABS not in sys.path:
     sys.path.insert(0, _PROJECT_DIR_ABS)
 
-from src.models.head_builder import build_head_layer  # noqa: E402
+from src.models.head_builder import build_head_layer, MultiLayerHeadExport  # noqa: E402
 from src.models.peft_integration import _import_peft  # noqa: E402
 from src.data.augmentations import build_eval_transform  # noqa: E402
 
@@ -619,6 +619,7 @@ def predict_main_and_ratio_patch_mode(
     head_total: int,
     use_layerwise_heads: bool,
     num_layers: int,
+    use_separate_bottlenecks: bool,
     layer_indices: Optional[List[int]] = None,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
@@ -657,8 +658,10 @@ def predict_main_and_ratio_patch_mode(
             images = images.to(device, non_blocking=True)
 
             # Multi-layer path: use DINO get_intermediate_layers to obtain per-layer
-            # CLS and patch tokens, then apply the packed head on each layer-specific
-            # patch feature and slice out that layer's segment in the final linear.
+            # CLS and patch tokens. For legacy packed heads, we apply the shared head
+            # on each layer-specific patch feature and slice that layer's segment from
+            # the final linear. For MultiLayerHeadExport (separate bottlenecks), we call
+            # its explicit per-layer forward.
             if use_layerwise_heads and num_layers > 1 and layer_indices is not None and len(layer_indices) > 0:
                 cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
                 if len(cls_list) != len(pt_list) or len(cls_list) != num_layers:
@@ -671,35 +674,44 @@ def predict_main_and_ratio_patch_mode(
                     if pt_l.dim() != 3:
                         raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt_l.shape)}")
                     B, N, C = pt_l.shape
-
-                    if head_num_main > 0:
-                        patch_features_flat = pt_l.reshape(B * N, C)  # (B*N, C)
-                        out_all_patch = head(patch_features_flat)  # (B*N, head_total * L)
-                        expected_dim = head_total * num_layers
-                        if out_all_patch.shape[1] != expected_dim:
-                            raise RuntimeError(
-                                f"Unexpected packed head dimension in patch-mode multi-layer: got {out_all_patch.shape[1]}, "
-                                f"expected {expected_dim}"
-                            )
-                        offset = l_idx * head_total
-                        layer_slice = out_all_patch[:, offset : offset + head_total]  # (B*N, head_total)
-                        layer_main = layer_slice[:, :head_num_main]  # (B*N, head_num_main)
-                        layer_main = layer_main.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
-                        main_layers_batch.append(layer_main)
+                    if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
+                        # New path: explicit per-layer bottlenecks encoded in head.
+                        layer_main, layer_ratio = head.forward_patch_layer(pt_l, l_idx)
                     else:
-                        # No main outputs; keep empty tensor for consistency
-                        main_layers_batch.append(torch.empty((B, 0), dtype=torch.float32, device=device))
+                        if head_num_main > 0:
+                            patch_features_flat = pt_l.reshape(B * N, C)  # (B*N, C)
+                            out_all_patch = head(patch_features_flat)  # (B*N, head_total * L)
+                            expected_dim = head_total * num_layers
+                            if out_all_patch.shape[1] != expected_dim:
+                                raise RuntimeError(
+                                    f"Unexpected packed head dimension in patch-mode multi-layer: got {out_all_patch.shape[1]}, "
+                                    f"expected {expected_dim}"
+                                )
+                            offset = l_idx * head_total
+                            layer_slice = out_all_patch[:, offset : offset + head_total]  # (B*N, head_total)
+                            layer_main = layer_slice[:, :head_num_main]  # (B*N, head_num_main)
+                            layer_main = layer_main.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+                        else:
+                            # No main outputs; keep empty tensor for consistency
+                            layer_main = torch.empty((B, 0), dtype=torch.float32, device=device)
 
-                    if head_num_ratio > 0:
-                        patch_mean_l = pt_l.mean(dim=1)  # (B, C)
-                        out_all_global = head(patch_mean_l)  # (B, head_total * L)
-                        if out_all_global.shape[1] != expected_dim:
-                            raise RuntimeError(
-                                f"Unexpected packed head dimension for ratio logits in patch-mode multi-layer: got {out_all_global.shape[1]}, "
-                                f"expected {expected_dim}"
-                            )
-                        layer_slice_g = out_all_global[:, offset : offset + head_total]  # (B, head_total)
-                        layer_ratio = layer_slice_g[:, head_num_main : head_num_main + head_num_ratio]  # (B, head_num_ratio)
+                        if head_num_ratio > 0:
+                            patch_mean_l = pt_l.mean(dim=1)  # (B, C)
+                            out_all_global = head(patch_mean_l)  # (B, head_total * L)
+                            if out_all_global.shape[1] != expected_dim:
+                                raise RuntimeError(
+                                    f"Unexpected packed head dimension for ratio logits in patch-mode multi-layer: got {out_all_global.shape[1]}, "
+                                    f"expected {expected_dim}"
+                                )
+                            layer_slice_g = out_all_global[:, offset : offset + head_total]  # (B, head_total)
+                            layer_ratio = layer_slice_g[
+                                :, head_num_main : head_num_main + head_num_ratio
+                            ]  # (B, head_num_ratio)
+                        else:
+                            layer_ratio = None
+
+                    main_layers_batch.append(layer_main)
+                    if layer_ratio is not None:
                         ratio_layers_batch.append(layer_ratio)
 
                 # Average over layers
@@ -768,6 +780,8 @@ def predict_main_and_ratio_global_multilayer(
     head_num_ratio: int,
     head_total: int,
     layer_indices: List[int],
+    *,
+    use_separate_bottlenecks: bool = False,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Global (CLS+mean(patch)) multi-layer inference for a single head:
@@ -814,26 +828,36 @@ def predict_main_and_ratio_global_multilayer(
                     raise RuntimeError(f"Unexpected patch tokens shape in global multi-layer inference: {tuple(pt_l.shape)}")
                 B, N, C = pt_l.shape
                 patch_mean_l = pt_l.mean(dim=1)  # (B, C)
-                feats_l = torch.cat([cls_l, patch_mean_l], dim=-1)  # (B, 2C)
-
-                out_all = head(feats_l)  # (B, head_total * num_layers)
-                expected_dim = head_total * num_layers
-                if out_all.shape[1] != expected_dim:
-                    raise RuntimeError(
-                        f"Unexpected packed head dimension in global multi-layer: got {out_all.shape[1]}, "
-                        f"expected {expected_dim}"
-                    )
-                offset = l_idx * head_total
-                layer_slice = out_all[:, offset : offset + head_total]  # (B, head_total)
-
-                if head_num_main > 0:
-                    layer_main = layer_slice[:, :head_num_main]  # (B, head_num_main)
+                if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
+                    # Explicit per-layer bottlenecks: call dedicated global-layer path.
+                    layer_main, layer_ratio = head.forward_global_layer(cls_l, patch_mean_l, l_idx)
                 else:
-                    layer_main = torch.empty((B, 0), dtype=torch.float32, device=device)
-                main_layers_batch.append(layer_main)
+                    feats_l = torch.cat([cls_l, patch_mean_l], dim=-1)  # (B, 2C)
 
-                if head_num_ratio > 0:
-                    layer_ratio = layer_slice[:, head_num_main : head_num_main + head_num_ratio]  # (B, head_num_ratio)
+                    out_all = head(feats_l)  # (B, head_total * num_layers)
+                    expected_dim = head_total * num_layers
+                    if out_all.shape[1] != expected_dim:
+                        raise RuntimeError(
+                            f"Unexpected packed head dimension in global multi-layer: got {out_all.shape[1]}, "
+                            f"expected {expected_dim}"
+                        )
+                    offset = l_idx * head_total
+                    layer_slice = out_all[:, offset : offset + head_total]  # (B, head_total)
+
+                    if head_num_main > 0:
+                        layer_main = layer_slice[:, :head_num_main]  # (B, head_num_main)
+                    else:
+                        layer_main = torch.empty((B, 0), dtype=torch.float32, device=device)
+
+                    if head_num_ratio > 0:
+                        layer_ratio = layer_slice[
+                            :, head_num_main : head_num_main + head_num_ratio
+                        ]  # (B, head_num_ratio)
+                    else:
+                        layer_ratio = None
+
+                main_layers_batch.append(layer_main)
+                if layer_ratio is not None:
                     ratio_layers_batch.append(layer_ratio)
 
             # Average over layers
@@ -986,6 +1010,7 @@ def main():
     use_patch_reg3_default = bool(first_meta.get("use_patch_reg3", False))
     use_layerwise_heads_default = bool(first_meta.get("use_layerwise_heads", False))
     backbone_layer_indices_default = list(first_meta.get("backbone_layer_indices", []))
+    use_separate_bottlenecks_default = bool(first_meta.get("use_separate_bottlenecks", False))
 
     # Build weighted/mean ensemble by running per-head feature extraction (supports per-head LoRA).
     # Only require that all heads share the same embedding_dim (backbone choice); ratio/patch
@@ -1071,24 +1096,50 @@ def main():
         # Determine whether this head uses layer-wise heads and which backbone layers.
         use_layerwise_heads_head = bool(meta.get("use_layerwise_heads", use_layerwise_heads_default))
         backbone_layer_indices_head = list(meta.get("backbone_layer_indices", backbone_layer_indices_default))
+        use_separate_bottlenecks_head = bool(
+            meta.get("use_separate_bottlenecks", use_separate_bottlenecks_default)
+        )
         # Determine whether this head uses the ratio format.
         head_is_ratio = bool(head_num_ratio > 0 and head_total == (head_num_main + head_num_ratio))
-        # When layer-wise heads are used, the packed head stores concatenated per-layer
-        # outputs in its final linear layer. The inference pipeline remains compatible
-        # by interpreting these outputs accordingly when producing final predictions.
-        effective_outputs = head_total if not use_layerwise_heads_head else head_total * max(1, len(backbone_layer_indices_head))
-        head_module = build_head_layer(
-            embedding_dim=head_embedding_dim,
-            num_outputs=effective_outputs if head_is_ratio else (head_num_main if not use_layerwise_heads_head else head_num_main * max(1, len(backbone_layer_indices_head))),
-            head_hidden_dims=head_hidden_dims,
-            head_activation=head_activation,
-            dropout=head_dropout,
-            use_output_softplus=False,
-            # For patch-mode heads, the packed MLP expects patch-token dimensionality
-            # (embedding_dim) as input. Legacy heads default to CLS+mean(patch) with
-            # 2 * embedding_dim and therefore do not override input_dim.
-            input_dim=head_embedding_dim if use_patch_reg3_head else None,
-        )
+        # When layer-wise heads are used, the packed head normally stores concatenated
+        # per-layer outputs in its final linear layer. When separate bottlenecks are
+        # also enabled, we instead export an explicit MultiLayerHeadExport that mirrors
+        # the training-time per-layer structure.
+        if use_layerwise_heads_head and use_separate_bottlenecks_head:
+            num_layers_eff = max(1, len(backbone_layer_indices_head))
+            head_module = MultiLayerHeadExport(
+                embedding_dim=head_embedding_dim,
+                num_outputs_main=head_num_main,
+                num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
+                head_hidden_dims=head_hidden_dims,
+                head_activation=head_activation,
+                dropout=head_dropout,
+                use_patch_reg3=use_patch_reg3_head,
+                num_layers=num_layers_eff,
+            )
+        else:
+            # Legacy / shared-bottleneck packed head.
+            effective_outputs = head_total if not use_layerwise_heads_head else head_total * max(
+                1, len(backbone_layer_indices_head)
+            )
+            head_module = build_head_layer(
+                embedding_dim=head_embedding_dim,
+                num_outputs=effective_outputs
+                if head_is_ratio
+                else (
+                    head_num_main
+                    if not use_layerwise_heads_head
+                    else head_num_main * max(1, len(backbone_layer_indices_head))
+                ),
+                head_hidden_dims=head_hidden_dims,
+                head_activation=head_activation,
+                dropout=head_dropout,
+                use_output_softplus=False,
+                # For patch-mode heads, the packed MLP expects patch-token dimensionality
+                # (embedding_dim) as input. Legacy heads default to CLS+mean(patch) with
+                # 2 * embedding_dim and therefore do not override input_dim.
+                input_dim=head_embedding_dim if use_patch_reg3_head else None,
+            )
         head_module.load_state_dict(state, strict=True)
 
         if use_patch_reg3_head:
@@ -1111,6 +1162,7 @@ def main():
                 head_total=head_total,
                 use_layerwise_heads=use_layerwise_heads_head,
                 num_layers=max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1,
+                use_separate_bottlenecks=use_separate_bottlenecks_head,
                 layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
             )
         else:
@@ -1130,6 +1182,7 @@ def main():
                     head_num_ratio=head_num_ratio if head_is_ratio else 0,
                     head_total=head_total,
                     layer_indices=backbone_layer_indices_head,
+                    use_separate_bottlenecks=use_separate_bottlenecks_head,
                 )
             else:
                 # Legacy single-layer path: extract CLS+mean(patch) only from last layer.

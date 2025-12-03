@@ -1,5 +1,5 @@
-seed: 998244353
-version: multilayer-patch-last4-log-seed2
+seed: 42
+version: multilayer-log-seperate-uw-no-kl-no-log
 data:
   root: data
   train_csv: train.csv
@@ -9,7 +9,7 @@ data:
     csiro:
       width_m: 0.7
       length_m: 0.3
-  image_size: [1120, 480]
+  image_size: [960, 480]
   batch_size: 1
   val_batch_size: 1
   num_workers: 20
@@ -101,7 +101,7 @@ model:
   pretrained: true
   freeze_backbone: true
   embedding_dim: 1280
-  log_scale_targets: true
+  log_scale_targets: false
   head:
     type: mlp
     hidden_dims: [1280]
@@ -114,11 +114,11 @@ model:
     # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
     # the global CLS + mean(patch) bottleneck.
     use_patch_reg3: true
-  # Optional: use multiple backbone layers with shared bottleneck and
-  # layer-specific heads whose predictions are averaged across layers.
-  # When disabled, the model falls back to using only the last layer features.
   backbone_layers:
     enabled: true
+    # When true, each selected backbone layer uses its own bottleneck MLP.
+    # When false, all layers share a single bottleneck (legacy behavior).
+    separate_bottlenecks: true
     # Indices refer to DINOv3 transformer blocks (0-based). For dinov3_vith16plus
     # the depth is 32, so valid indices are in [0, 31]. Example: use the last 4 layers.
     indices: [28, 29, 30, 31]
@@ -157,13 +157,9 @@ loss:
   weighting: uw
   # Enable/disable the biomass ratio head (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
   use_ratio_head: true
-  # KL divergence weight for the ratio head
-  ratio_kl_weight: 1.0
   # Enable/disable 5D weighted MSE loss computed on:
   # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
   use_5d_weighted_mse: true
-  # Global multiplier for the 5D weighted MSE term
-  mse_5d_weight: 1.0
   # Per-component weights for the 5D MSE term.
   mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
 
