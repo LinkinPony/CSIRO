@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -279,33 +279,102 @@ def predict_from_features(features_cpu: torch.Tensor, head: nn.Module, batch_siz
     return torch.cat(outputs, dim=0) if outputs else torch.empty((0, 3), dtype=torch.float32)
 
 
-def compute_metrics(preds: torch.Tensor, targets: torch.Tensor) -> Dict[str, float]:
+def compute_metrics(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    global_targets: Optional[torch.Tensor] = None,
+    target_names: Optional[List[str]] = None,
+) -> Dict[str, float]:
+    """
+    Compute regression metrics with R^2 defined in log space and using a global
+    dataset mean for the R^2 baseline, following the competition DESCRIPTION.
+
+    Args:
+        preds:   (N, D) predictions in grams.
+        targets: (N, D) ground-truth in grams for the current evaluation subset.
+        global_targets: Optional (M, D) tensor of ground-truth grams over the
+            full dataset used to define the baseline mean for R^2.
+        target_names: Optional list of D target names used to map weights.
+    """
     preds = preds.float()
     targets = targets.float()
+
+    # Basic metrics (linear space, grams)
     diff = preds - targets
     mse = torch.mean(diff ** 2).item()
     mae = torch.mean(torch.abs(diff)).item()
     rmse = float(np.sqrt(mse))
-    # Global R^2 across all outputs (same as training computation)
-    ss_res = torch.sum((targets - preds) ** 2)
-    mean_t = torch.mean(targets)
-    ss_tot = torch.sum((targets - mean_t) ** 2)
-    r2 = (1.0 - (ss_res / (ss_tot + 1e-8))).item()
-    # Per-target metrics
+
+    # --- R^2 in log space ---
+    eps = 1e-8
+    preds_clamp = preds.clamp_min(0.0)
+    targets_clamp = targets.clamp_min(0.0)
+    preds_log = torch.log1p(preds_clamp)
+    targets_log = torch.log1p(targets_clamp)
+
+    # Baseline: constant predictor equal to the global dataset mean (in grams)
+    # evaluated in log-space.
+    if global_targets is not None:
+        g = global_targets.float().clamp_min(0.0)
+        g_mean = torch.mean(g, dim=0)  # (D,) mean in grams over full dataset
+        mean_log = torch.log1p(g_mean)
+    else:
+        # Fallback: mean over the current evaluation subset
+        mean_log = torch.mean(targets_log, dim=0)
+
+    # Per-target R^2 in log space
+    diff_log = preds_log - targets_log
+    ss_res_per = torch.sum(diff_log ** 2, dim=0)  # (D,)
+    ss_tot_per = torch.sum((targets_log - mean_log) ** 2, dim=0)
+    r2_per = 1.0 - (ss_res_per / (ss_tot_per + eps))
+
+    # Map DESCRIPTION weights onto the provided target names
+    if target_names is None:
+        target_names = [f"dim_{i}" for i in range(r2_per.shape[0])]
+    weight_map = {
+        "Dry_Green_g": 0.1,
+        "Dry_Dead_g": 0.1,
+        "Dry_Clover_g": 0.1,
+        "GDM_g": 0.2,
+        "Dry_Total_g": 0.5,
+    }
+    weights_list: List[float] = []
+    for name in target_names:
+        w = float(weight_map.get(str(name), 1.0))
+        weights_list.append(w)
+    w = torch.tensor(weights_list, dtype=r2_per.dtype)
+    w = w.to(device=r2_per.device)
+
+    # Weighted R^2 across dimensions (competition-style aggregation)
+    valid = torch.isfinite(r2_per)
+    w_eff = w * valid.to(dtype=w.dtype)
+    denom = w_eff.sum().clamp_min(eps)
+    r2_weighted = float((w_eff * r2_per).sum() / denom)
+
+    # Per-target metrics in linear space (kept for backward compatibility)
     per_target_mse = torch.mean(diff ** 2, dim=0).tolist()
     per_target_mae = torch.mean(torch.abs(diff), dim=0).tolist()
-    return {
+
+    out: Dict[str, float] = {
         "mse": mse,
         "mae": mae,
         "rmse": rmse,
-        "r2": r2,
-        "mse_dc": float(per_target_mse[0]),
-        "mse_dd": float(per_target_mse[1]),
-        "mse_dg": float(per_target_mse[2]),
-        "mae_dc": float(per_target_mae[0]),
-        "mae_dd": float(per_target_mae[1]),
-        "mae_dg": float(per_target_mae[2]),
+        "r2": r2_weighted,
     }
+    # Legacy naming for 3 base components when available
+    if len(per_target_mse) >= 3 and len(per_target_mae) >= 3:
+        out.update(
+            {
+                "mse_dc": float(per_target_mse[0]),
+                "mse_dd": float(per_target_mse[1]),
+                "mse_dg": float(per_target_mse[2]),
+                "mae_dc": float(per_target_mae[0]),
+                "mae_dd": float(per_target_mae[1]),
+                "mae_dg": float(per_target_mae[2]),
+            }
+        )
+    return out
 
 
 def _write_test_csv_for_images(
@@ -410,14 +479,17 @@ def main():
     image_size = _parse_image_size(train_cfg["data"]["image_size"])
     mean = list(train_cfg["data"]["normalization"]["mean"])
     std = list(train_cfg["data"]["normalization"]["std"])
-    target_order = list(train_cfg["data"]["target_order"])  # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g]
+    dm_target_order = list(train_cfg["data"]["target_order"])
+    # Fixed 5D targets used for all R^2 computations (competition definition)
+    score_targets = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
     val_batch_size = int(train_cfg["data"].get("val_batch_size", train_cfg["data"]["batch_size"]))
     num_workers = int(train_cfg["data"].get("num_workers", 4))
     logger.info(
-        "Data settings: root={} image_size={} targets={} val_bs={} workers={}",
+        "Data settings: root={} image_size={} dm_targets={} score_targets={} val_bs={} workers={}",
         data_root,
         image_size,
-        target_order,
+        dm_target_order,
+        score_targets,
         val_batch_size,
         num_workers,
     )
@@ -434,7 +506,7 @@ def main():
         val_batch_size=val_batch_size,
         num_workers=num_workers,
         val_split=float(train_cfg["data"]["val_split"]),
-        target_order=target_order,
+        target_order=dm_target_order,
         mean=mean,
         std=std,
         train_scale=tuple(train_cfg["data"]["augment"]["random_resized_crop_scale"]),
@@ -470,8 +542,15 @@ def main():
 
     per_fold_metrics: List[Dict[str, float]] = []
     per_fold_rows: List[Dict[str, object]] = []
+    all_fold_preds: List[torch.Tensor] = []
+    all_fold_targets: List[torch.Tensor] = []
 
     logger.info("[4/4] Running per-fold validation inference via infer_and_submit_pt ...")
+    # Pre-compute global targets (in grams) for metric baselines (fixed 5D order).
+    full_targets_tensor = torch.from_numpy(
+        full_df[score_targets].to_numpy(dtype=np.float32)
+    )
+
     for fold_idx in range(k_cfg):
         val_csv = fold_splits_root / f"fold_{fold_idx}" / "val.csv"
         if not val_csv.is_file():
@@ -483,7 +562,7 @@ def main():
         logger.info("Fold {}: val rows={} ({})", fold_idx, len(merged), val_csv.name)
 
         image_paths = merged["image_path"].astype(str).tolist()
-        targets = torch.from_numpy(merged[target_order].to_numpy(dtype=np.float32))
+        targets = torch.from_numpy(merged[score_targets].to_numpy(dtype=np.float32))
 
         tmp_dir = out_ver_dir / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -494,7 +573,7 @@ def main():
         # Build test.csv for this fold and run the unified inference
         _write_test_csv_for_images(
             image_paths=image_paths,
-            target_order=target_order,
+            target_order=score_targets,
             out_csv_path=test_csv_path,
         )
 
@@ -510,11 +589,23 @@ def main():
 
         # Read predictions and compute metrics
         wide_preds = _read_submission_as_wide(sub_csv_path, test_csv_path)
-        # Ensure order matches image_paths
-        pred_map = {r["image_path"]: [r.get(target_order[0], 0.0), r.get(target_order[1], 0.0), r.get(target_order[2], 0.0)] for _, r in wide_preds.iterrows()}
+        # Ensure order matches image_paths; collect predictions in fixed 5D order.
+        pred_map = {
+            r["image_path"]: [r.get(name, 0.0) for name in score_targets]
+            for _, r in wide_preds.iterrows()
+        }
         preds_mat = torch.tensor([pred_map[p] for p in image_paths], dtype=torch.float32)
 
-        m = compute_metrics(preds=preds_mat, targets=targets)
+        # Accumulate for global cross-fold metrics (5D).
+        all_fold_preds.append(preds_mat)
+        all_fold_targets.append(targets)
+
+        m = compute_metrics(
+            preds=preds_mat,
+            targets=targets,
+            global_targets=full_targets_tensor,
+            target_names=score_targets,
+        )
         per_fold_metrics.append({"fold": float(fold_idx), **m})
         logger.info(
             "Fold {} metrics: MSE={:.6f} MAE={:.6f} RMSE={:.6f} R2={:.4f}",
@@ -529,14 +620,19 @@ def main():
             per_fold_rows.append(
                 {
                     "fold": fold_idx,
+                    "fold": fold_idx,
                     "image_id": merged.iloc[i]["image_id"],
                     "image_path": merged.iloc[i]["image_path"],
-                    "target_dc": float(merged.iloc[i][target_order[0]]),
-                    "target_dd": float(merged.iloc[i][target_order[1]]),
-                    "target_dg": float(merged.iloc[i][target_order[2]]),
+                    "target_dc": float(merged.iloc[i]["Dry_Clover_g"]),
+                    "target_dd": float(merged.iloc[i]["Dry_Dead_g"]),
+                    "target_dg": float(merged.iloc[i]["Dry_Green_g"]),
+                    "target_gdm": float(merged.iloc[i]["GDM_g"]),
+                    "target_dt": float(merged.iloc[i]["Dry_Total_g"]),
                     "pred_dc": float(preds_mat[i, 0].item()),
                     "pred_dd": float(preds_mat[i, 1].item()),
                     "pred_dg": float(preds_mat[i, 2].item()),
+                    "pred_gdm": float(preds_mat[i, 3].item()),
+                    "pred_dt": float(preds_mat[i, 4].item()),
                 }
             )
 
@@ -549,9 +645,15 @@ def main():
         json.dump(per_fold_metrics, f, indent=2)
     logger.success("Saved per-fold metrics JSON -> {}", per_fold_metrics_path)
 
-    all_preds_tensor = torch.from_numpy(per_fold_pred_df[["pred_dc", "pred_dd", "pred_dg"]].to_numpy(dtype=np.float32))
-    all_targets_tensor = torch.from_numpy(per_fold_pred_df[["target_dc", "target_dd", "target_dg"]].to_numpy(dtype=np.float32))
-    agg_per_fold_metrics = compute_metrics(all_preds_tensor, all_targets_tensor)
+    # Aggregate across all folds using concatenated 5D predictions/targets.
+    all_preds_tensor = torch.cat(all_fold_preds, dim=0)
+    all_targets_tensor = torch.cat(all_fold_targets, dim=0)
+    agg_per_fold_metrics = compute_metrics(
+        all_preds_tensor,
+        all_targets_tensor,
+        global_targets=full_targets_tensor,
+        target_names=score_targets,
+    )
     logger.info(
         "Aggregated per-fold metrics: MSE={:.6f} MAE={:.6f} RMSE={:.6f} R2={:.4f}",
         agg_per_fold_metrics["mse"],
@@ -575,7 +677,7 @@ def main():
     sub_csv_path = tmp_dir / "ensemble_full_submission.csv"
     _write_test_csv_for_images(
         image_paths=unique_paths,
-        target_order=target_order,
+        target_order=score_targets,
         out_csv_path=test_csv_path,
     )
 
@@ -588,16 +690,32 @@ def main():
     )
 
     wide_preds = _read_submission_as_wide(sub_csv_path, test_csv_path)
-    df_full_preds = wide_preds.rename(columns={
-        target_order[0]: "pred_dc",
-        target_order[1]: "pred_dd",
-        target_order[2]: "pred_dg",
-    })
+    # Rename predictions for export while keeping 5D info
+    df_full_preds = wide_preds.rename(
+        columns={
+            "Dry_Clover_g": "pred_dc",
+            "Dry_Dead_g": "pred_dd",
+            "Dry_Green_g": "pred_dg",
+            "GDM_g": "pred_gdm",
+            "Dry_Total_g": "pred_dt",
+        }
+    )
 
     merged_full = full_df.merge(df_full_preds, on="image_path", how="inner")
-    ens_targets = torch.from_numpy(merged_full[target_order].to_numpy(dtype=np.float32))
-    ens_preds = torch.from_numpy(merged_full[["pred_dc", "pred_dd", "pred_dg"]].to_numpy(dtype=np.float32))
-    ensemble_metrics = compute_metrics(ens_preds, ens_targets)
+    ens_targets = torch.from_numpy(
+        merged_full[score_targets].to_numpy(dtype=np.float32)
+    )
+    ens_preds = torch.from_numpy(
+        merged_full[["pred_dc", "pred_dd", "pred_dg", "pred_gdm", "pred_dt"]].to_numpy(
+            dtype=np.float32
+        )
+    )
+    ensemble_metrics = compute_metrics(
+        ens_preds,
+        ens_targets,
+        global_targets=full_targets_tensor,
+        target_names=score_targets,
+    )
     logger.info(
         "Ensemble full-dataset metrics: MSE={:.6f} MAE={:.6f} RMSE={:.6f} R2={:.4f}",
         ensemble_metrics["mse"],
@@ -606,22 +724,56 @@ def main():
         ensemble_metrics["r2"],
     )
 
-    merged_full_out = merged_full[["image_id", "image_path", *target_order, "pred_dc", "pred_dd", "pred_dg"]].copy()
+    merged_full_out = merged_full[
+        [
+            "image_id",
+            "image_path",
+            *score_targets,
+            "pred_dc",
+            "pred_dd",
+            "pred_dg",
+            "pred_gdm",
+            "pred_dt",
+        ]
+    ].copy()
     ens_pred_path = out_ver_dir / "ensemble_full_predictions.csv"
     merged_full_out.to_csv(ens_pred_path, index=False)
     logger.success("Saved ensemble predictions -> {}", ens_pred_path)
 
-    comp_left = per_fold_pred_df[["image_id", "image_path", "target_dc", "target_dd", "target_dg", "pred_dc", "pred_dd", "pred_dg"]]
-    comp_right = merged_full_out[["image_id", "image_path", "pred_dc", "pred_dd", "pred_dg"]]
-    comp_right = comp_right.rename(columns={
-        "pred_dc": "ens_pred_dc",
-        "pred_dd": "ens_pred_dd",
-        "pred_dg": "ens_pred_dg",
-    })
+    comp_left = per_fold_pred_df[
+        [
+            "image_id",
+            "image_path",
+            "target_dc",
+            "target_dd",
+            "target_dg",
+            "target_gdm",
+            "target_dt",
+            "pred_dc",
+            "pred_dd",
+            "pred_dg",
+            "pred_gdm",
+            "pred_dt",
+        ]
+    ]
+    comp_right = merged_full_out[
+        ["image_id", "image_path", "pred_dc", "pred_dd", "pred_dg", "pred_gdm", "pred_dt"]
+    ]
+    comp_right = comp_right.rename(
+        columns={
+            "pred_dc": "ens_pred_dc",
+            "pred_dd": "ens_pred_dd",
+            "pred_dg": "ens_pred_dg",
+            "pred_gdm": "ens_pred_gdm",
+            "pred_dt": "ens_pred_dt",
+        }
+    )
     comp = comp_left.merge(comp_right, on=["image_id", "image_path"], how="inner")
     comp["abs_diff_dc"] = (comp["pred_dc"] - comp["ens_pred_dc"]).abs()
     comp["abs_diff_dd"] = (comp["pred_dd"] - comp["ens_pred_dd"]).abs()
     comp["abs_diff_dg"] = (comp["pred_dg"] - comp["ens_pred_dg"]).abs()
+    comp["abs_diff_gdm"] = (comp["pred_gdm"] - comp["ens_pred_gdm"]).abs()
+    comp["abs_diff_dt"] = (comp["pred_dt"] - comp["ens_pred_dt"]).abs()
     comp_path = out_ver_dir / "comparison_per_fold_vs_ensemble.csv"
     comp.to_csv(comp_path, index=False)
     logger.success("Saved comparison CSV ({} rows) -> {}", len(comp), comp_path)
@@ -630,9 +782,13 @@ def main():
         "mean_abs_diff_dc": float(comp["abs_diff_dc"].mean()),
         "mean_abs_diff_dd": float(comp["abs_diff_dd"].mean()),
         "mean_abs_diff_dg": float(comp["abs_diff_dg"].mean()),
+        "mean_abs_diff_gdm": float(comp["abs_diff_gdm"].mean()),
+        "mean_abs_diff_dt": float(comp["abs_diff_dt"].mean()),
         "max_abs_diff_dc": float(comp["abs_diff_dc"].max()),
         "max_abs_diff_dd": float(comp["abs_diff_dd"].max()),
         "max_abs_diff_dg": float(comp["abs_diff_dg"].max()),
+        "max_abs_diff_gdm": float(comp["abs_diff_gdm"].max()),
+        "max_abs_diff_dt": float(comp["abs_diff_dt"].max()),
         "num_rows_compared": int(len(comp)),
     }
 

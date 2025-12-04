@@ -337,11 +337,15 @@ def _parse_image_size(value) -> Tuple[int, int]:
 
 
 def discover_head_weight_paths(path: str) -> List[str]:
-    # Accept single-file or directory containing per-fold heads
+    # Accept single-file or directory containing a preferred single head or per-fold heads.
     if os.path.isfile(path):
         return [path]
     if os.path.isdir(path):
-        # Preferred: weights/head/fold_*/infer_head.pt
+        # Preferred: explicit single-head file weights/head/infer_head.pt
+        single = os.path.join(path, "infer_head.pt")
+        if os.path.isfile(single):
+            return [single]
+        # Fallback: per-fold heads under weights/head/fold_*/infer_head.pt
         fold_paths: List[str] = []
         try:
             for name in sorted(os.listdir(path)):
@@ -353,10 +357,6 @@ def discover_head_weight_paths(path: str) -> List[str]:
             pass
         if fold_paths:
             return fold_paths
-        # Fallback: weights/head/infer_head.pt under the directory
-        single = os.path.join(path, "infer_head.pt")
-        if os.path.isfile(single):
-            return [single]
         # Fallback: any .pt directly under directory
         pts = [os.path.join(path, n) for n in os.listdir(path) if n.endswith('.pt')]
         pts.sort()

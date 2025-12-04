@@ -43,13 +43,6 @@ def main():
     log_dir = base_log_dir / version if version else base_log_dir
     ckpt_dir = base_ckpt_dir / version if version else base_ckpt_dir
 
-    # Train-all mode may redirect outputs under a single fold_0 for consistency
-    train_all_cfg = cfg.get("train_all", {})
-    train_all_enabled = bool(train_all_cfg.get("enabled", False))
-    if train_all_enabled:
-        log_dir = log_dir / "fold_0"
-        ckpt_dir = ckpt_dir / "fold_0"
-
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -83,75 +76,91 @@ def main():
     except Exception as e:
         logger.warning(f"Copying DINOv3 weights failed: {e}")
 
-    # Optional k-fold configuration (ignored when train_all is enabled)
+    # Optional k-fold / train-all configuration
     kfold_cfg = cfg.get("kfold", {})
-    use_kfold = bool(kfold_cfg.get("enabled", False)) and not train_all_enabled
+    kfold_enabled = bool(kfold_cfg.get("enabled", False))
 
-    if use_kfold:
+    train_all_cfg = cfg.get("train_all", {})
+    train_all_enabled = bool(train_all_cfg.get("enabled", False))
+
+    # 1) Run k-fold training if enabled (uses per-fold subdirectories under log_dir/ckpt_dir)
+    if kfold_enabled:
         run_kfold(cfg, log_dir, ckpt_dir)
-    else:
-        # Regular single-split training (including train_all special case)
+
+    # 2) Train-all or plain single-split training
+    if train_all_enabled:
         # Build full dataframe once when train_all is enabled to construct splits.
-        train_df = None
-        val_df = None
+        try:
+            from src.data.datamodule import PastureDataModule
 
-        if train_all_enabled:
+            area_m2 = resolve_dataset_area_m2(cfg)
+            base_dm = PastureDataModule(
+                data_root=cfg["data"]["root"],
+                train_csv=cfg["data"]["train_csv"],
+                image_size=parse_image_size(cfg["data"]["image_size"]),
+                batch_size=int(cfg["data"]["batch_size"]),
+                val_batch_size=int(
+                    cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])
+                ),
+                num_workers=int(cfg["data"]["num_workers"]),
+                prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
+                val_split=float(cfg["data"]["val_split"]),
+                target_order=list(cfg["data"]["target_order"]),
+                mean=list(cfg["data"]["normalization"]["mean"]),
+                std=list(cfg["data"]["normalization"]["std"]),
+                train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
+                sample_area_m2=float(area_m2),
+                zscore_output_path=str((log_dir / "train_all") / "z_score.json"),
+                log_scale_targets=bool(
+                    cfg["model"].get("log_scale_targets", False)
+                ),
+                hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
+                shuffle=bool(cfg["data"].get("shuffle", True)),
+            )
             try:
-                from src.data.datamodule import PastureDataModule
-
-                area_m2 = resolve_dataset_area_m2(cfg)
-                base_dm = PastureDataModule(
-                    data_root=cfg["data"]["root"],
-                    train_csv=cfg["data"]["train_csv"],
-                    image_size=parse_image_size(cfg["data"]["image_size"]),
-                    batch_size=int(cfg["data"]["batch_size"]),
-                    val_batch_size=int(
-                        cfg["data"].get("val_batch_size", cfg["data"]["batch_size"])
-                    ),
-                    num_workers=int(cfg["data"]["num_workers"]),
-                    prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
-                    val_split=float(cfg["data"]["val_split"]),
-                    target_order=list(cfg["data"]["target_order"]),
-                    mean=list(cfg["data"]["normalization"]["mean"]),
-                    std=list(cfg["data"]["normalization"]["std"]),
-                    train_scale=tuple(cfg["data"]["augment"]["random_resized_crop_scale"]),
-                    sample_area_m2=float(area_m2),
-                    zscore_output_path=str(log_dir / "z_score.json"),
-                    log_scale_targets=bool(
-                        cfg["model"].get("log_scale_targets", False)
-                    ),
-                    hflip_prob=float(cfg["data"]["augment"]["horizontal_flip_prob"]),
-                    shuffle=bool(cfg["data"].get("shuffle", True)),
-                )
-                try:
-                    full_df = base_dm.build_full_dataframe()
-                except Exception as e:
-                    logger.warning(f"Building full dataframe failed: {e}")
-                    raise
-
-                import pandas as pd  # local import to avoid global dependency if unused
-
-                rng_seed = int(cfg.get("seed", 42))
-                if len(full_df) < 1:
-                    raise ValueError(
-                        "No samples available to construct train_all splits."
-                    )
-                dummy_val = full_df.sample(n=1, random_state=rng_seed)
-                # Optionally duplicate the single row to avoid degenerate loader corner cases
-                val_df = pd.concat([dummy_val], ignore_index=True)
-                train_df = full_df.reset_index(drop=True)
+                full_df = base_dm.build_full_dataframe()
             except Exception as e:
-                logger.warning(f"Constructing train_all splits failed: {e}")
+                logger.warning(f"Building full dataframe failed: {e}")
                 raise
 
-        # Delegate the actual training pipeline to the shared single-run helper.
+            import pandas as pd  # local import to avoid global dependency if unused
+
+            rng_seed = int(cfg.get("seed", 42))
+            if len(full_df) < 1:
+                raise ValueError(
+                    "No samples available to construct train_all splits."
+                )
+            dummy_val = full_df.sample(n=1, random_state=rng_seed)
+            # Optionally duplicate the single row to avoid degenerate loader corner cases
+            val_df = pd.concat([dummy_val], ignore_index=True)
+            train_df = full_df.reset_index(drop=True)
+        except Exception as e:
+            logger.warning(f"Constructing train_all splits failed: {e}")
+            raise
+
+        train_all_log_dir = log_dir / "train_all"
+        train_all_ckpt_dir = ckpt_dir / "train_all"
+        train_all_log_dir.mkdir(parents=True, exist_ok=True)
+        train_all_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Delegate the actual training pipeline for train_all to the shared single-run helper.
+        train_single_split(
+            cfg,
+            train_all_log_dir,
+            train_all_ckpt_dir,
+            train_df=train_df,
+            val_df=val_df,
+            train_all_mode=True,
+        )
+    elif not kfold_enabled:
+        # Regular single-split training without k-fold or train_all.
         train_single_split(
             cfg,
             log_dir,
             ckpt_dir,
-            train_df=train_df,
-            val_df=val_df,
-            train_all_mode=train_all_enabled,
+            train_df=None,
+            val_df=None,
+            train_all_mode=False,
         )
 
 

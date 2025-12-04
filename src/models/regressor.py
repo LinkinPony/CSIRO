@@ -517,7 +517,7 @@ class BiomassRegressor(LightningModule):
             pdict = nn.ParameterDict({name: nn.Parameter(torch.zeros(1)) for name in task_names})
             self._uw_task_params = pdict
 
-        # buffers for epoch-wise metrics on validation set
+        # buffers for epoch-wise metrics on validation set (store predictions in grams)
         self._val_preds: list[Tensor] = []
         self._val_targets: list[Tensor] = []
 
@@ -1036,6 +1036,9 @@ class BiomassRegressor(LightningModule):
         loss_5d: Optional[Tensor] = None
         y_5d_g: Optional[Tensor] = batch.get("y_biomass_5d_g", None)  # (B,5) grams
         mask_5d: Optional[Tensor] = batch.get("biomass_5d_mask", None)  # (B,5)
+        # For metrics, prefer canonical 5D predictions/targets when available.
+        metrics_preds_5d: Optional[Tensor] = None
+        metrics_targets_5d: Optional[Tensor] = None
         if self.enable_5d_loss and y_5d_g is not None and mask_5d is not None and self.enable_ratio_head:
             # Convert main reg3 prediction back to g/m^2 (Dry_Total_g)
             pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
@@ -1056,6 +1059,10 @@ class BiomassRegressor(LightningModule):
             gdm_pred = clover_pred + green_pred
             total_pred = pred_total_gm2.squeeze(-1)
             pred_5d_gm2 = torch.stack([clover_pred, dead_pred, green_pred, gdm_pred, total_pred], dim=-1)
+
+            # For external metrics, work in grams in the fixed 5D order.
+            metrics_preds_5d = pred_5d_gm2 * float(self._area_m2)
+            metrics_targets_5d = y_5d_g.to(device=metrics_preds_5d.device, dtype=metrics_preds_5d.dtype)
 
             # Convert targets to g/m^2
             y_5d_gm2 = y_5d_g.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype) / float(
@@ -1119,17 +1126,21 @@ class BiomassRegressor(LightningModule):
             # Overall mae/mse are computed on normalized reg3 space for backward compatibility
             self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
-            # For external metrics (e.g., epoch-end R^2), return original-scale grams
-            preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
-            targets_out = batch.get("y_reg3_g", None)
-            if targets_out is None:
-                # Fallback: invert from g/m^2 stored if present
-                y_gm2 = batch.get("y_reg3_g_m2", None)
-                if y_gm2 is not None:
-                    targets_out = y_gm2 * float(self._area_m2)
-                else:
-                    # Last resort: invert from normalized y (approximate)
-                    targets_out = self._invert_reg3_to_grams(y_reg3.detach())
+            # For external metrics (e.g., epoch-end R^2), prefer 5D grams when available.
+            if metrics_preds_5d is not None and metrics_targets_5d is not None:
+                preds_out = metrics_preds_5d.detach()
+                targets_out = metrics_targets_5d.detach()
+            else:
+                preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
+                targets_out = batch.get("y_reg3_g", None)
+                if targets_out is None:
+                    # Fallback: invert from g/m^2 stored if present
+                    y_gm2 = batch.get("y_reg3_g_m2", None)
+                    if y_gm2 is not None:
+                        targets_out = y_gm2 * float(self._area_m2)
+                    else:
+                        # Last resort: invert from normalized y (approximate)
+                        targets_out = self._invert_reg3_to_grams(y_reg3.detach())
             return {
                 "loss": total_loss,
                 "mae": mae_reg3,
@@ -1232,15 +1243,19 @@ class BiomassRegressor(LightningModule):
         self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"{stage}_mae", mae, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_mse", mse, on_step=False, on_epoch=True, prog_bar=False)
-        # For external validation epoch R^2, return original-scale grams
-        preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
-        targets_out = batch.get("y_reg3_g", None)
-        if targets_out is None:
-            y_gm2 = batch.get("y_reg3_g_m2", None)
-            if y_gm2 is not None:
-                targets_out = y_gm2 * float(self._area_m2)
-            else:
-                targets_out = self._invert_reg3_to_grams(y_reg3.detach())
+        # For external validation epoch R^2, prefer 5D grams when available.
+        if metrics_preds_5d is not None and metrics_targets_5d is not None:
+            preds_out = metrics_preds_5d.detach()
+            targets_out = metrics_targets_5d.detach()
+        else:
+            preds_out = self._invert_reg3_to_grams(pred_reg3.detach())
+            targets_out = batch.get("y_reg3_g", None)
+            if targets_out is None:
+                y_gm2 = batch.get("y_reg3_g_m2", None)
+                if y_gm2 is not None:
+                    targets_out = y_gm2 * float(self._area_m2)
+                else:
+                    targets_out = self._invert_reg3_to_grams(y_reg3.detach())
         return {
             "loss": total_loss,
             "mae": mae,
@@ -1302,13 +1317,58 @@ class BiomassRegressor(LightningModule):
         self._log_uw_parameters("val")
         if len(self._val_preds) == 0:
             return
-        preds = torch.cat(self._val_preds, dim=0)
-        targets = torch.cat(self._val_targets, dim=0)
-        # overall R^2 across all outputs
-        ss_res = torch.sum((targets - preds) ** 2)
-        mean_t = torch.mean(targets)
-        ss_tot = torch.sum((targets - mean_t) ** 2)
-        r2 = 1.0 - (ss_res / (ss_tot + 1e-8))
+        preds = torch.cat(self._val_preds, dim=0)   # grams, shape (N, D)
+        targets = torch.cat(self._val_targets, dim=0)  # grams, shape (N, D)
+
+        # R^2 in log space with baseline mean defined over the training
+        # distribution when available, otherwise over the current val subset.
+        eps = 1e-8
+        preds_clamp = preds.clamp_min(0.0)
+        targets_clamp = targets.clamp_min(0.0)
+        preds_log = torch.log1p(preds_clamp)
+        targets_log = torch.log1p(targets_clamp)
+
+        # Baseline mean per dimension in log-space
+        if preds_log.shape[1] == 5 and self._biomass_5d_mean is not None:
+            # Use global 5D means in g/m^2, converted to grams.
+            try:
+                mean_gm2 = self._biomass_5d_mean.to(  # type: ignore[union-attr]
+                    device=targets_log.device, dtype=targets_log.dtype
+                )
+                mean_g = mean_gm2 * float(self._area_m2)
+                mean_log = torch.log1p(mean_g.clamp_min(0.0))
+            except Exception:
+                mean_log = torch.mean(targets_log, dim=0)
+        elif self._reg3_mean is not None:
+            try:
+                mean_gm2 = self._reg3_mean.to(device=targets_log.device, dtype=targets_log.dtype)  # type: ignore[union-attr]
+                mean_g = mean_gm2 * float(self._area_m2)
+                mean_log = torch.log1p(mean_g.clamp_min(0.0))
+            except Exception:
+                mean_log = torch.mean(targets_log, dim=0)
+        else:
+            mean_log = torch.mean(targets_log, dim=0)
+
+        # Per-dimension R^2 in log space
+        ss_res_per = torch.sum((targets_log - preds_log) ** 2, dim=0)
+        ss_tot_per = torch.sum((targets_log - mean_log) ** 2, dim=0)
+        r2_per = 1.0 - (ss_res_per / (ss_tot_per + eps))
+
+        # Aggregate across 5D with DESCRIPTION weights when applicable
+        if preds_log.shape[1] == 5:
+            weights = torch.tensor(
+                [0.1, 0.1, 0.1, 0.2, 0.5],
+                device=r2_per.device,
+                dtype=r2_per.dtype,
+            )
+            valid = torch.isfinite(r2_per)
+            w_eff = weights * valid.to(dtype=weights.dtype)
+            denom = w_eff.sum().clamp_min(eps)
+            r2 = (w_eff * r2_per).sum() / denom
+        else:
+            # Fallback: mean R^2 across dimensions (for non-5D configs)
+            r2 = torch.mean(r2_per)
+
         self.log("val_r2", r2, on_step=False, on_epoch=True, prog_bar=True)
 
     def on_train_epoch_end(self) -> None:

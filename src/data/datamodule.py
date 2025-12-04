@@ -292,6 +292,12 @@ class PastureDataModule(LightningDataModule):
         ndvi_series = df.groupby("image_id")["Pre_GSHH_NDVI"].first()
         species_series = df.groupby("image_id")["Species"].first()
         state_series = df.groupby("image_id")["State"].first()
+        # Optional Sampling_Date aggregation (used for grouped k-fold by date+state)
+        if "Sampling_Date" in df.columns:
+            sampling_date_series = df.groupby("image_id")["Sampling_Date"].first()
+        else:
+            sampling_date_series = None
+
         merged = pivot.join(image_path_series, how="inner")
         merged = (
             merged.join(height_series, how="left")
@@ -299,6 +305,8 @@ class PastureDataModule(LightningDataModule):
             .join(species_series, how="left")
             .join(state_series, how="left")
         )
+        if sampling_date_series is not None:
+            merged = merged.join(sampling_date_series, how="left")
         # Ensure all supervised primary targets are present
         merged = merged.dropna(subset=self.target_order)
         merged = merged.reset_index(drop=False)
@@ -322,9 +330,16 @@ class PastureDataModule(LightningDataModule):
             "Pre_GSHH_NDVI",
             "Species",
             "State",
-            "image_path",
-            "image_id",
         ]
+        # Insert Sampling_Date if present
+        if "Sampling_Date" in merged.columns:
+            cols.append("Sampling_Date")
+        cols.extend(
+            [
+                "image_path",
+                "image_id",
+            ]
+        )
         merged = merged[cols]
         return merged
 

@@ -183,7 +183,7 @@ scheduler:
 kfold:
   enabled: true
   k: 5
-  even_split: false
+  even_split: true
 
 trainer:
   max_epochs: 30

@@ -609,11 +609,12 @@ def main():
                 print(f" - {p}")
         return
 
-    # If kfold is enabled, export one head per fold under weights/head/fold_*/infer_head.pt
+    # If kfold is enabled, export one head per fold under weights/head/fold_*/infer_head.pt.
+    # If train_all is enabled, additionally export a preferred single head to
+    # weights/head/infer_head.pt (used as the default for offline inference).
     kfold_cfg = cfg.get("kfold", {})
     kfold_enabled = bool(kfold_cfg.get("enabled", False))
 
-    # Train-all mode is treated like kfold with a single fold (fold_0)
     train_all_cfg = cfg.get("train_all", {})
     train_all_enabled = bool(train_all_cfg.get("enabled", False))
 
@@ -624,8 +625,9 @@ def main():
     packaged_head_rel_paths: list[str] = []
     emit_packaged_manifest: bool = bool(ensemble_cfg.get("enabled", False))
 
-    if kfold_enabled or train_all_enabled:
-        k = 1 if train_all_enabled else int(kfold_cfg.get("k", 5))
+    # 1) Per-fold heads for k-fold training (if enabled).
+    if kfold_enabled:
+        k = int(kfold_cfg.get("k", 5))
         exported = []
         for fold_idx in range(k):
             fold_root_ckpt_dir = ckpt_dir / f"fold_{fold_idx}"
@@ -723,8 +725,99 @@ def main():
         print("Copied per-fold head checkpoints (src -> dst):")
         for src_path, dst_path in exported:
             print(f" - {src_path} -> {dst_path}")
-    else:
-        # Single-run export (non-kfold)
+
+    # 2) Preferred train_all head exported to weights/head/infer_head.pt (if enabled).
+    train_all_head_dst: Path | None = None
+    if train_all_enabled:
+        train_all_root_ckpt_dir = ckpt_dir / "train_all"
+        train_all_head_dir = train_all_root_ckpt_dir / "head"
+        train_all_log_dir = log_dir / "train_all"
+
+        chosen: Path | None = None
+        # When SWA is enabled, attempt to build the head from SWA-averaged weights first.
+        if use_swa:
+            main_last_ckpt = train_all_root_ckpt_dir / "last.ckpt"
+            ckpt_for_swa: Path | None
+            if main_last_ckpt.is_file():
+                ckpt_for_swa = main_last_ckpt
+            else:
+                ckpt_candidates = [p for p in train_all_root_ckpt_dir.glob("*.ckpt") if p.is_file()]
+                ckpt_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                ckpt_for_swa = ckpt_candidates[0] if ckpt_candidates else None
+
+            if ckpt_for_swa is not None:
+                print(f"[SWA] train_all: attempting SWA export from checkpoint: {ckpt_for_swa}")
+                swa_dst_dir = weights_dir / "head" / "train_all"
+                res = _export_swa_head_from_checkpoint(ckpt_for_swa, swa_dst_dir)
+                if res is not None:
+                    chosen, swa_head_path = res
+                    # Copy to the preferred root location without removing existing fold_* dirs.
+                    head_dst_dir = weights_dir / "head"
+                    head_dst_dir.mkdir(parents=True, exist_ok=True)
+                    train_all_head_dst = head_dst_dir / "infer_head.pt"
+                    shutil.copyfile(str(swa_head_path), str(train_all_head_dst))
+                    try:
+                        rel = train_all_head_dst.relative_to(weights_dir / "head")
+                        packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                    except Exception:
+                        pass
+                    # Copy z_score.json for train_all if present
+                    zsrc = train_all_log_dir / "z_score.json"
+                    if zsrc.is_file():
+                        try:
+                            shutil.copyfile(str(zsrc), str(head_dst_dir / "z_score.json"))
+                        except Exception:
+                            pass
+                else:
+                    print("[SWA] train_all: SWA export failed; falling back to raw head-epoch*.pt.")
+            else:
+                print("[SWA] train_all: no .ckpt files found for SWA export, falling back to raw head-epoch*.pt.")
+
+        # Fallback: latest/best raw head checkpoint under train_all/head
+        if train_all_head_dst is None:
+            head_files = list_head_checkpoints(train_all_head_dir)
+            if not head_files:
+                raise FileNotFoundError(f"No head checkpoints found under: {train_all_head_dir}")
+
+            if select_best:
+                metrics_csv = find_latest_metrics_csv(train_all_log_dir)
+                chosen = None
+                if metrics_csv is not None:
+                    best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+                    if best_epoch is not None:
+                        p = find_head_by_epoch(train_all_head_dir, best_epoch)
+                        if p is not None:
+                            chosen = p
+                if chosen is None:
+                    chosen = pick_latest_head(head_files)
+            else:
+                chosen = pick_latest_head(head_files)
+
+            if chosen is None:
+                raise FileNotFoundError("Failed to determine a head checkpoint for train_all.")
+
+            head_dst_dir = weights_dir / "head"
+            head_dst_dir.mkdir(parents=True, exist_ok=True)
+            train_all_head_dst = head_dst_dir / "infer_head.pt"
+            shutil.copyfile(str(chosen), str(train_all_head_dst))
+            try:
+                rel = train_all_head_dst.relative_to(weights_dir / "head")
+                packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+            except Exception:
+                pass
+            # Copy z_score.json for train_all if present
+            zsrc = train_all_log_dir / "z_score.json"
+            if zsrc.is_file():
+                try:
+                    shutil.copyfile(str(zsrc), str(head_dst_dir / "z_score.json"))
+                except Exception:
+                    pass
+
+        if train_all_head_dst is not None:
+            print(f"Copied train_all head checkpoint -> {train_all_head_dst}")
+
+    # 3) Single-run export (non-kfold, non-train_all) for backward-compatibility.
+    if not kfold_enabled and not train_all_enabled:
         head_dir = ckpt_dir / "head"
 
         # When SWA is enabled, first attempt to build the head from SWA-averaged

@@ -428,22 +428,30 @@ def train_single_split(
 
     csv_logger, tb_logger = create_lightning_loggers(log_dir)
 
+    trainer_cfg = cfg["trainer"]
+    # For train_all_mode we respect the configured limit_val_batches (default: 1 to
+    # only run a minimal dummy validation). For all other modes (single-split and
+    # k-fold), always validate on the full validation set (1.0) regardless of the
+    # config value.
+    if train_all_mode:
+        limit_val_batches = trainer_cfg.get("limit_val_batches", 1)
+    else:
+        limit_val_batches = 1.0
+
     trainer = pl.Trainer(
-        max_epochs=int(cfg["trainer"]["max_epochs"]),
-        accelerator=str(cfg["trainer"]["accelerator"]),
-        devices=cfg["trainer"]["devices"],
-        precision=cfg["trainer"]["precision"],
-        limit_train_batches=cfg["trainer"].get("limit_train_batches", 1.0),
-        limit_val_batches=cfg["trainer"].get(
-            "limit_val_batches", 1 if train_all_mode else 1.0
-        ),
+        max_epochs=int(trainer_cfg["max_epochs"]),
+        accelerator=str(trainer_cfg["accelerator"]),
+        devices=trainer_cfg["devices"],
+        precision=trainer_cfg["precision"],
+        limit_train_batches=trainer_cfg.get("limit_train_batches", 1.0),
+        limit_val_batches=limit_val_batches,
         callbacks=callbacks,
         logger=[csv_logger, tb_logger],
-        log_every_n_steps=int(cfg["trainer"]["log_every_n_steps"]),
-        accumulate_grad_batches=int(cfg["trainer"].get("accumulate_grad_batches", 1)),
-        gradient_clip_val=float(cfg["trainer"].get("gradient_clip_val", 0.0)),
+        log_every_n_steps=int(trainer_cfg["log_every_n_steps"]),
+        accumulate_grad_batches=int(trainer_cfg.get("accumulate_grad_batches", 1)),
+        gradient_clip_val=float(trainer_cfg.get("gradient_clip_val", 0.0)),
         gradient_clip_algorithm=str(
-            cfg["trainer"].get("gradient_clip_algorithm", "norm")
+            trainer_cfg.get("gradient_clip_algorithm", "norm")
         ),
         enable_checkpointing=True,
     )
