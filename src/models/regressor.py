@@ -26,6 +26,8 @@ class ManifoldMixup:
         self.enabled: bool = bool(enabled)
         self.prob: float = float(prob)
         self.alpha: float = float(alpha)
+        # Previous-sample cache to support batch_size == 1 manifold mixup
+        self._prev: Optional[Dict[str, Tensor]] = None
 
     @staticmethod
     def from_cfg(cfg: Optional[Dict[str, Any]]) -> Optional["ManifoldMixup"]:
@@ -47,7 +49,7 @@ class ManifoldMixup:
         """
         if not self.enabled:
             return z, batch, False
-        if z.dim() < 2 or z.size(0) <= 1:
+        if z.dim() < 2 or z.size(0) <= 0:
             return z, batch, False
         if not force:
             if self.prob <= 0.0:
@@ -60,29 +62,111 @@ class ManifoldMixup:
         if self.alpha > 0.0:
             lam = float(torch.distributions.Beta(self.alpha, self.alpha).sample().item())
 
-        perm = torch.randperm(bsz, device=z.device)
-        z_mixed = lam * z + (1.0 - lam) * z[perm]
+        # Case 1: standard in-batch mixup for batch_size >= 2 (unchanged behavior).
+        if bsz >= 2:
+            perm = torch.randperm(bsz, device=z.device)
+            z_mixed = lam * z + (1.0 - lam) * z[perm]
 
-        # Mix main scalar regression targets (already in normalized space when applicable)
+            # Mix main scalar regression targets (already in normalized space when applicable)
+            for key in ("y_reg3", "y_height", "y_ndvi"):
+                if key in batch:
+                    y = batch[key]
+                    if isinstance(y, torch.Tensor) and y.dim() >= 1 and y.size(0) == bsz:
+                        batch[key] = lam * y + (1.0 - lam) * y[perm]
+
+            # Mix 5D biomass grams and recompute ratio targets from the mixed grams.
+            if "y_biomass_5d_g" in batch:
+                y_5d = batch["y_biomass_5d_g"]
+                if (
+                    isinstance(y_5d, torch.Tensor)
+                    and y_5d.dim() == 2
+                    and y_5d.size(0) == bsz
+                    and y_5d.size(1) >= 5
+                ):
+                    y_5d_perm = y_5d[perm]
+                    mixed_5d = lam * y_5d + (1.0 - lam) * y_5d_perm
+                    batch["y_biomass_5d_g"] = mixed_5d
+
+                    # Mix 5D masks conservatively (only keep supervision where both were valid)
+                    mask_5d = batch.get("biomass_5d_mask", None)
+                    if isinstance(mask_5d, torch.Tensor) and mask_5d.dim() == mixed_5d.dim():
+                        mask_5d_perm = mask_5d[perm]
+                        batch["biomass_5d_mask"] = mask_5d * mask_5d_perm
+
+                    # Recompute ratio labels from mixed grams to keep physical consistency
+                    mixed_total = mixed_5d[:, 4].clamp(min=1e-6)
+                    if "y_ratio" in batch:
+                        batch["y_ratio"] = torch.stack(
+                            [
+                                mixed_5d[:, 0] / mixed_total,
+                                mixed_5d[:, 1] / mixed_total,
+                                mixed_5d[:, 2] / mixed_total,
+                            ],
+                            dim=-1,
+                        )
+                    if "ratio_mask" in batch:
+                        ratio_mask = batch["ratio_mask"]
+                        if isinstance(ratio_mask, torch.Tensor) and ratio_mask.size(0) == bsz:
+                            batch["ratio_mask"] = ratio_mask * ratio_mask[perm]
+
+            return z_mixed, batch, True
+
+        # Case 2: batch_size == 1. Use previous cached sample to perform mixing, similar to CutMix.
+        # Cache current sample (detached) for potential use on the next step.
+        current: Dict[str, Tensor] = {
+            "z": z.detach().clone(),
+        }
+        for key in ("y_reg3", "y_height", "y_ndvi", "y_biomass_5d_g", "biomass_5d_mask", "y_ratio", "ratio_mask"):
+            val = batch.get(key, None)
+            if isinstance(val, torch.Tensor):
+                current[key] = val.detach().clone()
+
+        # If no previous sample or incompatible shape, only update cache and skip mixing this time.
+        if self._prev is None or "z" not in self._prev or self._prev["z"].shape != z.shape:
+            self._prev = current
+            return z, batch, False
+
+        prev = self._prev
+        z_prev = prev["z"].to(z.device, dtype=z.dtype)
+        z_mixed = lam * z + (1.0 - lam) * z_prev
+
+        # Mix main scalar regression targets with the cached sample.
         for key in ("y_reg3", "y_height", "y_ndvi"):
-            if key in batch:
+            if key in batch and key in prev:
                 y = batch[key]
-                if isinstance(y, torch.Tensor) and y.dim() >= 1 and y.size(0) == bsz:
-                    batch[key] = lam * y + (1.0 - lam) * y[perm]
+                y_prev = prev[key].to(y.device, dtype=y.dtype)
+                if (
+                    isinstance(y, torch.Tensor)
+                    and isinstance(y_prev, torch.Tensor)
+                    and y.dim() >= 1
+                    and y_prev.shape == y.shape
+                ):
+                    batch[key] = lam * y + (1.0 - lam) * y_prev
 
-        # Mix 5D biomass grams and recompute ratio targets from the mixed grams.
-        if "y_biomass_5d_g" in batch:
+        # Mix 5D biomass grams and recompute ratio targets using the cached sample.
+        if "y_biomass_5d_g" in batch and "y_biomass_5d_g" in prev:
             y_5d = batch["y_biomass_5d_g"]
-            if isinstance(y_5d, torch.Tensor) and y_5d.dim() == 2 and y_5d.size(0) == bsz and y_5d.size(1) >= 5:
-                y_5d_perm = y_5d[perm]
-                mixed_5d = lam * y_5d + (1.0 - lam) * y_5d_perm
+            y_5d_prev = prev["y_biomass_5d_g"].to(y_5d.device, dtype=y_5d.dtype)
+            if (
+                isinstance(y_5d, torch.Tensor)
+                and isinstance(y_5d_prev, torch.Tensor)
+                and y_5d.dim() == 2
+                and y_5d_prev.shape == y_5d.shape
+                and y_5d.size(1) >= 5
+            ):
+                mixed_5d = lam * y_5d + (1.0 - lam) * y_5d_prev
                 batch["y_biomass_5d_g"] = mixed_5d
 
-                # Mix 5D masks conservatively (only keep supervision where both were valid)
                 mask_5d = batch.get("biomass_5d_mask", None)
-                if isinstance(mask_5d, torch.Tensor) and mask_5d.dim() == mixed_5d.dim():
-                    mask_5d_perm = mask_5d[perm]
-                    batch["biomass_5d_mask"] = mask_5d * mask_5d_perm
+                mask_5d_prev = prev.get("biomass_5d_mask", None)
+                if (
+                    isinstance(mask_5d, torch.Tensor)
+                    and isinstance(mask_5d_prev, torch.Tensor)
+                    and mask_5d.shape == mixed_5d.shape
+                ):
+                    batch["biomass_5d_mask"] = mask_5d * mask_5d_prev.to(
+                        mask_5d.device, dtype=mask_5d.dtype
+                    )
 
                 # Recompute ratio labels from mixed grams to keep physical consistency
                 mixed_total = mixed_5d[:, 4].clamp(min=1e-6)
@@ -95,11 +179,20 @@ class ManifoldMixup:
                         ],
                         dim=-1,
                     )
-                if "ratio_mask" in batch:
+                if "ratio_mask" in batch and "ratio_mask" in prev:
                     ratio_mask = batch["ratio_mask"]
-                    if isinstance(ratio_mask, torch.Tensor) and ratio_mask.size(0) == bsz:
-                        batch["ratio_mask"] = ratio_mask * ratio_mask[perm]
+                    ratio_mask_prev = prev["ratio_mask"].to(
+                        ratio_mask.device, dtype=ratio_mask.dtype
+                    )
+                    if (
+                        isinstance(ratio_mask, torch.Tensor)
+                        and isinstance(ratio_mask_prev, torch.Tensor)
+                        and ratio_mask_prev.shape == ratio_mask.shape
+                    ):
+                        batch["ratio_mask"] = ratio_mask * ratio_mask_prev
 
+        # Update cache with current sample for the next step.
+        self._prev = current
         return z_mixed, batch, True
 
 
@@ -494,7 +587,11 @@ class BiomassRegressor(LightningModule):
         """
         return self._forward_reg3_logits_for_heads(z, list(self.reg3_heads))
 
-    def _compute_reg3_from_images(self, images: Tensor) -> Tuple[Tensor, Tensor]:
+    def _compute_reg3_from_images(
+        self,
+        images: Optional[Tensor] = None,
+        pt_tokens: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
         """
         Compute main reg3 prediction logits (before optional Softplus) and global bottleneck
         features from input images.
@@ -505,17 +602,22 @@ class BiomassRegressor(LightningModule):
         """
         if not self.use_patch_reg3:
             # Legacy path: CLS concat mean(patch) -> shared_bottleneck -> reg3_heads
+            if images is None:
+                raise ValueError("images must be provided when use_patch_reg3 is False")
             features = self.feature_extractor(images)
             z = self.shared_bottleneck(features)
             pred_reg3_logits = self._forward_reg3_logits(z)
             return pred_reg3_logits, z
 
-        # Patch-based path for main regression: reuse a single backbone forward to get
-        # both CLS and patch tokens, then:
-        #   - build a global feature from patch tokens only (mean over patches),
-        #   - build per-patch features that depend only on patch tokens (Dry_Total_g path),
-        #     both using patch-token dimensionality (embedding_dim) as the bottleneck input.
-        cls_tokens, pt = self.feature_extractor.forward_cls_and_tokens(images)
+        # Patch-based path for main regression. When pt_tokens are provided, reuse them
+        # directly (e.g., after manifold mixup on backbone patch tokens); otherwise,
+        # obtain CLS and patch tokens from the backbone.
+        if pt_tokens is None:
+            if images is None:
+                raise ValueError("Either images or pt_tokens must be provided in patch-mode reg3")
+            _, pt = self.feature_extractor.forward_cls_and_tokens(images)
+        else:
+            pt = pt_tokens
         if pt.dim() != 3:
             raise RuntimeError(f"Unexpected patch tokens shape in patch-mode reg3: {tuple(pt.shape)}")
         B, N, C = pt.shape
@@ -535,7 +637,9 @@ class BiomassRegressor(LightningModule):
 
     def _compute_reg3_and_z_multilayer(
         self,
-        images: Tensor,
+        images: Optional[Tensor] = None,
+        cls_list: Optional[List[Tensor]] = None,
+        pt_list: Optional[List[Tensor]] = None,
     ) -> Tuple[Tensor, Tensor, List[Tensor]]:
         """
         Multi-layer main regression path:
@@ -555,10 +659,16 @@ class BiomassRegressor(LightningModule):
         if len(self.backbone_layer_indices) == 0:
             raise RuntimeError("backbone_layer_indices is empty in multi-layer path")
 
-        # Obtain CLS and patch tokens for all requested layers in a single backbone forward.
-        cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
-            images, self.backbone_layer_indices
-        )
+        # Obtain CLS and patch tokens for all requested layers in a single backbone forward,
+        # unless they were already provided (e.g., after manifold mixup on backbone outputs).
+        if cls_list is None or pt_list is None:
+            if images is None:
+                raise ValueError(
+                    "Either images or (cls_list, pt_list) must be provided for multi-layer reg3"
+                )
+            cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
+                images, self.backbone_layer_indices
+            )
         if len(cls_list) != len(pt_list):
             raise RuntimeError("Mismatch between CLS and patch token lists in multi-layer path")
 
@@ -775,20 +885,66 @@ class BiomassRegressor(LightningModule):
         z: Tensor
         z_layers: Optional[List[Tensor]] = None
         if self.use_layerwise_heads:
-            pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(images)
+            # Multi-layer path: obtain per-layer CLS and patch tokens from the backbone,
+            # optionally apply manifold mixup on the DINO patch tokens, then build
+            # bottleneck features and heads on top.
+            cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
+                images, self.backbone_layer_indices
+            )
+            if (
+                use_mixup
+                and self._manifold_mixup is not None
+                and (stage == "train")
+                and (not is_ndvi_only)
+            ):
+                try:
+                    # Stack per-layer patch tokens into a single tensor of shape (B, L, N, C)
+                    # so that manifold mixup operates on DINO outputs along the batch dim.
+                    pt_stack = torch.stack(pt_list, dim=1)
+                    pt_stack, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
+                    # Unstack back into a list of (B, N, C) tensors per layer.
+                    pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
+                except Exception:
+                    pass
+            pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(
+                images=None, cls_list=cls_list, pt_list=pt_list
+            )
         else:
             if self.use_patch_reg3:
-                pred_reg3, z = self._compute_reg3_from_images(images)
+                # Patch-based main regression path: obtain backbone patch tokens, apply
+                # manifold mixup on these DINO features, then compute bottleneck features.
+                _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                ):
+                    try:
+                        pt_tokens, batch, _ = self._manifold_mixup.apply(
+                            pt_tokens, batch, force=True
+                        )
+                    except Exception:
+                        pass
+                pred_reg3, z = self._compute_reg3_from_images(images=None, pt_tokens=pt_tokens)
             else:
+                # Legacy CLS+mean(patch) path: apply manifold mixup directly on the
+                # DINO global features (CLS concat mean(patch)) before the bottleneck.
                 features = self.feature_extractor(images)
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                ):
+                    try:
+                        features, batch, _ = self._manifold_mixup.apply(
+                            features, batch, force=True
+                        )
+                    except Exception:
+                        pass
                 z = self.shared_bottleneck(features)
                 pred_reg3 = self._forward_reg3_logits(z)
-        # Apply manifold mixup on bottleneck features if chosen
-        if use_mixup and self._manifold_mixup is not None and (stage == "train") and (not is_ndvi_only):
-            try:
-                z, batch, _ = self._manifold_mixup.apply(z, batch, force=True)
-            except Exception:
-                pass
         if is_ndvi_only:
             # NDVI-only batch (no reg3 supervision). Optimize NDVI scalar head only.
             if not self.enable_ndvi or (self.ndvi_head is None and (not self.use_layerwise_heads or self.layer_ndvi_heads is None)):

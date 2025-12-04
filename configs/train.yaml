@@ -1,5 +1,5 @@
 seed: 42
-version: multilayer-log-seperate-uw-no-kl-no-log
+version: multilayer-manifold-mixup-alpha2-30epoch-last8
 data:
   root: data
   train_csv: train.csv
@@ -79,7 +79,7 @@ data:
     manifold_mixup:
       enabled: true
       prob: 1.0
-      alpha: 1.0
+      alpha: 2.0
     cutmix:
       enabled: false
       alpha: 0.5
@@ -121,7 +121,7 @@ model:
     separate_bottlenecks: true
     # Indices refer to DINOv3 transformer blocks (0-based). For dinov3_vith16plus
     # the depth is 32, so valid indices are in [0, 31]. Example: use the last 4 layers.
-    indices: [28, 29, 30, 31]
+    indices: [24, 25, 26, 27, 28, 29, 30, 31]
 
 mtl:
   enabled: true
@@ -186,7 +186,7 @@ kfold:
   even_split: false
 
 trainer:
-  max_epochs: 15
+  max_epochs: 30
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -233,7 +233,7 @@ ndvi_dense:
     vertical_flip_prob: 0.0
 
 irish_glass_clover:
-  enabled: true
+  enabled: false
   # Root directory containing data.csv and images/ for the Irish Glass Clover dataset
   root: data/irish_glass_clover
   csv: data.csv
