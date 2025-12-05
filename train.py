@@ -163,6 +163,25 @@ def main():
             train_all_mode=False,
         )
 
+    # 3) Optional SWA-based k-fold validation evaluation after all training
+    #    has completed. This mirrors the standalone swa_eval_kfold.py script
+    #    but is run by default whenever k-fold training was enabled.
+    if kfold_enabled:
+        try:
+            from swa_eval_kfold import run_swa_eval_for_kfold_cfg
+
+            logger.info(
+                "Running post-training SWA k-fold evaluation to compute log-space "
+                "metrics with global baseline (kfold_swa_metrics.json)."
+            )
+            run_swa_eval_for_kfold_cfg(
+                cfg,
+                device="auto",
+                output_name="kfold_swa_metrics.json",
+            )
+        except Exception as e:
+            logger.warning(f"SWA k-fold evaluation failed (non-fatal): {e}")
+
 
 if __name__ == "__main__":
     main()

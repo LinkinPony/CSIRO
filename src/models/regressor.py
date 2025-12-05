@@ -498,14 +498,14 @@ class BiomassRegressor(LightningModule):
         self.loss_weighting: Optional[str] = (loss_weighting.lower() if loss_weighting else None)
         # Per-task UW parameters (dynamic per batch to avoid size mismatch)
         self._uw_task_params: Optional[nn.ParameterDict] = None
-        if self.mtl_enabled and self.loss_weighting == "uw":
+        if self.loss_weighting == "uw":
             # Treat main biomass reg3, ratio loss and 5D loss as three separate UW tasks.
             task_names: List[str] = ["reg3"]
             if self.enable_ratio_head:
                 task_names.append("ratio")
             if self.enable_5d_loss and self.enable_ratio_head:
                 task_names.append("biomass_5d")
-            # Keep auxiliary tasks for MTL
+            # Keep auxiliary tasks for MTL when enabled
             if self.enable_height:
                 task_names.append("height")
             if self.enable_ndvi:
@@ -1114,14 +1114,23 @@ class BiomassRegressor(LightningModule):
             loss_reg3_total = loss_reg3_total + loss_5d
         self.log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
 
-        # If MTL is disabled or all auxiliary tasks are off, optimize only the reg3 path
+        # If MTL is disabled or all auxiliary tasks are off, optimize only the reg3 path.
+        # When uncertainty weighting is enabled, still treat reg3, ratio and 5D as separate UW tasks.
         if (not self.mtl_enabled) or (
             self.enable_height is False
             and self.enable_ndvi is False
             and self.enable_species is False
             and self.enable_state is False
         ):
-            total_loss = loss_reg3_total
+            if self.loss_weighting == "uw":
+                named_losses_simple: List[Tuple[str, Tensor]] = [("reg3", loss_reg3_mse)]
+                if loss_ratio_mse is not None:
+                    named_losses_simple.append(("ratio", loss_ratio_mse))
+                if loss_5d is not None:
+                    named_losses_simple.append(("biomass_5d", loss_5d))
+                total_loss = self._uw_sum(named_losses_simple)
+            else:
+                total_loss = loss_reg3_total
             self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
             # Overall mae/mse are computed on normalized reg3 space for backward compatibility
             self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)

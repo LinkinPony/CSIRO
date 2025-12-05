@@ -625,8 +625,11 @@ def main():
     packaged_head_rel_paths: list[str] = []
     emit_packaged_manifest: bool = bool(ensemble_cfg.get("enabled", False))
 
-    # 1) Per-fold heads for k-fold training (if enabled).
-    if kfold_enabled:
+    # 1) Per-fold heads for k-fold training (if enabled **and** train_all is disabled).
+    # When both kfold and train_all are enabled, we now only package the train_all
+    # head as the preferred single model for offline inference, and skip exporting
+    # individual per-fold heads here.
+    if kfold_enabled and not train_all_enabled:
         k = int(kfold_cfg.get("k", 5))
         exported = []
         for fold_idx in range(k):
@@ -756,6 +759,11 @@ def main():
                     head_dst_dir.mkdir(parents=True, exist_ok=True)
                     train_all_head_dst = head_dst_dir / "infer_head.pt"
                     shutil.copyfile(str(swa_head_path), str(train_all_head_dst))
+                    # Remove the temporary train_all/ copy to avoid redundant packaging.
+                    try:
+                        shutil.rmtree(swa_dst_dir, ignore_errors=True)
+                    except Exception:
+                        pass
                     try:
                         rel = train_all_head_dst.relative_to(weights_dir / "head")
                         packaged_head_rel_paths.append(str(rel).replace("\\", "/"))

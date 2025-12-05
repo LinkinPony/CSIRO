@@ -1,5 +1,5 @@
 seed: 42
-version: multilayer-manifold-mixup-alpha2-30epoch-last8
+version: mainfold-mixup-no-patch-reg3-multilayer
 data:
   root: data
   train_csv: train.csv
@@ -113,7 +113,7 @@ model:
     #   - Average per-patch predictions to obtain the image-level output.
     # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
     # the global CLS + mean(patch) bottleneck.
-    use_patch_reg3: true
+    use_patch_reg3: false
   backbone_layers:
     enabled: true
     # When true, each selected backbone layer uses its own bottleneck MLP.
@@ -121,13 +121,13 @@ model:
     separate_bottlenecks: true
     # Indices refer to DINOv3 transformer blocks (0-based). For dinov3_vith16plus
     # the depth is 32, so valid indices are in [0, 31]. Example: use the last 4 layers.
-    indices: [24, 25, 26, 27, 28, 29, 30, 31]
+    indices: [25, 27, 29, 31]
 
 mtl:
   enabled: true
   tasks:
     height: false
-    ndvi: true
+    ndvi: false
     ndvi_dense: false
     species: false
     state: false
@@ -181,7 +181,7 @@ scheduler:
   warmup_start_factor: 0.1
 
 kfold:
-  enabled: true
+  enabled: false
   k: 5
   even_split: true
 
