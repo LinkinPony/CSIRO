@@ -209,6 +209,9 @@ class BiomassRegressor(LightningModule):
         # Optional patch-based main regression path (per-patch prediction then average)
         use_patch_reg3: bool = False,
         log_scale_targets: bool = False,
+        # Whole-image consistency between global and patch-based heads
+        enable_reg3_consistency: bool = False,
+        reg3_consistency_weight: float = 1.0,
         # Normalization and scaling
         area_m2: float = 1.0,
         reg3_zscore_mean: Optional[List[float]] = None,
@@ -301,22 +304,22 @@ class BiomassRegressor(LightningModule):
             feature_extractor.backbone.train()
         self.feature_extractor = feature_extractor
 
+        # Whole-image consistency (global vs. patch-based reg3 heads)
+        self.enable_reg3_consistency: bool = bool(enable_reg3_consistency)
+        self.reg3_consistency_weight: float = float(reg3_consistency_weight)
+
         # Shared bottleneck: MLP defined by hidden_dims; last hidden dim is bottleneck size.
         # Supports a legacy activation-based MLP and a SwiGLU variant.
         hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
         act_name = (head_activation or "").lower()
         # For legacy heads, the backbone feature is CLS concat mean(patch) → 2 * embedding_dim.
-        # When use_patch_reg3 is enabled, the main regression path and packed head operate
-        # directly on patch-token dimensionality (embedding_dim), and global features are
-        # reduced to this size before entering the bottleneck.
+        # When use_patch_reg3 is enabled, the patch-based main regression path operates
+        # directly on patch-token dimensionality (embedding_dim), while the global path
+        # continues to use CLS concat mean(patch) (2 * embedding_dim).
         use_patch = bool(use_patch_reg3)
 
-        def _build_bottleneck() -> nn.Sequential:
+        def _build_bottleneck(in_dim: int) -> nn.Sequential:
             layers: List[nn.Module] = []
-            if use_patch:
-                in_dim = embedding_dim
-            else:
-                in_dim = embedding_dim * 2
             if dropout and dropout > 0:
                 layers.append(nn.Dropout(dropout))
 
@@ -350,9 +353,12 @@ class BiomassRegressor(LightningModule):
 
             return nn.Sequential(*layers)
 
-        # Default shared bottleneck (used when not using per-layer bottlenecks, and
-        # also as a fallback when layer-wise bottlenecks are not constructed).
-        self.shared_bottleneck = _build_bottleneck()
+        # Global bottleneck (inputs: CLS concat mean(patch), dim = 2 * embedding_dim).
+        # This is used for the global image-level path and for auxiliary tasks / ratio head.
+        self.shared_bottleneck = _build_bottleneck(embedding_dim * 2)
+        # Optional patch bottleneck (inputs: patch tokens, dim = embedding_dim), used only
+        # when patch-based main regression is enabled.
+        self.patch_bottleneck = _build_bottleneck(embedding_dim) if use_patch else None
 
         # Task heads
         bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
@@ -390,14 +396,20 @@ class BiomassRegressor(LightningModule):
 
         # Optional per-layer bottlenecks for multi-layer heads
         self.use_separate_bottlenecks: bool = bool(use_separate_bottlenecks)
+        # Per-layer GLOBAL bottlenecks (CLS+mean(patch)), when enabled.
+        self.layer_bottlenecks = None  # type: ignore[assignment]
+        # Per-layer PATCH bottlenecks (patch tokens), used only when patch-based main regression is enabled.
+        self.layer_patch_bottlenecks = None  # type: ignore[assignment]
         if self.use_layerwise_heads and self.use_separate_bottlenecks:
-            # One bottleneck MLP per selected backbone layer.
+            # One global bottleneck MLP per selected backbone layer.
             self.layer_bottlenecks = nn.ModuleList(
-                [_build_bottleneck() for _ in range(self.num_layers)]
+                [_build_bottleneck(embedding_dim * 2) for _ in range(self.num_layers)]
             )
-        else:
-            # Either multi-layer heads are disabled or we keep using the shared bottleneck.
-            self.layer_bottlenecks = None  # type: ignore[assignment]
+            # Optional per-layer patch bottlenecks for scheme A when patch-based regression is on.
+            if use_patch:
+                self.layer_patch_bottlenecks = nn.ModuleList(
+                    [_build_bottleneck(embedding_dim) for _ in range(self.num_layers)]
+                )
 
         self.mtl_enabled: bool = bool(mtl_enabled)
         # Per-task toggles (gated by global MTL flag)
@@ -592,57 +604,89 @@ class BiomassRegressor(LightningModule):
     def _compute_reg3_from_images(
         self,
         images: Optional[Tensor] = None,
+        cls_tokens: Optional[Tensor] = None,
         pt_tokens: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
         """
         Compute main reg3 prediction logits (before optional Softplus) and global bottleneck
         features from input images.
 
         Returns:
-            pred_reg3_logits: (B, num_outputs) in normalized domain (g/m^2 or z-score)
-            z_global:         (B, bottleneck_dim) shared bottleneck from CLS+mean(patch)
+            pred_reg3_logits: (B, num_outputs) main path used for supervision
+            z_global:         (B, bottleneck_dim) global bottleneck from CLS+mean(patch)
+            pred_reg3_global: (B, num_outputs) optional global-head prediction (None when unavailable)
+            ratio_patch_probs: (B, 3) optional patch-averaged ratio distribution when enabled
         """
+        # --- Legacy global path (no patch-based main regression) ---
         if not self.use_patch_reg3:
-            # Legacy path: CLS concat mean(patch) -> shared_bottleneck -> reg3_heads
             if images is None:
                 raise ValueError("images must be provided when use_patch_reg3 is False")
+            # DinoV3FeatureExtractor.forward(images) returns CLS concat mean(patch) (B, 2C).
             features = self.feature_extractor(images)
             z = self.shared_bottleneck(features)
             pred_reg3_logits = self._forward_reg3_logits(z)
-            return pred_reg3_logits, z
+            # When patch-based path is disabled, the global head is the only head.
+            return pred_reg3_logits, z, pred_reg3_logits, None
 
-        # Patch-based path for main regression. When pt_tokens are provided, reuse them
-        # directly (e.g., after manifold mixup on backbone patch tokens); otherwise,
-        # obtain CLS and patch tokens from the backbone.
-        if pt_tokens is None:
+        # --- Patch-based main regression path (scheme A) ---
+        # Obtain CLS and patch tokens either from cached tensors or directly from the backbone.
+        if pt_tokens is None or (cls_tokens is None and images is None):
             if images is None:
-                raise ValueError("Either images or pt_tokens must be provided in patch-mode reg3")
-            _, pt = self.feature_extractor.forward_cls_and_tokens(images)
+                raise ValueError(
+                    "Either images or (cls_tokens, pt_tokens) must be provided in patch-mode reg3"
+                )
+            cls, pt = self.feature_extractor.forward_cls_and_tokens(images)
         else:
             pt = pt_tokens
+            if cls_tokens is None:
+                # Fallback: in extremely rare cases cls_tokens may be missing; this should
+                # not happen in normal training flows, but we guard for robustness by
+                # recomputing from images when possible.
+                if images is None:
+                    raise ValueError(
+                        "cls_tokens is None in patch-mode reg3 and images is also None"
+                    )
+                cls, _ = self.feature_extractor.forward_cls_and_tokens(images)
+            else:
+                cls = cls_tokens
+
         if pt.dim() != 3:
             raise RuntimeError(f"Unexpected patch tokens shape in patch-mode reg3: {tuple(pt.shape)}")
         B, N, C = pt.shape
-        # Global bottleneck uses only the mean patch token (patch-only, C-dim).
-        patch_mean = pt.mean(dim=1)  # (B, C)
-        z_global = self.shared_bottleneck(patch_mean)  # (B, bottleneck_dim)
 
-        # Build per-patch features for the main regression path: each patch token (C-dim)
-        # is fed through the shared bottleneck, and predictions are averaged over patches.
+        # Global path: CLS concat mean(patch) -> global bottleneck -> global reg3 heads.
+        patch_mean = pt.mean(dim=1)  # (B, C)
+        feats_global = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
+        z_global = self.shared_bottleneck(feats_global)  # (B, bottleneck_dim)
+        pred_reg3_global = self._forward_reg3_logits(z_global)  # (B, num_outputs)
+
+        # Local path: per-patch tokens -> patch bottleneck -> reg3 heads -> average over patches.
+        if self.patch_bottleneck is None:
+            raise RuntimeError(
+                "patch_bottleneck is None while use_patch_reg3 is True; initialization bug."
+            )
         patch_features_flat = pt.reshape(B * N, C)  # (B*N, C)
-        z_patches_flat = self.shared_bottleneck(patch_features_flat)  # (B*N, bottleneck_dim)
+        z_patches_flat = self.patch_bottleneck(patch_features_flat)  # (B*N, bottleneck_dim)
         pred_patches_flat = self._forward_reg3_logits(z_patches_flat)  # (B*N, num_outputs)
         pred_patches = pred_patches_flat.view(B, N, self.num_outputs)  # (B, N, num_outputs)
-        # Average over patches to obtain per-image logits.
+        # Average over patches to obtain per-image logits (main supervised path).
         pred_reg3_logits = pred_patches.mean(dim=1)  # (B, num_outputs)
-        return pred_reg3_logits, z_global
+        # Optional patch-based ratio distribution (average over patches)
+        ratio_patch_probs: Optional[Tensor] = None
+        if self.enable_ratio_head and self.ratio_head is not None:
+            ratio_logits_patches_flat = self.ratio_head(z_patches_flat)  # (B*N, 3)
+            p_patches_flat = F.softmax(ratio_logits_patches_flat, dim=-1)
+            p_patches = p_patches_flat.view(B, N, self.num_ratio_outputs)  # (B, N, 3)
+            ratio_patch_probs = p_patches.mean(dim=1)  # (B, 3)
+
+        return pred_reg3_logits, z_global, pred_reg3_global, ratio_patch_probs
 
     def _compute_reg3_and_z_multilayer(
         self,
         images: Optional[Tensor] = None,
         cls_list: Optional[List[Tensor]] = None,
         pt_list: Optional[List[Tensor]] = None,
-    ) -> Tuple[Tensor, Tensor, List[Tensor]]:
+    ) -> Tuple[Tensor, Tensor, List[Tensor], Optional[Tensor], Optional[Tensor]]:
         """
         Multi-layer main regression path:
           - For each selected backbone layer, build a bottleneck feature z_l,
@@ -650,9 +694,11 @@ class BiomassRegressor(LightningModule):
           - Average predictions and bottleneck features over layers.
 
         Returns:
-            pred_reg3_logits: (B, num_outputs) averaged over layers
+            pred_reg3_logits: (B, num_outputs) main path averaged over layers
             z_global:         (B, bottleneck_dim) averaged bottleneck over layers
             z_layers:         list of (B, bottleneck_dim) per-layer bottlenecks
+            pred_reg3_global: (B, num_outputs) optional global-head prediction averaged over layers
+            ratio_patch_probs: (B, 3) optional patch- and layer-averaged ratio distribution
         """
         if not self.use_layerwise_heads:
             raise RuntimeError(
@@ -675,10 +721,12 @@ class BiomassRegressor(LightningModule):
             raise RuntimeError("Mismatch between CLS and patch token lists in multi-layer path")
 
         z_layers: List[Tensor] = []
-        pred_layers: List[Tensor] = []
+        pred_layers: List[Tensor] = []          # main path (global or patch-based)
+        pred_layers_global: List[Tensor] = []   # explicit global-head predictions
+        ratio_patch_layers: List[Tensor] = []   # per-layer patch-averaged ratio distributions
 
         if not self.use_patch_reg3:
-            # CLS + mean(patch) per layer
+            # CLS + mean(patch) per layer (global-only path).
             for layer_idx, (cls, pt) in enumerate(zip(cls_list, pt_list)):
                 if pt.dim() != 3:
                     raise RuntimeError(f"Unexpected patch tokens shape in multi-layer reg3: {tuple(pt.shape)}")
@@ -686,10 +734,10 @@ class BiomassRegressor(LightningModule):
                 feats = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
                 # Select per-layer bottleneck if available; otherwise fall back to shared one.
                 if self.layer_bottlenecks is not None:
-                    bottleneck = self.layer_bottlenecks[layer_idx]
+                    bottleneck_global = self.layer_bottlenecks[layer_idx]
                 else:
-                    bottleneck = self.shared_bottleneck
-                z_l = bottleneck(feats)  # (B, bottleneck_dim)
+                    bottleneck_global = self.shared_bottleneck
+                z_l = bottleneck_global(feats)  # (B, bottleneck_dim)
                 z_layers.append(z_l)
                 # Select layer-specific reg3 heads if available; otherwise fall back to shared heads.
                 if self.layer_reg3_heads is not None:
@@ -698,45 +746,102 @@ class BiomassRegressor(LightningModule):
                     heads_l = list(self.reg3_heads)
                 pred_l = self._forward_reg3_logits_for_heads(z_l, heads_l)  # (B, num_outputs)
                 pred_layers.append(pred_l)
+                pred_layers_global.append(pred_l)
         else:
-            # Patch-based reg3 per layer: per-patch predictions then averaged, then averaged over layers.
+            # Patch-based reg3 per layer: per-patch predictions then averaged, plus a
+            # parallel global path from CLS+mean(patch) for consistency.
             for layer_idx, (cls, pt) in enumerate(zip(cls_list, pt_list)):
                 if pt.dim() != 3:
-                    raise RuntimeError(f"Unexpected patch tokens shape in multi-layer patch-mode reg3: {tuple(pt.shape)}")
+                    raise RuntimeError(
+                        f"Unexpected patch tokens shape in multi-layer patch-mode reg3: {tuple(pt.shape)}"
+                    )
                 B, N, C = pt.shape
                 patch_mean = pt.mean(dim=1)  # (B, C)
-                # Select per-layer bottleneck if available; otherwise fall back to shared one.
+                feats_global = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
+
+                # Global bottleneck per layer (or shared)
                 if self.layer_bottlenecks is not None:
-                    bottleneck = self.layer_bottlenecks[layer_idx]
+                    bottleneck_global = self.layer_bottlenecks[layer_idx]
                 else:
-                    bottleneck = self.shared_bottleneck
-                z_global_l = bottleneck(patch_mean)  # (B, bottleneck_dim)
+                    bottleneck_global = self.shared_bottleneck
+                z_global_l = bottleneck_global(feats_global)  # (B, bottleneck_dim)
                 z_layers.append(z_global_l)
 
+                # Patch bottleneck per layer (or shared)
+                if self.layer_patch_bottlenecks is not None:
+                    bottleneck_patch = self.layer_patch_bottlenecks[layer_idx]
+                else:
+                    if self.patch_bottleneck is None:
+                        raise RuntimeError(
+                            "patch_bottleneck is None while use_patch_reg3 is True; initialization bug."
+                        )
+                    bottleneck_patch = self.patch_bottleneck
+
                 patch_features_flat = pt.reshape(B * N, C)
-                z_patches_flat = bottleneck(patch_features_flat)  # (B*N, bottleneck_dim)
+                z_patches_flat = bottleneck_patch(patch_features_flat)  # (B*N, bottleneck_dim)
+
                 if self.layer_reg3_heads is not None:
                     heads_l = list(self.layer_reg3_heads[layer_idx])
                 else:
                     heads_l = list(self.reg3_heads)
-                pred_patches_flat = self._forward_reg3_logits_for_heads(z_patches_flat, heads_l)  # (B*N, num_outputs)
+
+                # Local (patch-based) predictions
+                pred_patches_flat = self._forward_reg3_logits_for_heads(
+                    z_patches_flat, heads_l
+                )  # (B*N, num_outputs)
                 pred_patches = pred_patches_flat.view(B, N, self.num_outputs)
-                pred_l = pred_patches.mean(dim=1)  # (B, num_outputs)
-                pred_layers.append(pred_l)
+                pred_l_local = pred_patches.mean(dim=1)  # (B, num_outputs)
+                pred_layers.append(pred_l_local)
+
+                # Global predictions from CLS+mean(patch) for this layer
+                pred_l_global = self._forward_reg3_logits_for_heads(
+                    z_global_l, heads_l
+                )  # (B, num_outputs)
+                pred_layers_global.append(pred_l_global)
+
+                # Patch-based ratio distribution for this layer (average over patches)
+                if self.enable_ratio_head:
+                    if self.layer_ratio_heads is not None:
+                        ratio_head_l = self.layer_ratio_heads[layer_idx]
+                        ratio_logits_patches_flat = ratio_head_l(z_patches_flat)  # (B*N, 3)
+                    elif self.ratio_head is not None:
+                        ratio_logits_patches_flat = self.ratio_head(z_patches_flat)  # (B*N, 3)
+                    else:
+                        ratio_logits_patches_flat = None
+                    if ratio_logits_patches_flat is not None:
+                        p_patches_flat = F.softmax(ratio_logits_patches_flat, dim=-1)
+                        p_patches = p_patches_flat.view(B, N, self.num_ratio_outputs)  # (B, N, 3)
+                        ratio_patch_layers.append(p_patches.mean(dim=1))  # (B, 3)
 
         pred_reg3_logits = average_layerwise_predictions(pred_layers)
         z_global = average_layerwise_predictions(z_layers)
-        return pred_reg3_logits, z_global, z_layers
+        pred_reg3_global = (
+            average_layerwise_predictions(pred_layers_global)
+            if len(pred_layers_global) > 0
+            else None
+        )
+        ratio_patch_probs = (
+            average_layerwise_predictions(ratio_patch_layers)
+            if len(ratio_patch_layers) > 0
+            else None
+        )
+        return pred_reg3_logits, z_global, z_layers, pred_reg3_global, ratio_patch_probs
 
     def forward(self, images: Tensor) -> Tensor:
         # Return main regression prediction in original grams (g).
-        # When use_patch_reg3 is enabled, this corresponds to the per-patch prediction
-        # averaged over all patches; otherwise it is the legacy CLS+mean(patch) head.
+        # In inference, when use_patch_reg3 is enabled, we average the patch-based
+        # main prediction with the global CLS+mean(patch) prediction; otherwise,
+        # both paths coincide and we effectively use a single head.
         if self.use_layerwise_heads:
-            pred_reg3_logits, _, _ = self._compute_reg3_and_z_multilayer(images)
+            pred_main, _, _, pred_global, _ = self._compute_reg3_and_z_multilayer(images)
         else:
-            pred_reg3_logits, _ = self._compute_reg3_from_images(images)
-        out = pred_reg3_logits
+            pred_main, _, pred_global, _ = self._compute_reg3_from_images(images)
+
+        if pred_global is not None:
+            out = 0.5 * (pred_main + pred_global)
+        else:
+            out = pred_main
+
         if self.out_softplus is not None:
             out = self.out_softplus(out)
         # Invert normalization and scaling to grams
@@ -884,6 +989,8 @@ class BiomassRegressor(LightningModule):
         # use the global bottleneck z. When use_layerwise_heads is enabled, both
         # reg3 and z are obtained by averaging per-layer predictions/features.
         pred_reg3: Tensor
+        pred_reg3_global: Optional[Tensor] = None
+        ratio_patch_probs: Optional[Tensor] = None
         z: Tensor
         z_layers: Optional[List[Tensor]] = None
         if self.use_layerwise_heads:
@@ -908,14 +1015,14 @@ class BiomassRegressor(LightningModule):
                     pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
                 except Exception:
                     pass
-            pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(
+            pred_reg3, z, z_layers, pred_reg3_global, ratio_patch_probs = self._compute_reg3_and_z_multilayer(
                 images=None, cls_list=cls_list, pt_list=pt_list
             )
         else:
             if self.use_patch_reg3:
-                # Patch-based main regression path: obtain backbone patch tokens, apply
+                # Patch-based main regression path: obtain backbone CLS & patch tokens, apply
                 # manifold mixup on these DINO features, then compute bottleneck features.
-                _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                cls_tokens, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
                 if (
                     use_mixup
                     and self._manifold_mixup is not None
@@ -928,7 +1035,9 @@ class BiomassRegressor(LightningModule):
                         )
                     except Exception:
                         pass
-                pred_reg3, z = self._compute_reg3_from_images(images=None, pt_tokens=pt_tokens)
+                pred_reg3, z, pred_reg3_global, ratio_patch_probs = self._compute_reg3_from_images(
+                    images=None, cls_tokens=cls_tokens, pt_tokens=pt_tokens
+                )
             else:
                 # Legacy CLS+mean(patch) path: apply manifold mixup directly on the
                 # DINO global features (CLS concat mean(patch)) before the bottleneck.
@@ -947,6 +1056,8 @@ class BiomassRegressor(LightningModule):
                         pass
                 z = self.shared_bottleneck(features)
                 pred_reg3 = self._forward_reg3_logits(z)
+                pred_reg3_global = pred_reg3
+                ratio_patch_probs = None
         if is_ndvi_only:
             # NDVI-only batch (no reg3 supervision). Optimize NDVI scalar head only.
             if not self.enable_ndvi or (self.ndvi_head is None and (not self.use_layerwise_heads or self.layer_ndvi_heads is None)):
@@ -982,6 +1093,8 @@ class BiomassRegressor(LightningModule):
 
         if self.out_softplus is not None:
             pred_reg3 = self.out_softplus(pred_reg3)
+            if pred_reg3_global is not None:
+                pred_reg3_global = self.out_softplus(pred_reg3_global)
 
         # Optional per-dimension supervision mask for reg3 (to support partial targets)
         if reg3_mask is not None:
@@ -993,6 +1106,27 @@ class BiomassRegressor(LightningModule):
         mask_sum_reg3 = mask.sum().clamp_min(1.0)
         # Base MSE on main reg3 outputs (e.g., Dry_Total_g).
         loss_reg3_mse = diff2_reg3.sum() / mask_sum_reg3
+
+        # --- Global–patch consistency loss (optional, scheme A) ---
+        loss_reg3_consistency: Optional[Tensor] = None
+        if (
+            self.use_patch_reg3
+            and self.enable_reg3_consistency
+            and pred_reg3_global is not None
+        ):
+            # Encourage agreement between the global head (CLS+mean(patch)) and the
+            # patch-based main head at the image level, using the same supervision mask.
+            diff_cons = (pred_reg3 - pred_reg3_global) * mask
+            diff2_cons = diff_cons * diff_cons
+            loss_reg3_consistency_raw = diff2_cons.sum() / mask_sum_reg3
+            loss_reg3_consistency = loss_reg3_consistency_raw * self.reg3_consistency_weight
+            self.log(
+                f"{stage}_loss_reg3_consistency",
+                loss_reg3_consistency,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+            )
 
         # Always log base reg3 metrics (independent of MTL / auxiliary tasks)
         self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
@@ -1007,6 +1141,7 @@ class BiomassRegressor(LightningModule):
 
         # --- Ratio MSE loss (CSIRO only; masked via ratio_mask) ---
         loss_ratio_mse: Optional[Tensor] = None
+        loss_ratio_consistency: Optional[Tensor] = None
         if self.enable_ratio_head:
             y_ratio: Optional[Tensor] = batch.get("y_ratio", None)  # (B,3)
             ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
@@ -1034,8 +1169,41 @@ class BiomassRegressor(LightningModule):
                 loss_ratio_mse = (num / den)
                 self.log(f"{stage}_loss_ratio_mse", loss_ratio_mse, on_step=False, on_epoch=True, prog_bar=False)
 
+                # Consistency between global ratio (from z) and patch-averaged ratio (if available).
+                if (
+                    self.use_patch_reg3
+                    and self.enable_reg3_consistency
+                    and ratio_patch_probs is not None
+                ):
+                    if ratio_patch_probs.shape != p_pred.shape:
+                        raise RuntimeError(
+                            f"ratio_patch_probs shape {tuple(ratio_patch_probs.shape)} does not match p_pred {tuple(p_pred.shape)}"
+                        )
+                    diff_ratio_cons = ratio_patch_probs - p_pred  # (B,3)
+                    mse_per_sample_cons = (diff_ratio_cons * diff_ratio_cons).sum(
+                        dim=-1, keepdim=True
+                    )  # (B,1)
+                    m_cons = ratio_mask.to(
+                        device=mse_per_sample_cons.device,
+                        dtype=mse_per_sample_cons.dtype,
+                    )
+                    num_cons = (mse_per_sample_cons * m_cons).sum()
+                    den_cons = m_cons.sum().clamp_min(1.0)
+                    loss_ratio_consistency_raw = num_cons / den_cons
+                    loss_ratio_consistency = (
+                        loss_ratio_consistency_raw * self.reg3_consistency_weight
+                    )
+                    self.log(
+                        f"{stage}_loss_ratio_consistency",
+                        loss_ratio_consistency,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                    )
+
         # --- 5D weighted MSE loss over physical components ---
         loss_5d: Optional[Tensor] = None
+        loss_5d_consistency: Optional[Tensor] = None
         y_5d_g: Optional[Tensor] = batch.get("y_biomass_5d_g", None)  # (B,5) grams
         mask_5d: Optional[Tensor] = batch.get("biomass_5d_mask", None)  # (B,5)
         # For metrics, prefer canonical 5D predictions/targets when available.
@@ -1062,6 +1230,26 @@ class BiomassRegressor(LightningModule):
             total_pred = pred_total_gm2.squeeze(-1)
             pred_5d_gm2 = torch.stack([clover_pred, dead_pred, green_pred, gdm_pred, total_pred], dim=-1)
 
+            # Optional second 5D prediction built from the global reg3 head for consistency.
+            pred_5d_gm2_global: Optional[Tensor] = None
+            if (
+                self.use_patch_reg3
+                and self.enable_reg3_consistency
+                and pred_reg3_global is not None
+            ):
+                pred_total_gm2_global = self._invert_reg3_to_g_per_m2(
+                    pred_reg3_global
+                )  # (B,1)
+                comp_gm2_global = p_pred * pred_total_gm2_global  # (B,3)
+                clover_g = comp_gm2_global[:, 0]
+                dead_g = comp_gm2_global[:, 1]
+                green_g = comp_gm2_global[:, 2]
+                gdm_g = clover_g + green_g
+                total_g = pred_total_gm2_global.squeeze(-1)
+                pred_5d_gm2_global = torch.stack(
+                    [clover_g, dead_g, green_g, gdm_g, total_g], dim=-1
+                )
+
             # For external metrics, work in grams in the fixed 5D order.
             metrics_preds_5d = pred_5d_gm2 * float(self._area_m2)
             metrics_targets_5d = y_5d_g.to(device=metrics_preds_5d.device, dtype=metrics_preds_5d.dtype)
@@ -1074,10 +1262,15 @@ class BiomassRegressor(LightningModule):
             # Optionally move to z-scored space using precomputed 5D stats
             pred_5d_input = pred_5d_gm2
             target_5d_input = y_5d_gm2
+            pred_5d_input_global = pred_5d_gm2_global if pred_5d_gm2_global is not None else None
 
             if self.log_scale_targets:
                 pred_5d_input = torch.log1p(torch.clamp(pred_5d_input, min=0.0))
                 target_5d_input = torch.log1p(torch.clamp(target_5d_input, min=0.0))
+                if pred_5d_input_global is not None:
+                    pred_5d_input_global = torch.log1p(
+                        torch.clamp(pred_5d_input_global, min=0.0)
+                    )
 
             if self._use_biomass_5d_zscore:
                 mean_5d = self._biomass_5d_mean.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype)  # type: ignore[union-attr]
@@ -1087,9 +1280,15 @@ class BiomassRegressor(LightningModule):
                 )
                 pred_5d = (pred_5d_input - mean_5d) / std_5d
                 target_5d = (target_5d_input - mean_5d) / std_5d
+                pred_5d_global = (
+                    (pred_5d_input_global - mean_5d) / std_5d
+                    if pred_5d_input_global is not None
+                    else None
+                )
             else:
                 pred_5d = pred_5d_input
                 target_5d = target_5d_input
+                pred_5d_global = pred_5d_input_global
 
             # Weighted MSE across components with masks
             w = self.biomass_5d_weights.to(device=pred_5d.device, dtype=pred_5d.dtype)  # (5,)
@@ -1102,18 +1301,61 @@ class BiomassRegressor(LightningModule):
             total_w = valid_weight.sum().clamp_min(1e-8)
             loss_5d = (w * mse_per_dim).sum() / total_w
 
+            # Consistency between 5D predictions derived from main reg3 head and
+            # those derived from the global reg3 head (when available).
+            if (
+                pred_5d_global is not None
+                and self.use_patch_reg3
+                and self.enable_reg3_consistency
+            ):
+                diff_5d_cons = (pred_5d - pred_5d_global) * m5
+                diff2_5d_cons = diff_5d_cons * diff_5d_cons
+                mse_per_dim_cons = diff2_5d_cons.sum(dim=0) / per_dim_den
+                loss_5d_consistency_raw = (w * mse_per_dim_cons).sum() / total_w
+                loss_5d_consistency = (
+                    loss_5d_consistency_raw * self.reg3_consistency_weight
+                )
+                self.log(
+                    f"{stage}_loss_5d_consistency",
+                    loss_5d_consistency,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                )
+
             # Log per-component MSE and aggregated loss
             names_5d = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
             for i, name in enumerate(names_5d):
                 self.log(f"{stage}_mse_5d_{name}", mse_per_dim[i], on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_loss_5d_weighted", loss_5d, on_step=False, on_epoch=True, prog_bar=False)
 
-        # Aggregate reg3-related losses for logging (independent of UW task structure)
-        loss_reg3_total = loss_reg3_mse
+        # Aggregate reg3-related losses for logging (independent of UW task structure).
+        # For optimization, treat the consistency terms as part of each task's loss.
+        loss_reg3_task = loss_reg3_mse
+        if loss_reg3_consistency is not None:
+            loss_reg3_task = loss_reg3_task + loss_reg3_consistency
+
+        loss_ratio_task: Optional[Tensor]
         if loss_ratio_mse is not None:
-            loss_reg3_total = loss_reg3_total + loss_ratio_mse
+            loss_ratio_task = loss_ratio_mse
+            if loss_ratio_consistency is not None:
+                loss_ratio_task = loss_ratio_task + loss_ratio_consistency
+        else:
+            loss_ratio_task = None
+
+        loss_5d_task: Optional[Tensor]
         if loss_5d is not None:
-            loss_reg3_total = loss_reg3_total + loss_5d
+            loss_5d_task = loss_5d
+            if loss_5d_consistency is not None:
+                loss_5d_task = loss_5d_task + loss_5d_consistency
+        else:
+            loss_5d_task = None
+
+        loss_reg3_total = loss_reg3_task
+        if loss_ratio_task is not None:
+            loss_reg3_total = loss_reg3_total + loss_ratio_task
+        if loss_5d_task is not None:
+            loss_reg3_total = loss_reg3_total + loss_5d_task
         self.log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
 
         # If MTL is disabled or all auxiliary tasks are off, optimize only the reg3 path.
@@ -1125,11 +1367,11 @@ class BiomassRegressor(LightningModule):
             and self.enable_state is False
         ):
             if self.loss_weighting == "uw":
-                named_losses_simple: List[Tuple[str, Tensor]] = [("reg3", loss_reg3_mse)]
-                if loss_ratio_mse is not None:
-                    named_losses_simple.append(("ratio", loss_ratio_mse))
-                if loss_5d is not None:
-                    named_losses_simple.append(("biomass_5d", loss_5d))
+                named_losses_simple: List[Tuple[str, Tensor]] = [("reg3", loss_reg3_task)]
+                if loss_ratio_task is not None:
+                    named_losses_simple.append(("ratio", loss_ratio_task))
+                if loss_5d_task is not None:
+                    named_losses_simple.append(("biomass_5d", loss_5d_task))
                 total_loss = self._uw_sum(named_losses_simple)
             else:
                 total_loss = loss_reg3_total
@@ -1192,14 +1434,14 @@ class BiomassRegressor(LightningModule):
             logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
             logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
 
-        # Collect losses in consistent order for UW/equal weighting
+        # Collect losses in consistent order for UW/equal weighting.
+        # Use task-level losses that already include consistency terms.
         named_losses: List[Tuple[str, Tensor]] = []
-        # Treat reg3, ratio and 5D as separate UW tasks when enabled.
-        named_losses.append(("reg3", loss_reg3_mse))
-        if loss_ratio_mse is not None:
-            named_losses.append(("ratio", loss_ratio_mse))
-        if loss_5d is not None:
-            named_losses.append(("biomass_5d", loss_5d))
+        named_losses.append(("reg3", loss_reg3_task))
+        if loss_ratio_task is not None:
+            named_losses.append(("ratio", loss_ratio_task))
+        if loss_5d_task is not None:
+            named_losses.append(("biomass_5d", loss_5d_task))
 
         if self.enable_height:
             loss_height = F.mse_loss(pred_height, y_height)  # type: ignore[arg-type]

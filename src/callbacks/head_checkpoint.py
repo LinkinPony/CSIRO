@@ -75,12 +75,23 @@ class HeadCheckpoint(Callback):
             # a dedicated MultiLayerHeadExport that mirrors the training-time structure.
             if use_layerwise_heads and use_separate_bottlenecks and hasattr(pl_module, "layer_bottlenecks"):
                 # Multi-layer + per-layer bottlenecks: export explicit per-layer MLPs.
+                # When patch-based main regression is enabled, training-time code uses:
+                #   - layer_bottlenecks      for the global CLS+mean(patch) path (input dim = 2C)
+                #   - layer_patch_bottlenecks for the patch-based main path (input dim = C)
+                # For inference we export MultiLayerHeadExport with `use_patch_reg3` controlling
+                # the expected input dimensionality. Therefore:
+                #   - if use_patch_reg3 is True, we must copy from layer_patch_bottlenecks
+                #     so that the bottlenecks expect patch-token dimensionality (C);
+                #   - otherwise we copy from layer_bottlenecks (CLS+mean(patch), 2C).
                 embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024))
                 head_hidden_dims = list(getattr(pl_module.hparams, "head_hidden_dims", []))
                 head_activation = str(getattr(pl_module.hparams, "head_activation", "relu"))
                 dropout = float(getattr(pl_module.hparams, "dropout", 0.0))
 
                 layer_bottlenecks = list(getattr(pl_module, "layer_bottlenecks", []))
+                layer_patch_bottlenecks = list(getattr(pl_module, "layer_patch_bottlenecks", [])) if hasattr(
+                    pl_module, "layer_patch_bottlenecks"
+                ) and getattr(pl_module, "layer_patch_bottlenecks") is not None else []
                 layer_reg3_heads = list(getattr(pl_module, "layer_reg3_heads", []))
                 layer_ratio_heads = (
                     list(getattr(pl_module, "layer_ratio_heads"))
@@ -108,7 +119,12 @@ class HeadCheckpoint(Callback):
                 with torch.no_grad():
                     # Bottlenecks
                     for idx in range(num_layers):
-                        src_b = layer_bottlenecks[idx]
+                        # For patch-based main regression, prefer patch bottlenecks when available;
+                        # otherwise fall back to the global bottlenecks (CLS+mean(patch)).
+                        if use_patch_reg3 and idx < len(layer_patch_bottlenecks):
+                            src_b = layer_patch_bottlenecks[idx]
+                        else:
+                            src_b = layer_bottlenecks[idx]
                         dst_b = head_module.layer_bottlenecks[idx]
                         dst_b.load_state_dict(src_b.state_dict())
 

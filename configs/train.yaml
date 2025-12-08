@@ -1,5 +1,5 @@
 seed: 42
-version: mainfold-mixup-no-patch-reg3-multilayer-log-sgd9
+version: consistency-no-log
 data:
   root: data
   train_csv: train.csv
@@ -101,7 +101,7 @@ model:
   pretrained: true
   freeze_backbone: true
   embedding_dim: 1280
-  log_scale_targets: true
+  log_scale_targets: false
   head:
     type: mlp
     hidden_dims: [1280]
@@ -121,7 +121,7 @@ model:
     separate_bottlenecks: true
     # Indices refer to DINOv3 transformer blocks (0-based). For dinov3_vith16plus
     # the depth is 32, so valid indices are in [0, 31]. Example: use the last 4 layers.
-    indices: [25, 27, 29, 31]
+    indices: [25,27,29,31]
 
 mtl:
   enabled: true
@@ -162,6 +162,10 @@ loss:
   use_5d_weighted_mse: true
   # Per-component weights for the 5D MSE term.
   mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
+  # Optional whole-image consistency between global (CLS+mean(patch)) and patch-based
+  # main heads for reg3. Only has an effect when model.head.use_patch_reg3: true.
+  use_reg3_consistency: true
+  reg3_consistency_weight: 1.0
 
 optimizer:
   name: adamw            # choices: adamw, sgd, sam (alias for AdamW + SAM)

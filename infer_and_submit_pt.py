@@ -674,35 +674,64 @@ def predict_main_and_ratio_patch_mode(
                     if pt_l.dim() != 3:
                         raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt_l.shape)}")
                     B, N, C = pt_l.shape
+                    patch_mean_l = pt_l.mean(dim=1)  # (B, C)
+
                     if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
                         # New path: explicit per-layer bottlenecks encoded in head.
-                        layer_main, layer_ratio = head.forward_patch_layer(pt_l, l_idx)
+                        # Patch-based main + ratio from forward_patch_layer.
+                        layer_main_patch, layer_ratio = head.forward_patch_layer(pt_l, l_idx)
+                        # Approximate a global main prediction using the same per-layer
+                        # bottleneck on mean patch tokens (C-dim). This mirrors the idea
+                        # of a CLS+mean(patch) global path used during training, but
+                        # operates in the head-export space.
+                        bottleneck_l = head.layer_bottlenecks[l_idx]
+                        z_global = bottleneck_l(patch_mean_l)  # (B, hidden)
+                        layer_main_global = MultiLayerHeadExport._forward_reg3_logits_for_heads(
+                            z_global,
+                            list(head.layer_reg3_heads[l_idx]),
+                        )  # (B, head_num_main)
+                        layer_main = 0.5 * (layer_main_patch + layer_main_global)
                     else:
+                        expected_dim = head_total * num_layers
                         if head_num_main > 0:
+                            # Patch-based main path: per-patch predictions then averaged.
                             patch_features_flat = pt_l.reshape(B * N, C)  # (B*N, C)
                             out_all_patch = head(patch_features_flat)  # (B*N, head_total * L)
-                            expected_dim = head_total * num_layers
                             if out_all_patch.shape[1] != expected_dim:
                                 raise RuntimeError(
                                     f"Unexpected packed head dimension in patch-mode multi-layer: got {out_all_patch.shape[1]}, "
                                     f"expected {expected_dim}"
                                 )
                             offset = l_idx * head_total
-                            layer_slice = out_all_patch[:, offset : offset + head_total]  # (B*N, head_total)
-                            layer_main = layer_slice[:, :head_num_main]  # (B*N, head_num_main)
-                            layer_main = layer_main.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+                            layer_slice_patch = out_all_patch[:, offset : offset + head_total]  # (B*N, head_total)
+                            layer_main_patch = layer_slice_patch[:, :head_num_main]  # (B*N, head_num_main)
+                            layer_main_patch = layer_main_patch.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+
+                            # Global main path: apply the same head on mean patch tokens and
+                            # slice this layer's main segment; then average with patch-path main.
+                            out_all_global_main = head(patch_mean_l)  # (B, head_total * L)
+                            if out_all_global_main.shape[1] != expected_dim:
+                                raise RuntimeError(
+                                    f"Unexpected packed head dimension for global main logits in patch-mode multi-layer: got {out_all_global_main.shape[1]}, "
+                                    f"expected {expected_dim}"
+                                )
+                            layer_slice_main = out_all_global_main[:, offset : offset + head_total]  # (B, head_total)
+                            layer_main_global = layer_slice_main[:, :head_num_main]  # (B, head_num_main)
+
+                            layer_main = 0.5 * (layer_main_patch + layer_main_global)
                         else:
                             # No main outputs; keep empty tensor for consistency
                             layer_main = torch.empty((B, 0), dtype=torch.float32, device=device)
 
                         if head_num_ratio > 0:
-                            patch_mean_l = pt_l.mean(dim=1)  # (B, C)
+                            # Ratio logits remain defined on the global mean-patch features.
                             out_all_global = head(patch_mean_l)  # (B, head_total * L)
                             if out_all_global.shape[1] != expected_dim:
                                 raise RuntimeError(
                                     f"Unexpected packed head dimension for ratio logits in patch-mode multi-layer: got {out_all_global.shape[1]}, "
                                     f"expected {expected_dim}"
                                 )
+                            offset = l_idx * head_total
                             layer_slice_g = out_all_global[:, offset : offset + head_total]  # (B, head_total)
                             layer_ratio = layer_slice_g[
                                 :, head_num_main : head_num_main + head_num_ratio
@@ -733,10 +762,19 @@ def predict_main_and_ratio_patch_mode(
                 B, N, C = pt.shape
 
                 if head_num_main > 0:
-                    patch_features_flat = pt.reshape(B * N, C)  # (B*N, C) patch-only information
+                    # Patch-based main path.
+                    patch_features_flat = pt.reshape(B * N, C)  # (B*N, C)
                     out_all_patch = head(patch_features_flat)  # (B*N, head_total)
                     out_main_patch = out_all_patch[:, :head_num_main]
                     out_main_patch = out_main_patch.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+
+                    # Global main path from mean patch token using the same head.
+                    patch_mean = pt.mean(dim=1)  # (B, C)
+                    out_all_global_main = head(patch_mean)  # (B, head_total)
+                    out_main_global = out_all_global_main[:, :head_num_main]  # (B, head_num_main)
+
+                    # Average patch-based and global main predictions in normalized space.
+                    out_main_patch = 0.5 * (out_main_patch + out_main_global)
                 else:
                     out_main_patch = torch.empty((B, 0), dtype=torch.float32, device=device)
 

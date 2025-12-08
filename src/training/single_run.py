@@ -272,6 +272,8 @@ def train_single_split(
             [0.1, 0.1, 0.1, 0.2, 0.5],
         )
     )
+    reg3_consistency_enabled = bool(loss_cfg.get("use_reg3_consistency", False))
+    reg3_consistency_weight = float(loss_cfg.get("reg3_consistency_weight", 1.0))
 
     # Multi-layer backbone / layer-wise head configuration (optional)
     backbone_layers_cfg = (
@@ -308,6 +310,8 @@ def train_single_split(
         # Optional patch-based main regression path (scheme A: only main task uses patch path).
         use_patch_reg3=bool(cfg["model"]["head"].get("use_patch_reg3", False)),
         log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
+        enable_reg3_consistency=reg3_consistency_enabled,
+        reg3_consistency_weight=reg3_consistency_weight,
         area_m2=float(area_m2),
         reg3_zscore_mean=list(dm.reg3_zscore_mean or [])
         if hasattr(dm, "reg3_zscore_mean")
