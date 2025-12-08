@@ -1,5 +1,5 @@
 seed: 42
-version: mainfold-mixup-no-patch-reg3-multilayer
+version: mainfold-mixup-no-patch-reg3-multilayer-log-sgd9
 data:
   root: data
   train_csv: train.csv
@@ -101,7 +101,7 @@ model:
   pretrained: true
   freeze_backbone: true
   embedding_dim: 1280
-  log_scale_targets: false
+  log_scale_targets: true
   head:
     type: mlp
     hidden_dims: [1280]
@@ -164,15 +164,17 @@ loss:
   mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
 
 optimizer:
-  name: adamw
+  name: adamw            # choices: adamw, sgd, sam (alias for AdamW + SAM)
   lr: 0.001
   weight_decay: 0.01
+  momentum: 0.9          # used only when name: sgd
+  nesterov: false        # used only when name: sgd
   uw_lr: 0.01
   uw_weight_decay: 0.0
   # SAM optimizer (Sharpness-Aware Minimization) configuration.
   # To enable SAM, either set `name: sam` or `use_sam: true`.
   use_sam: false
-  sam_rho: 0.05
+  sam_rho: 0.1
   sam_adaptive: true
 
 scheduler:

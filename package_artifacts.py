@@ -419,8 +419,15 @@ def main():
             tmp_cfg["version"] = ver
             v_log_dir, v_ckpt_dir = resolve_dirs(tmp_cfg)
 
-            # Detect kfold by listing fold_* directories
-            fold_dirs = [p for p in v_ckpt_dir.glob("fold_*") if p.is_dir()]
+            # Prefer train_all when present: when both train_all and fold_* exist,
+            # treat this version as a single train_all run (skip per-fold heads).
+            train_all_root = v_ckpt_dir / "train_all"
+            has_train_all = train_all_root.is_dir()
+
+            # Detect kfold by listing fold_* directories only when no train_all override.
+            fold_dirs: list[Path] = []
+            if not has_train_all:
+                fold_dirs = [p for p in v_ckpt_dir.glob("fold_*") if p.is_dir()]
             if fold_dirs:
                 fold_dirs.sort(key=lambda p: p.name)
                 exported = []
@@ -508,16 +515,25 @@ def main():
                 for src_path, dst_path in exported:
                     print(f" - {src_path} -> {dst_path}")
             else:
-                # Single-run directory
+                # Single-run or train_all directory (no fold_* subdirs).
                 dst_dir = weights_dir / "head" / ver
-                # Try SWA
+
+                # Prefer train_all subdirectory when present, to mirror single-version packaging.
+                ckpt_root_dir = v_ckpt_dir
+                log_root_dir = v_log_dir
+                train_all_root = v_ckpt_dir / "train_all"
+                if train_all_root.is_dir():
+                    ckpt_root_dir = train_all_root
+                    log_root_dir = v_log_dir / "train_all"
+
+                # Try SWA from the selected root (train_all if available, otherwise v_ckpt_dir).
                 chosen: Path | None = None
                 if use_swa:
-                    main_last_ckpt = v_ckpt_dir / "last.ckpt"
+                    main_last_ckpt = ckpt_root_dir / "last.ckpt"
                     if main_last_ckpt.is_file():
                         ckpt_for_swa = main_last_ckpt
                     else:
-                        ckpt_candidates = [p for p in v_ckpt_dir.glob("*.ckpt") if p.is_file()]
+                        ckpt_candidates = [p for p in ckpt_root_dir.glob("*.ckpt") if p.is_file()]
                         ckpt_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                         ckpt_for_swa = ckpt_candidates[0] if ckpt_candidates else None
                     if ckpt_for_swa is not None:
@@ -532,7 +548,7 @@ def main():
                             except Exception:
                                 pass
                             # Copy z_score.json for this version if present
-                            zsrc = v_log_dir / "z_score.json"
+                            zsrc = log_root_dir / "z_score.json"
                             if zsrc.is_file():
                                 try:
                                     shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
@@ -540,14 +556,15 @@ def main():
                                     pass
                         else:
                             print(f"[SWA] {ver}: SWA export failed; fallback to raw head-epoch*.pt.")
+
                 if chosen is None:
-                    # Legacy raw copy
-                    head_dir = v_ckpt_dir / "head"
+                    # Legacy raw copy: look for head-epoch*.pt under the selected root (train_all/head or v_ckpt_dir/head).
+                    head_dir = ckpt_root_dir / "head"
                     head_files = list_head_checkpoints(head_dir)
                     if not head_files:
                         raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
                     if select_best:
-                        metrics_csv = find_latest_metrics_csv(v_log_dir)
+                        metrics_csv = find_latest_metrics_csv(log_root_dir)
                         chosen = None
                         if metrics_csv is not None:
                             best_epoch = pick_best_epoch_from_metrics(metrics_csv)
@@ -572,7 +589,7 @@ def main():
                         packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
                     except Exception:
                         pass
-                    zsrc = v_log_dir / "z_score.json"
+                    zsrc = log_root_dir / "z_score.json"
                     if zsrc.is_file():
                         try:
                             shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))

@@ -1094,11 +1094,17 @@ def main():
         # are treated as patch-mode heads; all others default to the legacy global path.
         use_patch_reg3_head = bool(meta.get("use_patch_reg3", False))
         # Determine whether this head uses layer-wise heads and which backbone layers.
-        use_layerwise_heads_head = bool(meta.get("use_layerwise_heads", use_layerwise_heads_default))
-        backbone_layer_indices_head = list(meta.get("backbone_layer_indices", backbone_layer_indices_default))
-        use_separate_bottlenecks_head = bool(
-            meta.get("use_separate_bottlenecks", use_separate_bottlenecks_default)
+        # IMPORTANT: similar to `use_patch_reg3`, older heads may not store these flags
+        # in their meta. For such heads we must *not* inherit the defaults from the
+        # first (typically multi-layer) head, otherwise we would incorrectly build a
+        # MultiLayerHeadExport when the checkpoint actually contains a simple MLP
+        # (state_dict keys like \"1.weight\", \"4.bias\", etc.), leading to shape
+        # mismatches when loading.
+        use_layerwise_heads_head = bool(meta.get("use_layerwise_heads", False))
+        backbone_layer_indices_head = list(
+            meta.get("backbone_layer_indices", backbone_layer_indices_default)
         )
+        use_separate_bottlenecks_head = bool(meta.get("use_separate_bottlenecks", False))
         # Determine whether this head uses the ratio format.
         head_is_ratio = bool(head_num_ratio > 0 and head_total == (head_num_main + head_num_ratio))
         # When layer-wise heads are used, the packed head normally stores concatenated

@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional, List, Tuple
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.optim import AdamW, Optimizer
+from torch.optim import AdamW, Optimizer, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, _LRScheduler
 from lightning.pytorch import LightningModule
 from loguru import logger
@@ -262,6 +262,8 @@ class BiomassRegressor(LightningModule):
         use_sam: bool = False,
         sam_rho: float = 0.05,
         sam_adaptive: bool = False,
+        sgd_momentum: float = 0.9,
+        sgd_nesterov: bool = False,
     ) -> None:
         super().__init__()
         # Normalize optimizer hyperparameters before saving them.
@@ -1428,18 +1430,34 @@ class BiomassRegressor(LightningModule):
                 "weight_decay": lora_wd,
             })
 
-        # Optimizer selection: plain AdamW or SAM-wrapped AdamW.
+        # Optimizer selection: AdamW or SGD (optionally wrapped with SAM).
         opt_name = str(getattr(self.hparams, "optimizer_name", "adamw")).lower()
         use_sam_flag = bool(getattr(self.hparams, "use_sam", False))
         if opt_name in ("sam", "sam_adamw", "adamw_sam"):
+            # Backward-compatible aliases: treat as AdamW + SAM.
             use_sam_flag = True
+
+        # Choose base optimizer class and its extra kwargs.
+        base_opt_cls = AdamW
+        base_opt_kwargs: Dict[str, Any] = {}
+        if opt_name.startswith("sgd"):
+            base_opt_cls = SGD
+            momentum = float(getattr(self.hparams, "sgd_momentum", 0.9))
+            nesterov = bool(getattr(self.hparams, "sgd_nesterov", False))
+            base_opt_kwargs.update({"momentum": momentum, "nesterov": nesterov})
 
         if use_sam_flag:
             sam_rho = float(getattr(self.hparams, "sam_rho", 0.05))
             sam_adaptive = bool(getattr(self.hparams, "sam_adaptive", False))
-            optimizer: Optimizer = SAM(param_groups, AdamW, rho=sam_rho, adaptive=sam_adaptive)
+            optimizer: Optimizer = SAM(
+                param_groups,
+                base_opt_cls,
+                rho=sam_rho,
+                adaptive=sam_adaptive,
+                **base_opt_kwargs,
+            )
         else:
-            optimizer = AdamW(param_groups)
+            optimizer = base_opt_cls(param_groups, **base_opt_kwargs)
 
         if self.hparams.scheduler_name and self.hparams.scheduler_name.lower() == "cosine":
             max_epochs: int = int(self.hparams.max_epochs or 10)

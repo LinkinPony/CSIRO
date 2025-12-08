@@ -213,3 +213,5 @@ __marimo__/
 submission.csv
 /dinov3_weights/
 submission_mc_dropout_debug.json
+
+weights.zip

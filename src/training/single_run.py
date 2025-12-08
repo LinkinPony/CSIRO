@@ -293,6 +293,8 @@ def train_single_split(
     use_sam = bool(optimizer_cfg.get("use_sam", False) or optimizer_name.lower() == "sam")
     sam_rho = float(optimizer_cfg.get("sam_rho", 0.05))
     sam_adaptive = bool(optimizer_cfg.get("sam_adaptive", False))
+    sgd_momentum = float(optimizer_cfg.get("momentum", 0.9))
+    sgd_nesterov = bool(optimizer_cfg.get("nesterov", False))
 
     model = BiomassRegressor(
         backbone_name=str(cfg["model"]["backbone"]),
@@ -388,6 +390,8 @@ def train_single_split(
         use_sam=use_sam,
         sam_rho=sam_rho,
         sam_adaptive=sam_adaptive,
+        sgd_momentum=sgd_momentum,
+        sgd_nesterov=sgd_nesterov,
     )
 
     head_ckpt_dir = ckpt_dir / "head"
