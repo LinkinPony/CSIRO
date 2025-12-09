@@ -1,5 +1,5 @@
 seed: 42
-version: consistency-no-log
+version: manifold-mixup-fix
 data:
   root: data
   train_csv: train.csv
@@ -21,7 +21,9 @@ data:
   # the remaining components via a separate ratio head.
   target_order: [Dry_Total_g]
   augment:
-    random_resized_crop_scale: [0.8, 1.0]
+    random_resized_crop_scale: [1.0, 1.0]
+    random_resized_crop:
+      enabled: false  # Set to false to disable RandomResizedCrop (uses deterministic resize instead)
     horizontal_flip_prob: 0.5
     color_jitter:
       enabled: true
@@ -164,7 +166,7 @@ loss:
   mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
   # Optional whole-image consistency between global (CLS+mean(patch)) and patch-based
   # main heads for reg3. Only has an effect when model.head.use_patch_reg3: true.
-  use_reg3_consistency: true
+  use_reg3_consistency: false
   reg3_consistency_weight: 1.0
 
 optimizer:

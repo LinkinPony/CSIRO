@@ -995,7 +995,7 @@ class BiomassRegressor(LightningModule):
         z_layers: Optional[List[Tensor]] = None
         if self.use_layerwise_heads:
             # Multi-layer path: obtain per-layer CLS and patch tokens from the backbone,
-            # optionally apply manifold mixup on the DINO patch tokens, then build
+            # optionally apply manifold mixup jointly on CLS + patch tokens, then build
             # bottleneck features and heads on top.
             cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
                 images, self.backbone_layer_indices
@@ -1007,12 +1007,24 @@ class BiomassRegressor(LightningModule):
                 and (not is_ndvi_only)
             ):
                 try:
-                    # Stack per-layer patch tokens into a single tensor of shape (B, L, N, C)
-                    # so that manifold mixup operates on DINO outputs along the batch dim.
-                    pt_stack = torch.stack(pt_list, dim=1)
-                    pt_stack, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
-                    # Unstack back into a list of (B, N, C) tensors per layer.
-                    pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
+                    # Jointly stack CLS and patch tokens so that manifold mixup operates
+                    # on both, sharing the same (lam, perm) across CLS and patches.
+                    # cls_list: [L * (B, C)] -> (B, L, C)
+                    # pt_list : [L * (B, N, C)] -> (B, L, N, C)
+                    cls_stack = torch.stack(cls_list, dim=1)  # (B, L, C)
+                    pt_stack = torch.stack(pt_list, dim=1)    # (B, L, N, C)
+                    # Insert CLS as the first "token" along the N-dimension:
+                    #   tokens[:, :, 0]   = CLS
+                    #   tokens[:, :, 1:]  = patch tokens
+                    cls_stack_exp = cls_stack.unsqueeze(2)    # (B, L, 1, C)
+                    tokens = torch.cat([cls_stack_exp, pt_stack], dim=2)  # (B, L, 1+N, C)
+                    tokens, batch, _ = self._manifold_mixup.apply(tokens, batch, force=True)
+                    # Split back into per-layer CLS and patch tokens.
+                    cls_stack_mixed = tokens[:, :, 0, :]      # (B, L, C)
+                    pt_stack_mixed = tokens[:, :, 1:, :]      # (B, L, N, C)
+                    L_layers = cls_stack_mixed.shape[1]
+                    cls_list = [cls_stack_mixed[:, i] for i in range(L_layers)]
+                    pt_list = [pt_stack_mixed[:, i] for i in range(L_layers)]
                 except Exception:
                     pass
             pred_reg3, z, z_layers, pred_reg3_global, ratio_patch_probs = self._compute_reg3_and_z_multilayer(
@@ -1021,7 +1033,7 @@ class BiomassRegressor(LightningModule):
         else:
             if self.use_patch_reg3:
                 # Patch-based main regression path: obtain backbone CLS & patch tokens, apply
-                # manifold mixup on these DINO features, then compute bottleneck features.
+                # manifold mixup jointly on CLS + patch tokens, then compute bottleneck features.
                 cls_tokens, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
                 if (
                     use_mixup
@@ -1030,9 +1042,19 @@ class BiomassRegressor(LightningModule):
                     and (not is_ndvi_only)
                 ):
                     try:
-                        pt_tokens, batch, _ = self._manifold_mixup.apply(
-                            pt_tokens, batch, force=True
+                        # Concatenate CLS as the first token so that manifold mixup
+                        # uses the same (lam, perm) for CLS and all patch tokens.
+                        # cls_tokens: (B, C) -> (B, 1, C)
+                        # pt_tokens : (B, N, C)
+                        tokens = torch.cat(
+                            [cls_tokens.unsqueeze(1), pt_tokens], dim=1
+                        )  # (B, 1+N, C)
+                        tokens, batch, _ = self._manifold_mixup.apply(
+                            tokens, batch, force=True
                         )
+                        # Split back: first position is CLS, remaining are patch tokens.
+                        cls_tokens = tokens[:, 0, :]      # (B, C)
+                        pt_tokens = tokens[:, 1:, :]      # (B, N, C)
                     except Exception:
                         pass
                 pred_reg3, z, pred_reg3_global, ratio_patch_probs = self._compute_reg3_from_images(

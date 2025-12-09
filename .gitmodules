@@ -28,3 +28,6 @@
 [submodule "third_party/F-SAM"]
 	path = third_party/F-SAM
 	url = git@github.com:nblt/F-SAM.git
+[submodule "third_party/NFM"]
+	path = third_party/NFM
+	url = git@github.com:erichson/NFM.git

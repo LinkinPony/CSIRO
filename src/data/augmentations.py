@@ -355,9 +355,25 @@ def build_train_transform(
 
     # 1) Geometric and color transforms on PIL images
     pre_tensor: List[Any] = []
-    # Keep existing random resized crop + horizontal flip (backward-compat)
-    rrc_scale = cfg.get("random_resized_crop_scale", cfg.get("random_resized_crop", {}).get("scale", [0.8, 1.0]))
-    pre_tensor.append(T.RandomResizedCrop(image_size, scale=tuple(rrc_scale)))
+    # Keep existing random resized crop + horizontal flip (backward-compat).
+    # Optionally allow disabling RandomResizedCrop via config:
+    #
+    # data:
+    #   augment:
+    #     random_resized_crop_scale: [0.8, 1.0]  # legacy scale config
+    #     random_resized_crop:
+    #       enabled: true                      # set false to disable RandomResizedCrop
+    #
+    rrc_cfg: Dict[str, Any] = dict(cfg.get("random_resized_crop", {}))
+    rrc_enabled = bool(rrc_cfg.get("enabled", True))
+    if rrc_enabled:
+        rrc_scale = cfg.get("random_resized_crop_scale", rrc_cfg.get("scale", [0.8, 1.0]))
+        pre_tensor.append(T.RandomResizedCrop(image_size, scale=tuple(rrc_scale)))
+    else:
+        # When RandomResizedCrop is disabled, fall back to a deterministic resize
+        # so that the network still sees inputs at the expected resolution while
+        # avoiding additional geometric randomness.
+        pre_tensor.append(T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC))
 
     hflip_prob = float(cfg.get("horizontal_flip_prob", cfg.get("horizontal_flip", {}).get("prob", 0.5)))
     if hflip_prob > 0.0:
