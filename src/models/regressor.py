@@ -18,7 +18,8 @@ from src.training.sam import SAM
 
 class ManifoldMixup:
     """
-    Feature-level (\"manifold\") mixup applied on the shared bottleneck representation z,
+    Feature-level ("manifold") mixup applied on DINO backbone features
+    (CLS tokens, patch tokens, or global CLS+mean(patch) embeddings),
     together with consistent mixing of regression and 5D/ratio targets.
     """
 
@@ -243,10 +244,10 @@ class BiomassRegressor(LightningModule):
         enable_ndvi_dense: bool = False,
         enable_species: bool = False,
         enable_state: bool = False,
-        # CutMix configs (batch-level augmentation)
+        # CutMix configs (batch-level image/label augmentation)
         cutmix_cfg: Optional[Dict[str, Any]] = None,
         ndvi_dense_cutmix_cfg: Optional[Dict[str, Any]] = None,
-        # Manifold mixup on shared bottleneck representation
+        # Manifold mixup on DINO backbone features (CLS / patch / global embeddings)
         manifold_mixup_cfg: Optional[Dict[str, Any]] = None,
         # Biomass decomposition / ratio head configuration
         enable_ratio_head: bool = True,
@@ -535,9 +536,9 @@ class BiomassRegressor(LightningModule):
         self._val_preds: list[Tensor] = []
         self._val_targets: list[Tensor] = []
 
-        # --- CutMix batch-level augmentation ---
+        # --- CutMix batch-level augmentation on input images + labels ---
         self._cutmix_main = CutMixBatchAugment.from_cfg(cutmix_cfg)
-        # --- Manifold mixup on bottleneck representation ---
+        # --- Manifold mixup on DINO backbone outputs (CLS / patch / global features) ---
         self._manifold_mixup = ManifoldMixup.from_cfg(manifold_mixup_cfg)
 
         # --- Layer-wise heads per backbone layer (optional) ---

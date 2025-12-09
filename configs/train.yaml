@@ -1,5 +1,5 @@
 seed: 42
-version: manifold-mixup-fix
+version: manifold-mixup-disable
 data:
   root: data
   train_csv: train.csv
@@ -21,9 +21,9 @@ data:
   # the remaining components via a separate ratio head.
   target_order: [Dry_Total_g]
   augment:
-    random_resized_crop_scale: [1.0, 1.0]
+    random_resized_crop_scale: [0.8, 1.0]
     random_resized_crop:
-      enabled: false  # Set to false to disable RandomResizedCrop (uses deterministic resize instead)
+      enabled: true  # Set to false to disable RandomResizedCrop (uses deterministic resize instead)
     horizontal_flip_prob: 0.5
     color_jitter:
       enabled: true
@@ -77,11 +77,12 @@ data:
       scale: [0.02, 0.1]
       ratio: [0.3, 3.3]
       value: random
-    # Feature-level manifold mixup on the shared bottleneck representation z
+    # Feature-level manifold mixup on DINO backbone outputs
+    # (CLS tokens, patch tokens, or global CLS+mean(patch) features)
     manifold_mixup:
-      enabled: true
-      prob: 1.0
-      alpha: 2.0
+      enabled: false
+      prob: 0.5
+      alpha: 0.3
     cutmix:
       enabled: false
       alpha: 0.5
@@ -194,7 +195,7 @@ kfold:
   even_split: true
 
 trainer:
-  max_epochs: 30
+  max_epochs: 15
   accelerator: auto
   devices: 1
   precision: 16-mixed
