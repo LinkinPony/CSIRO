@@ -217,13 +217,16 @@ class DinoV3FeatureExtractor(nn.Module):
                 "multi-layer feature extraction is unsupported for this backbone."
             )
 
+        # Use pre-global-LayerNorm block outputs (norm=False) so that inference-time
+        # multi-layer heads see the same features as in training, where we attach our
+        # own per-layer LayerNorm and L2 normalization instead of DINOv3's shared norm.
         outs = get_intermediate(
             images,
             n=layer_indices,
             reshape=False,
             return_class_token=True,
             return_extra_tokens=False,
-            norm=True,
+            norm=False,
         )
         return outs
 
@@ -519,6 +522,7 @@ def extract_features_for_images(
     std: List[float],
     batch_size: int,
     num_workers: int,
+    token_norm_state: Optional[dict] = None,
 ) -> Tuple[List[str], torch.Tensor]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
@@ -527,12 +531,46 @@ def extract_features_for_images(
 
     feature_extractor.eval().to(device)
 
+    # Optional global token-level LayerNorm reconstructed from exported head.
+    # When present, we will apply this LN + L2 normalization on CLS+patch tokens
+    # before forming CLS+mean(patch) features, to mirror training-time behavior
+    # for single-layer (non-layerwise) heads.
+    global_token_norm = None
+    if token_norm_state:
+        import torch.nn as nn  # local import
+
+        w = token_norm_state.get("global_token_norm.weight", None)
+        if w is not None:
+            dim = int(w.shape[0]) if w.ndim >= 1 else 1
+            global_token_norm = nn.LayerNorm(dim).to(device)
+            global_token_norm.weight.data.copy_(w.to(device))
+            b = token_norm_state.get("global_token_norm.bias", None)
+            if b is not None and global_token_norm.bias is not None:
+                global_token_norm.bias.data.copy_(b.to(device))
+
     rels: List[str] = []
     feats_cpu: List[torch.Tensor] = []
     with torch.inference_mode():
         for images, rel_paths in dl:
             images = images.to(device, non_blocking=True)
-            feats = feature_extractor(images)
+            if global_token_norm is None:
+                # Backward-compatible path: use CLS+mean(patch) features as returned
+                # by DinoV3FeatureExtractor.forward (DINO global LN only).
+                feats = feature_extractor(images)
+            else:
+                # New path: obtain CLS and patch tokens from the final DINO block,
+                # apply our own global token-level LayerNorm + L2 normalization on
+                # CLS+patch tokens, then build CLS+mean(patch) features.
+                cls, pt = feature_extractor.forward_cls_and_tokens(images)
+                if pt.dim() != 3:
+                    raise RuntimeError(f"Unexpected patch tokens shape in extract_features_for_images: {tuple(pt.shape)}")
+                tokens = torch.cat([cls.unsqueeze(1), pt], dim=1)  # (B, 1+N, C)
+                tokens = global_token_norm(tokens)
+                tokens = F.normalize(tokens, p=2, dim=-1)
+                cls_n = tokens[:, 0, :]
+                pt_n = tokens[:, 1:, :]
+                patch_mean = pt_n.mean(dim=1)
+                feats = torch.cat([cls_n, patch_mean], dim=-1)  # (B, 2C)
             feats_cpu.append(feats.detach().cpu().float())
             rels.extend(list(rel_paths))
     features = torch.cat(feats_cpu, dim=0) if feats_cpu else torch.empty((0, 0), dtype=torch.float32)
@@ -621,6 +659,7 @@ def predict_main_and_ratio_patch_mode(
     num_layers: int,
     use_separate_bottlenecks: bool,
     layer_indices: Optional[List[int]] = None,
+    token_norm_state: Optional[dict] = None,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Patch-mode inference for a single head:
@@ -649,6 +688,52 @@ def predict_main_and_ratio_patch_mode(
     feature_extractor.eval().to(device)
     head = head.eval().to(device)
 
+    # Reconstruct optional token-level LayerNorms (per-layer and/or global) from
+    # the exported head state. These are used to normalize DINO CLS/patch tokens
+    # before feeding them into the exported head, matching training-time behavior.
+    layer_token_norms = {}
+    global_token_norm = None
+    if token_norm_state:
+        import torch.nn as nn  # local import to avoid polluting global namespace
+
+        # Build per-layer LayerNorms
+        tmp_layers: dict[int, dict[str, torch.Tensor]] = {}
+        for k, v in token_norm_state.items():
+            parts = str(k).split(".")
+            if not parts:
+                continue
+            if parts[0] == "layer_token_norms" and len(parts) >= 3:
+                try:
+                    idx = int(parts[1])
+                except Exception:
+                    continue
+                param_name = parts[2]
+                if idx not in tmp_layers:
+                    tmp_layers[idx] = {}
+                tmp_layers[idx][param_name] = v
+            elif parts[0] == "global_token_norm" and len(parts) >= 2:
+                param_name = parts[1]
+                if global_token_norm is None:
+                    dim = int(v.shape[0]) if v.ndim >= 1 else 1
+                    global_token_norm = nn.LayerNorm(dim).to(device)
+                tensor = v.to(device)
+                if param_name == "weight":
+                    global_token_norm.weight.data.copy_(tensor)
+                elif param_name == "bias" and global_token_norm.bias is not None:
+                    global_token_norm.bias.data.copy_(tensor)
+
+        for idx, params in tmp_layers.items():
+            w = params.get("weight", None)
+            if w is None:
+                continue
+            dim = int(w.shape[0]) if w.ndim >= 1 else 1
+            ln = nn.LayerNorm(dim).to(device)
+            ln.weight.data.copy_(w.to(device))
+            b = params.get("bias", None)
+            if b is not None and ln.bias is not None:
+                ln.bias.data.copy_(b.to(device))
+            layer_token_norms[idx] = ln
+
     rels: List[str] = []
     preds_main_list: List[torch.Tensor] = []
     preds_ratio_list: List[torch.Tensor] = []
@@ -674,6 +759,13 @@ def predict_main_and_ratio_patch_mode(
                     if pt_l.dim() != 3:
                         raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt_l.shape)}")
                     B, N, C = pt_l.shape
+                    # Optional per-layer token-level LN + L2 normalization on CLS+patch tokens
+                    if layer_token_norms and l_idx in layer_token_norms:
+                        tokens = torch.cat([cls_l.unsqueeze(1), pt_l], dim=1)  # (B, 1+N, C)
+                        tokens = layer_token_norms[l_idx](tokens)
+                        tokens = F.normalize(tokens, p=2, dim=-1)
+                        cls_l = tokens[:, 0, :]
+                        pt_l = tokens[:, 1:, :]
                     patch_mean_l = pt_l.mean(dim=1)  # (B, C)
 
                     if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
@@ -760,6 +852,13 @@ def predict_main_and_ratio_patch_mode(
                 if pt.dim() != 3:
                     raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt.shape)}")
                 B, N, C = pt.shape
+                # Optional global token-level LN + L2 normalization
+                if global_token_norm is not None:
+                    tokens = torch.cat([cls.unsqueeze(1), pt], dim=1)  # (B, 1+N, C)
+                    tokens = global_token_norm(tokens)
+                    tokens = F.normalize(tokens, p=2, dim=-1)
+                    cls = tokens[:, 0, :]
+                    pt = tokens[:, 1:, :]
 
                 if head_num_main > 0:
                     # Patch-based main path.
@@ -820,6 +919,7 @@ def predict_main_and_ratio_global_multilayer(
     layer_indices: List[int],
     *,
     use_separate_bottlenecks: bool = False,
+    token_norm_state: Optional[dict] = None,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Global (CLS+mean(patch)) multi-layer inference for a single head:
@@ -843,6 +943,37 @@ def predict_main_and_ratio_global_multilayer(
     feature_extractor.eval().to(device)
     head = head.eval().to(device)
 
+    # Optional per-layer token-level LayerNorms reconstructed from exported head.
+    layer_token_norms = {}
+    if token_norm_state:
+        import torch.nn as nn  # local import
+
+        tmp_layers: dict[int, dict[str, torch.Tensor]] = {}
+        for k, v in token_norm_state.items():
+            parts = str(k).split(".")
+            if not parts:
+                continue
+            if parts[0] == "layer_token_norms" and len(parts) >= 3:
+                try:
+                    idx = int(parts[1])
+                except Exception:
+                    continue
+                param_name = parts[2]
+                if idx not in tmp_layers:
+                    tmp_layers[idx] = {}
+                tmp_layers[idx][param_name] = v
+        for idx, params in tmp_layers.items():
+            w = params.get("weight", None)
+            if w is None:
+                continue
+            dim = int(w.shape[0]) if w.ndim >= 1 else 1
+            ln = nn.LayerNorm(dim).to(device)
+            ln.weight.data.copy_(w.to(device))
+            b = params.get("bias", None)
+            if b is not None and ln.bias is not None:
+                ln.bias.data.copy_(b.to(device))
+            layer_token_norms[idx] = ln
+
     num_layers = len(layer_indices)
     if num_layers <= 0:
         raise ValueError("layer_indices must contain at least one layer for multi-layer inference")
@@ -865,6 +996,13 @@ def predict_main_and_ratio_global_multilayer(
                 if pt_l.dim() != 3:
                     raise RuntimeError(f"Unexpected patch tokens shape in global multi-layer inference: {tuple(pt_l.shape)}")
                 B, N, C = pt_l.shape
+                # Optional per-layer token-level LN + L2 normalization on CLS+patch tokens
+                if layer_token_norms and l_idx in layer_token_norms:
+                    tokens = torch.cat([cls_l.unsqueeze(1), pt_l], dim=1)  # (B, 1+N, C)
+                    tokens = layer_token_norms[l_idx](tokens)
+                    tokens = F.normalize(tokens, p=2, dim=-1)
+                    cls_l = tokens[:, 0, :]
+                    pt_l = tokens[:, 1:, :]
                 patch_mean_l = pt_l.mean(dim=1)  # (B, C)
                 if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
                     # Explicit per-layer bottlenecks: call dedicated global-layer path.
@@ -1071,7 +1209,17 @@ def main():
     for head_pt in head_weight_paths:
         w = float(weight_map.get(head_pt, 1.0))
         # Load head state and meta
-        state, meta, peft_payload = load_head_state(head_pt)
+        raw_state, meta, peft_payload = load_head_state(head_pt)
+        # Split out optional token-level LayerNorm weights (stored under token_norms.*)
+        token_norm_state: dict = {}
+        state: dict = {}
+        for k, v in raw_state.items():
+            if str(k).startswith("token_norms."):
+                # Strip the prefix so that downstream code sees keys like
+                # layer_token_norms.{idx}.weight / global_token_norm.weight
+                token_norm_state[str(k)[len("token_norms.") :]] = v
+            else:
+                state[k] = v
         if not isinstance(meta, dict):
             meta = {}
 
@@ -1208,6 +1356,7 @@ def main():
                 num_layers=max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1,
                 use_separate_bottlenecks=use_separate_bottlenecks_head,
                 layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                token_norm_state=token_norm_state if token_norm_state else None,
             )
         else:
             if use_layerwise_heads_head and len(backbone_layer_indices_head) > 0:
@@ -1227,6 +1376,7 @@ def main():
                     head_total=head_total,
                     layer_indices=backbone_layer_indices_head,
                     use_separate_bottlenecks=use_separate_bottlenecks_head,
+                    token_norm_state=token_norm_state if token_norm_state else None,
                 )
             else:
                 # Legacy single-layer path: extract CLS+mean(patch) only from last layer.
@@ -1240,6 +1390,7 @@ def main():
                     std=std,
                     batch_size=batch_size,
                     num_workers=num_workers,
+                    token_norm_state=token_norm_state if token_norm_state else None,
                 )
                 preds_main, preds_ratio = predict_from_features(
                     features_cpu=features_cpu,

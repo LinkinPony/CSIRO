@@ -1,5 +1,5 @@
 seed: 42
-version: manifold-mixup-disable
+version: manifold-mixup-l2norm-single-layer-patch
 data:
   root: data
   train_csv: train.csv
@@ -80,9 +80,9 @@ data:
     # Feature-level manifold mixup on DINO backbone outputs
     # (CLS tokens, patch tokens, or global CLS+mean(patch) features)
     manifold_mixup:
-      enabled: false
-      prob: 0.5
-      alpha: 0.3
+      enabled: true
+      prob: 1.0
+      alpha: 2.0
     cutmix:
       enabled: false
       alpha: 0.5
@@ -116,9 +116,9 @@ model:
     #   - Average per-patch predictions to obtain the image-level output.
     # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
     # the global CLS + mean(patch) bottleneck.
-    use_patch_reg3: false
+    use_patch_reg3: true
   backbone_layers:
-    enabled: true
+    enabled: false
     # When true, each selected backbone layer uses its own bottleneck MLP.
     # When false, all layers share a single bottleneck (legacy behavior).
     separate_bottlenecks: true

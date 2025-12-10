@@ -69,13 +69,18 @@ class DinoV3FeatureExtractor(nn.Module):
 
         # DINOv3 accepts either an int (last n layers) or a sequence of indices.
         # Here we always pass a normalized list of indices defined by the caller.
+        # Important: we request *pre-global-LayerNorm* block outputs by setting norm=False.
+        # This returns, for each selected block, the raw block output tokens (CLS + patches),
+        # which have only gone through that block's own internal LayerNorms (norm1/norm2),
+        # but NOT through the shared final norm/cls_norm. This lets downstream heads attach
+        # their own per-layer normalization instead of reusing the global DINOv3 norm.
         outs = get_intermediate(
             images,
             n=layer_indices,
             reshape=False,
             return_class_token=True,
             return_extra_tokens=False,
-            norm=True,
+            norm=False,
         )
         return outs
 

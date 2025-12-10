@@ -178,11 +178,22 @@ class HeadCheckpoint(Callback):
             def collect_linears(m: nn.Module):
                 return [mod for mod in m.modules() if isinstance(mod, nn.Linear)]
 
-            # New-style model: shared_bottleneck + reg3_heads (one or more independent 1-d heads)
+            # New-style model: bottleneck MLP (shared_bottleneck or patch_bottleneck)
+            # + reg3_heads (one or more independent 1-d heads)
             if hasattr(pl_module, "shared_bottleneck") and hasattr(pl_module, "reg3_heads") and not (
                 use_layerwise_heads and use_separate_bottlenecks and hasattr(pl_module, "layer_bottlenecks")
             ):
-                bottleneck_linears = collect_linears(pl_module.shared_bottleneck)
+                # For patch-mode single-layer heads, the main reg3 path uses
+                # patch_bottleneck on patch tokens, while the global CLS+mean(patch)
+                # path uses shared_bottleneck. For inference we export a head that
+                # operates directly on patch tokens, so we must mirror the
+                # patch_bottleneck when use_patch_reg3 is True; otherwise we mirror
+                # shared_bottleneck as before.
+                src_bottleneck: nn.Module = pl_module.shared_bottleneck  # type: ignore[assignment]
+                if use_patch_reg3 and hasattr(pl_module, "patch_bottleneck") and getattr(pl_module, "patch_bottleneck") is not None:
+                    src_bottleneck = getattr(pl_module, "patch_bottleneck")  # type: ignore[assignment]
+
+                bottleneck_linears = collect_linears(src_bottleneck)
                 tgt_linears = collect_linears(head_module)
                 if len(tgt_linears) != len(bottleneck_linears) + 1:
                     raise RuntimeError("Mismatch in linear layers between bottleneck and inference head")
@@ -284,6 +295,33 @@ class HeadCheckpoint(Callback):
                 else:
                     raise
 
+        # Optionally bundle token-level LayerNorm weights used on DINO CLS/patch tokens
+        # before the bottleneck. These are needed to reproduce the training-time
+        # normalization (per-layer or global) in the head-only inference script.
+        try:
+            token_norm_state = {}
+            layer_token_norms = getattr(pl_module, "layer_token_norms", None)
+            if layer_token_norms is not None:
+                for idx, ln in enumerate(layer_token_norms):
+                    if isinstance(ln, nn.LayerNorm):
+                        # Store as token_norms.layer_token_norms.{idx}.(weight|bias)
+                        token_norm_state[f"layer_token_norms.{idx}.weight"] = ln.weight.detach().cpu().clone()
+                        if ln.bias is not None:
+                            token_norm_state[f"layer_token_norms.{idx}.bias"] = ln.bias.detach().cpu().clone()
+            global_token_norm = getattr(pl_module, "global_token_norm", None)
+            if isinstance(global_token_norm, nn.LayerNorm):
+                token_norm_state["global_token_norm.weight"] = global_token_norm.weight.detach().cpu().clone()
+                if global_token_norm.bias is not None:
+                    token_norm_state["global_token_norm.bias"] = global_token_norm.bias.detach().cpu().clone()
+            if token_norm_state:
+                # Prefix all keys with token_norms. to keep them separate from the packed head.
+                for k, v in token_norm_state.items():
+                    state_dict_to_save[f"token_norms.{k}"] = v
+        except Exception:
+            # If anything goes wrong while exporting token norms, skip silently to
+            # preserve backward compatibility with older checkpoints.
+            pass
+
         state: Dict[str, Any] = {
             "state_dict": state_dict_to_save,
             "meta": {
@@ -313,6 +351,22 @@ class HeadCheckpoint(Callback):
                 "use_separate_bottlenecks": bool(getattr(pl_module.hparams, "use_separate_bottlenecks", False)) if hasattr(pl_module, "hparams") else False,
                 # Order of ratio components packed in the head (if any)
                 "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
+                # Token-level LayerNorm configuration for DINO CLS/patch tokens used
+                # before the bottleneck MLPs. These flags allow the inference script
+                # to decide whether to reconstruct per-layer/global token norms.
+                "use_token_norms": bool(
+                    hasattr(pl_module, "layer_token_norms")
+                    and getattr(pl_module, "layer_token_norms") is not None
+                ),
+                "num_token_norm_layers": int(
+                    len(getattr(pl_module, "layer_token_norms", []))
+                )
+                if hasattr(pl_module, "layer_token_norms") and getattr(pl_module, "layer_token_norms") is not None
+                else 0,
+                "has_global_token_norm": bool(
+                    hasattr(pl_module, "global_token_norm")
+                    and getattr(pl_module, "global_token_norm") is not None
+                ),
             },
         }
         # Optionally bundle LoRA adapter payload alongside the head (to preserve the two-inputs rule at inference)
