@@ -109,9 +109,9 @@ def build_bottleneck_mlp(
     act_name = (head_activation or "").lower()
 
     layers: List[nn.Module] = []
-    # When use_patch_reg3 is enabled, the bottleneck operates directly on patch
-    # token dimensionality (C). Otherwise, it expects CLS concat mean(patch) (2C).
-    in_dim = embedding_dim if use_patch_reg3 else (embedding_dim * 2)
+    # Bottlenecks now always operate directly on patch-based features (e.g. mean(patch)),
+    # so the input dimensionality is the backbone embedding_dim (C).
+    in_dim = embedding_dim
 
     if dropout and dropout > 0:
         layers.append(nn.Dropout(dropout))
@@ -225,19 +225,18 @@ class MultiLayerHeadExport(nn.Module):
 
     def forward_global_layer(
         self,
-        cls: torch.Tensor,
         patch_mean: torch.Tensor,
         layer_idx: int,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Global (CLS+mean(patch)) path for a single backbone layer.
+        Global patch-based path for a single backbone layer (no CLS token).
         """
         if not (0 <= layer_idx < self.num_layers):
             raise IndexError(f"layer_idx {layer_idx} out of range for num_layers={self.num_layers}")
 
-        # When use_patch_reg3 is False, the bottleneck expects CLS+mean(patch) (2C).
-        # We still call this method only in that regime from inference code.
-        feats = torch.cat([cls, patch_mean], dim=-1)
+        # Bottlenecks operate directly on patch-based features (e.g. mean(patch)),
+        # so we feed the mean patch token (C-dim) into the bottleneck.
+        feats = patch_mean
         bottleneck = self.layer_bottlenecks[layer_idx]
         z = bottleneck(feats)
 

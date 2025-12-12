@@ -1,5 +1,5 @@
-seed: 42
-version: manifold-mixup-l2norm-single-layer-patch
+seed: 1
+version: no-cls-mixup-layernorm-v4-e25-seed2
 data:
   root: data
   train_csv: train.csv
@@ -21,22 +21,22 @@ data:
   # the remaining components via a separate ratio head.
   target_order: [Dry_Total_g]
   augment:
-    random_resized_crop_scale: [0.8, 1.0]
+    random_resized_crop_scale: [1.0, 1.0]
     random_resized_crop:
-      enabled: true  # Set to false to disable RandomResizedCrop (uses deterministic resize instead)
+      enabled: false  # Set to false to disable RandomResizedCrop (uses deterministic resize instead)
     horizontal_flip_prob: 0.5
     color_jitter:
       enabled: true
       prob: 0.8
-      brightness: 0.2
-      contrast: 0.2
-      saturation: 0.1
+      brightness: 0.1
+      contrast: 0.1
+      saturation: 0.05
       hue: 0.00
     vertical_flip:
       enabled: true
       prob: 0.5
     random_affine:
-      enabled: true
+      enabled: false
       degrees: 5.0
       translate: [0.02, 0.02]
       scale: [0.95, 1.05]
@@ -74,18 +74,18 @@ data:
     random_erasing:
       enabled: true
       p: 0.25
-      scale: [0.02, 0.1]
+      scale: [0.02, 0.05]
       ratio: [0.3, 3.3]
       value: random
     # Feature-level manifold mixup on DINO backbone outputs
     # (CLS tokens, patch tokens, or global CLS+mean(patch) features)
     manifold_mixup:
       enabled: true
-      prob: 1.0
-      alpha: 2.0
+      prob: 0.3
+      alpha: 0.5
     cutmix:
       enabled: false
-      alpha: 0.5
+      alpha: 0.3
       # minmax: [0.3, 0.7]  # optional clamp for bbox size; comment to disable
       use_prev_for_bsz1: true
     no_augment_prob: 0.1
@@ -105,6 +105,14 @@ model:
   freeze_backbone: true
   embedding_dim: 1280
   log_scale_targets: false
+  # Token-level normalization on DINO backbone outputs (CLS + patches)
+  # applied before manifold mixup / downstream MLPs. These flags control
+  # the custom LayerNorm and L2 normalization we add on top of DINOv3.
+  token_norm:
+    # When true, apply a learnable LayerNorm to backbone tokens.
+    use_layernorm: true
+    # When true, apply L2 normalization so tokens lie on a hypersphere.
+    use_l2norm: false
   head:
     type: mlp
     hidden_dims: [1280]
@@ -116,9 +124,9 @@ model:
     #   - Average per-patch predictions to obtain the image-level output.
     # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
     # the global CLS + mean(patch) bottleneck.
-    use_patch_reg3: true
+    use_patch_reg3: false
   backbone_layers:
-    enabled: false
+    enabled: true
     # When true, each selected backbone layer uses its own bottleneck MLP.
     # When false, all layers share a single bottleneck (legacy behavior).
     separate_bottlenecks: true
@@ -130,7 +138,7 @@ mtl:
   enabled: true
   tasks:
     height: false
-    ndvi: false
+    ndvi: true
     ndvi_dense: false
     species: false
     state: false
@@ -195,7 +203,7 @@ kfold:
   even_split: true
 
 trainer:
-  max_epochs: 15
+  max_epochs: 25
   accelerator: auto
   devices: 1
   precision: 16-mixed

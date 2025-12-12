@@ -289,6 +289,17 @@ def train_single_split(
         backbone_layers_cfg.get("separate_bottlenecks", True)
     )
 
+    # Token-level normalization on DINO backbone outputs (CLS + patches).
+    # These flags control our custom LayerNorm and L2 normalization that
+    # are applied before manifold mixup / downstream MLPs.
+    token_norm_cfg = (
+        cfg["model"].get("token_norm", {})
+        if isinstance(cfg.get("model", {}), dict)
+        else {}
+    )
+    use_token_layernorm = bool(token_norm_cfg.get("use_layernorm", True))
+    use_token_l2norm = bool(token_norm_cfg.get("use_l2norm", True))
+
     # Optimizer / SAM configuration
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_name = str(optimizer_cfg.get("name", "adamw"))
@@ -390,6 +401,9 @@ def train_single_split(
         if isinstance(backbone_layer_indices, (list, tuple))
         else None,
         use_separate_bottlenecks=use_separate_bottlenecks,
+        # Token-level normalization on backbone tokens
+        use_token_layernorm=use_token_layernorm,
+        use_token_l2norm=use_token_l2norm,
         optimizer_name=optimizer_name,
         use_sam=use_sam,
         sam_rho=sam_rho,

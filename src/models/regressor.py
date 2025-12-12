@@ -261,6 +261,13 @@ class BiomassRegressor(LightningModule):
         # When True, each selected backbone layer uses its own bottleneck MLP.
         # When False, all layers share a single bottleneck (legacy behavior).
         use_separate_bottlenecks: bool = True,
+        # Token-level normalization on DINO backbone outputs (CLS + patches)
+        # applied before manifold mixup / downstream MLPs.
+        # - use_token_layernorm: apply a learnable LayerNorm on tokens
+        # - use_token_l2norm:    apply L2 normalization so tokens live on a hypersphere
+        # These flags allow enabling/disabling our custom LN and L2 independently.
+        use_token_layernorm: bool = True,
+        use_token_l2norm: bool = True,
         # Optimizer / SAM configuration
         optimizer_name: Optional[str] = None,
         use_sam: bool = False,
@@ -354,9 +361,11 @@ class BiomassRegressor(LightningModule):
 
             return nn.Sequential(*layers)
 
-        # Global bottleneck (inputs: CLS concat mean(patch), dim = 2 * embedding_dim).
+        # Global bottleneck (inputs: global patch-based features, e.g. mean(patch), dim = embedding_dim).
         # This is used for the global image-level path and for auxiliary tasks / ratio head.
-        self.shared_bottleneck = _build_bottleneck(embedding_dim * 2)
+        # NOTE: Historically this consumed CLS concat mean(patch) (2 * embedding_dim); after
+        # removing CLS usage we now operate purely on patch/mean‑patch features.
+        self.shared_bottleneck = _build_bottleneck(embedding_dim)
         # Optional patch bottleneck (inputs: patch tokens, dim = embedding_dim), used only
         # when patch-based main regression is enabled.
         self.patch_bottleneck = _build_bottleneck(embedding_dim) if use_patch else None
@@ -397,7 +406,7 @@ class BiomassRegressor(LightningModule):
 
         # Optional per-layer bottlenecks for multi-layer heads
         self.use_separate_bottlenecks: bool = bool(use_separate_bottlenecks)
-        # Per-layer GLOBAL bottlenecks (CLS+mean(patch)), when enabled.
+        # Per-layer GLOBAL bottlenecks built from per-layer patch features, when enabled.
         self.layer_bottlenecks = None  # type: ignore[assignment]
         # Per-layer PATCH bottlenecks (patch tokens), used only when patch-based main regression is enabled.
         self.layer_patch_bottlenecks = None  # type: ignore[assignment]
@@ -410,14 +419,21 @@ class BiomassRegressor(LightningModule):
         if self.use_layerwise_heads and self.use_separate_bottlenecks:
             # One global bottleneck MLP per selected backbone layer.
             self.layer_bottlenecks = nn.ModuleList(
-                [_build_bottleneck(embedding_dim * 2) for _ in range(self.num_layers)]
+                # Historically these bottlenecks consumed CLS concat mean(patch) (2C); after
+                # removing CLS usage they now operate purely on patch-based global features
+                # such as per-layer mean(patch) with dimensionality C.
+                [_build_bottleneck(embedding_dim) for _ in range(self.num_layers)]
             )
             # Optional per-layer patch bottlenecks for scheme A when patch-based regression is on.
             if use_patch:
                 self.layer_patch_bottlenecks = nn.ModuleList(
                     [_build_bottleneck(embedding_dim) for _ in range(self.num_layers)]
                 )
-        if self.use_layerwise_heads:
+        # Token-level normalization flags (shared between single-layer and multi-layer paths)
+        self.use_token_layernorm: bool = bool(use_token_layernorm)
+        self.use_token_l2norm: bool = bool(use_token_l2norm)
+
+        if self.use_layerwise_heads and self.use_token_layernorm:
             # One token-level LayerNorm per selected backbone layer (shared between
             # CLS and patch tokens of that layer).
             self.layer_token_norms = nn.ModuleList(
@@ -430,7 +446,7 @@ class BiomassRegressor(LightningModule):
         # global path also benefits from a learnable LN + L2 normalization on DINO
         # features before manifold mixup / MLPs.
         self.global_token_norm = None  # type: ignore[assignment]
-        if not self.use_layerwise_heads:
+        if (not self.use_layerwise_heads) and self.use_token_layernorm:
             self.global_token_norm = nn.LayerNorm(embedding_dim)
 
         self.mtl_enabled: bool = bool(mtl_enabled)
@@ -626,7 +642,6 @@ class BiomassRegressor(LightningModule):
     def _compute_reg3_from_images(
         self,
         images: Optional[Tensor] = None,
-        cls_tokens: Optional[Tensor] = None,
         pt_tokens: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
         """
@@ -639,47 +654,52 @@ class BiomassRegressor(LightningModule):
             pred_reg3_global: (B, num_outputs) optional global-head prediction (None when unavailable)
             ratio_patch_probs: (B, 3) optional patch-averaged ratio distribution when enabled
         """
-        # --- Legacy global path (no patch-based main regression) ---
+        # --- Global path with no patch-based main regression ---
+        # This path now operates purely on global patch-based features (e.g. mean(patch)),
+        # without using CLS tokens.
         if not self.use_patch_reg3:
-            if images is None:
-                raise ValueError("images must be provided when use_patch_reg3 is False")
-            # DinoV3FeatureExtractor.forward(images) returns CLS concat mean(patch) (B, 2C).
-            features = self.feature_extractor(images)
-            z = self.shared_bottleneck(features)
+            if images is None and pt_tokens is None:
+                raise ValueError(
+                    "Either images or pt_tokens must be provided when use_patch_reg3 is False"
+                )
+            if pt_tokens is None:
+                # Obtain patch tokens from the backbone (ignore CLS).
+                _, pt = self.feature_extractor.forward_cls_and_tokens(images)  # type: ignore[arg-type]
+            else:
+                pt = pt_tokens
+
+            if pt.dim() != 3:
+                raise RuntimeError(
+                    f"Unexpected patch tokens shape in global reg3 path: {tuple(pt.shape)}"
+                )
+            # Global feature: mean over patch tokens (B, C)
+            patch_mean = pt.mean(dim=1)
+            z = self.shared_bottleneck(patch_mean)
             pred_reg3_logits = self._forward_reg3_logits(z)
             # When patch-based path is disabled, the global head is the only head.
             return pred_reg3_logits, z, pred_reg3_logits, None
 
         # --- Patch-based main regression path (scheme A) ---
-        # Obtain CLS and patch tokens either from cached tensors or directly from the backbone.
-        if pt_tokens is None or (cls_tokens is None and images is None):
+        # Obtain patch tokens either from cached tensors or directly from the backbone.
+        if pt_tokens is None:
             if images is None:
                 raise ValueError(
-                    "Either images or (cls_tokens, pt_tokens) must be provided in patch-mode reg3"
+                    "Either images or pt_tokens must be provided in patch-mode reg3"
                 )
-            cls, pt = self.feature_extractor.forward_cls_and_tokens(images)
+            # Obtain patch tokens from the backbone (ignore CLS).
+            _, pt = self.feature_extractor.forward_cls_and_tokens(images)
         else:
             pt = pt_tokens
-            if cls_tokens is None:
-                # Fallback: in extremely rare cases cls_tokens may be missing; this should
-                # not happen in normal training flows, but we guard for robustness by
-                # recomputing from images when possible.
-                if images is None:
-                    raise ValueError(
-                        "cls_tokens is None in patch-mode reg3 and images is also None"
-                    )
-                cls, _ = self.feature_extractor.forward_cls_and_tokens(images)
-            else:
-                cls = cls_tokens
 
         if pt.dim() != 3:
-            raise RuntimeError(f"Unexpected patch tokens shape in patch-mode reg3: {tuple(pt.shape)}")
+            raise RuntimeError(
+                f"Unexpected patch tokens shape in patch-mode reg3: {tuple(pt.shape)}"
+            )
         B, N, C = pt.shape
 
-        # Global path: CLS concat mean(patch) -> global bottleneck -> global reg3 heads.
+        # Global path: mean(patch) -> global bottleneck -> global reg3 heads.
         patch_mean = pt.mean(dim=1)  # (B, C)
-        feats_global = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
-        z_global = self.shared_bottleneck(feats_global)  # (B, bottleneck_dim)
+        z_global = self.shared_bottleneck(patch_mean)  # (B, bottleneck_dim)
         pred_reg3_global = self._forward_reg3_logits(z_global)  # (B, num_outputs)
 
         # Local path: per-patch tokens -> patch bottleneck -> reg3 heads -> average over patches.
@@ -731,16 +751,17 @@ class BiomassRegressor(LightningModule):
 
         # Obtain CLS and patch tokens for all requested layers in a single backbone forward,
         # unless they were already provided (e.g., after manifold mixup on backbone outputs).
-        if cls_list is None or pt_list is None:
+        if pt_list is None:
             if images is None:
                 raise ValueError(
-                    "Either images or (cls_list, pt_list) must be provided for multi-layer reg3"
+                    "Either images or pt_list must be provided for multi-layer reg3"
                 )
-            cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
+            # Obtain per-layer patch tokens from the backbone (ignore CLS).
+            _, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
                 images, self.backbone_layer_indices
             )
-        if len(cls_list) != len(pt_list):
-            raise RuntimeError("Mismatch between CLS and patch token lists in multi-layer path")
+        if len(pt_list) != len(self.backbone_layer_indices):
+            raise RuntimeError("Mismatch between patch token lists and backbone_layer_indices in multi-layer path")
 
         z_layers: List[Tensor] = []
         pred_layers: List[Tensor] = []          # main path (global or patch-based)
@@ -748,12 +769,15 @@ class BiomassRegressor(LightningModule):
         ratio_patch_layers: List[Tensor] = []   # per-layer patch-averaged ratio distributions
 
         if not self.use_patch_reg3:
-            # CLS + mean(patch) per layer (global-only path).
-            for layer_idx, (cls, pt) in enumerate(zip(cls_list, pt_list)):
+            # Global-only path built from per-layer patch features (e.g. mean(patch)).
+            for layer_idx, pt in enumerate(pt_list):
                 if pt.dim() != 3:
-                    raise RuntimeError(f"Unexpected patch tokens shape in multi-layer reg3: {tuple(pt.shape)}")
+                    raise RuntimeError(
+                        f"Unexpected patch tokens shape in multi-layer reg3: {tuple(pt.shape)}"
+                    )
                 patch_mean = pt.mean(dim=1)  # (B, C)
-                feats = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
+                # Global feature for this layer: mean over patch tokens (B, C)
+                feats = patch_mean
                 # Select per-layer bottleneck if available; otherwise fall back to shared one.
                 if self.layer_bottlenecks is not None:
                     bottleneck_global = self.layer_bottlenecks[layer_idx]
@@ -771,22 +795,21 @@ class BiomassRegressor(LightningModule):
                 pred_layers_global.append(pred_l)
         else:
             # Patch-based reg3 per layer: per-patch predictions then averaged, plus a
-            # parallel global path from CLS+mean(patch) for consistency.
-            for layer_idx, (cls, pt) in enumerate(zip(cls_list, pt_list)):
+            # parallel global path built from per-layer patch features for consistency.
+            for layer_idx, pt in enumerate(pt_list):
                 if pt.dim() != 3:
                     raise RuntimeError(
                         f"Unexpected patch tokens shape in multi-layer patch-mode reg3: {tuple(pt.shape)}"
                     )
                 B, N, C = pt.shape
                 patch_mean = pt.mean(dim=1)  # (B, C)
-                feats_global = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
 
-                # Global bottleneck per layer (or shared)
+                # Global bottleneck per layer (or shared), operating on mean(patch) features.
                 if self.layer_bottlenecks is not None:
                     bottleneck_global = self.layer_bottlenecks[layer_idx]
                 else:
                     bottleneck_global = self.shared_bottleneck
-                z_global_l = bottleneck_global(feats_global)  # (B, bottleneck_dim)
+                z_global_l = bottleneck_global(patch_mean)  # (B, bottleneck_dim)
                 z_layers.append(z_global_l)
 
                 # Patch bottleneck per layer (or shared)
@@ -1007,35 +1030,35 @@ class BiomassRegressor(LightningModule):
 
         # Main regression path (reg3). When use_patch_reg3 is enabled, this returns
         # per-patch predictions averaged over patches together with a global bottleneck
-        # feature built from CLS + mean(patch). Auxiliary heads and ratio/5D always
-        # use the global bottleneck z. When use_layerwise_heads is enabled, both
-        # reg3 and z are obtained by averaging per-layer predictions/features.
+        # feature built from patch-only global features (e.g. mean(patch)). Auxiliary
+        # heads and ratio/5D always use the global bottleneck z. When use_layerwise_heads
+        # is enabled, both reg3 and z are obtained by averaging per-layer predictions/features.
         pred_reg3: Tensor
         pred_reg3_global: Optional[Tensor] = None
         ratio_patch_probs: Optional[Tensor] = None
         z: Tensor
         z_layers: Optional[List[Tensor]] = None
         if self.use_layerwise_heads:
-            # Multi-layer path: obtain per-layer CLS and patch tokens from the backbone,
+            # Multi-layer path: obtain per-layer patch tokens from the backbone,
             # optionally apply per-layer token-LN + L2, manifold mixup on these
-            # normalized tokens, then build bottleneck features and heads on top.
-            cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
+            # normalized patch tokens, then build bottleneck features and heads on top.
+            _, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
                 images, self.backbone_layer_indices
             )
-            # Step 2 & 3: per-layer learnable LayerNorm on DINO tokens, followed by L2
-            # normalization so that each token lies on a hypersphere. We do this before
-            # manifold mixup so that mixing happens in the normalized feature space.
-            if self.layer_token_norms is not None:
-                normed_cls_list: List[Tensor] = []
+            # Step 2 & 3: optional per-layer learnable LayerNorm on patch tokens,
+            # followed by optional L2 normalization so that each token lies on a
+            # hypersphere. We do this before manifold mixup so that mixing happens
+            # in the (optionally) normalized feature space.
+            if self.layer_token_norms is not None or self.use_token_l2norm:
                 normed_pt_list: List[Tensor] = []
-                for layer_idx, (cls, pt) in enumerate(zip(cls_list, pt_list)):
-                    # tokens: (B, 1+N, C) where first token is CLS, remaining are patches
-                    tokens_lp = torch.cat([cls.unsqueeze(1), pt], dim=1)
-                    tokens_lp = self.layer_token_norms[layer_idx](tokens_lp)
-                    tokens_lp = F.normalize(tokens_lp, p=2, dim=-1)
-                    normed_cls_list.append(tokens_lp[:, 0, :])
-                    normed_pt_list.append(tokens_lp[:, 1:, :])
-                cls_list, pt_list = normed_cls_list, normed_pt_list
+                for layer_idx, pt in enumerate(pt_list):
+                    pt_n = pt
+                    if self.layer_token_norms is not None:
+                        pt_n = self.layer_token_norms[layer_idx](pt_n)
+                    if self.use_token_l2norm:
+                        pt_n = F.normalize(pt_n, p=2, dim=-1)
+                    normed_pt_list.append(pt_n)
+                pt_list = normed_pt_list
 
             if (
                 use_mixup
@@ -1044,43 +1067,35 @@ class BiomassRegressor(LightningModule):
                 and (not is_ndvi_only)
             ):
                 try:
-                    # Jointly stack CLS and patch tokens so that manifold mixup operates
-                    # on both, sharing the same (lam, perm) across CLS and patches),
-                    # but now in the per-layer LN + L2-normalized space.
-                    # cls_list: [L * (B, C)] -> (B, L, C)
-                    # pt_list : [L * (B, N, C)] -> (B, L, N, C)
-                    cls_stack = torch.stack(cls_list, dim=1)  # (B, L, C)
-                    pt_stack = torch.stack(pt_list, dim=1)    # (B, L, N, C)
-                    cls_stack_exp = cls_stack.unsqueeze(2)    # (B, L, 1, C)
-                    tokens = torch.cat([cls_stack_exp, pt_stack], dim=2)  # (B, L, 1+N, C)
-                    tokens, batch, _ = self._manifold_mixup.apply(tokens, batch, force=True)
-                    # After mixup, re-apply L2 normalization so that all token vectors
-                    # stay on the same hypersphere.
-                    tokens = F.normalize(tokens, p=2, dim=-1)
-                    # Split back into per-layer CLS and patch tokens.
-                    cls_stack_mixed = tokens[:, :, 0, :]      # (B, L, C)
-                    pt_stack_mixed = tokens[:, :, 1:, :]      # (B, L, N, C)
-                    L_layers = cls_stack_mixed.shape[1]
-                    cls_list = [cls_stack_mixed[:, i] for i in range(L_layers)]
-                    pt_list = [pt_stack_mixed[:, i] for i in range(L_layers)]
+                    # Stack per-layer patch tokens so that manifold mixup operates on
+                    # them in the normalized space. Shape: (B, L, N, C).
+                    pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
+                    tokens, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
+                    # After mixup, optionally re-apply L2 normalization so that all
+                    # token vectors stay on the same hypersphere.
+                    if self.use_token_l2norm:
+                        tokens = F.normalize(tokens, p=2, dim=-1)
+                    L_layers = tokens.shape[1]
+                    pt_list = [tokens[:, i] for i in range(L_layers)]
                 except Exception:
                     pass
             pred_reg3, z, z_layers, pred_reg3_global, ratio_patch_probs = self._compute_reg3_and_z_multilayer(
-                images=None, cls_list=cls_list, pt_list=pt_list
+                images=None, cls_list=None, pt_list=pt_list
             )
         else:
             if self.use_patch_reg3:
-                # Patch-based main regression path: obtain backbone CLS & patch tokens, apply
-                # our own token-level LN + L2 on the final DINO block outputs, optionally
+                # Patch-based main regression path: obtain backbone patch tokens, apply
+                # our own token-level LN and/or L2 on the final DINO block outputs, optionally
                 # perform manifold mixup in this normalized space, then compute bottleneck
                 # features for global + patch-based heads.
-                cls_tokens, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
-                # Apply single-layer learnable LayerNorm + L2 on CLS+patch tokens so that
-                # we operate in a normalized hypersphere feature space.
-                tokens_sp = torch.cat([cls_tokens.unsqueeze(1), pt_tokens], dim=1)  # (B, 1+N, C)
+                _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                # Apply single-layer learnable LayerNorm and/or L2 on patch tokens so that
+                # we optionally operate in a normalized hypersphere feature space.
+                tokens_sp = pt_tokens  # (B, N, C)
                 if self.global_token_norm is not None:
                     tokens_sp = self.global_token_norm(tokens_sp)
-                tokens_sp = F.normalize(tokens_sp, p=2, dim=-1)
+                if self.use_token_l2norm:
+                    tokens_sp = F.normalize(tokens_sp, p=2, dim=-1)
                 if (
                     use_mixup
                     and self._manifold_mixup is not None
@@ -1088,30 +1103,30 @@ class BiomassRegressor(LightningModule):
                     and (not is_ndvi_only)
                 ):
                     try:
-                        # Manifold mixup on LN+L2-normalized tokens; re-apply L2 so that
-                        # mixed tokens also lie on the same hypersphere.
+                        # Manifold mixup on (optionally) LN/L2-normalized patch tokens; re-apply
+                        # L2 so that mixed tokens also lie on the same hypersphere when enabled.
                         tokens_sp, batch, _ = self._manifold_mixup.apply(
                             tokens_sp, batch, force=True
                         )
-                        tokens_sp = F.normalize(tokens_sp, p=2, dim=-1)
+                        if self.use_token_l2norm:
+                            tokens_sp = F.normalize(tokens_sp, p=2, dim=-1)
                     except Exception:
                         pass
-                # Split back: first position is CLS, remaining are patch tokens.
-                cls_tokens = tokens_sp[:, 0, :]      # (B, C)
-                pt_tokens = tokens_sp[:, 1:, :]      # (B, N, C)
+                pt_tokens = tokens_sp  # (B, N, C)
                 pred_reg3, z, pred_reg3_global, ratio_patch_probs = self._compute_reg3_from_images(
-                    images=None, cls_tokens=cls_tokens, pt_tokens=pt_tokens
+                    images=None, pt_tokens=pt_tokens
                 )
             else:
-                # Legacy CLS+mean(patch) path: obtain backbone CLS & patch tokens from
-                # the final DINO block, apply our own token-level LN + L2 on them, then
-                # (optionally) perform manifold mixup in this normalized space before
-                # forming CLS+mean(patch) global features.
-                cls_tokens, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
-                tokens_sp = torch.cat([cls_tokens.unsqueeze(1), pt_tokens], dim=1)  # (B, 1+N, C)
+                # Legacy global path: obtain backbone patch tokens from the final DINO block,
+                # apply our own token-level LN and/or L2 on them, then (optionally) perform
+                # manifold mixup in this normalized space before forming global features
+                # from mean(patch) only.
+                _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                tokens_sp = pt_tokens  # (B, N, C)
                 if self.global_token_norm is not None:
                     tokens_sp = self.global_token_norm(tokens_sp)
-                tokens_sp = F.normalize(tokens_sp, p=2, dim=-1)
+                if self.use_token_l2norm:
+                    tokens_sp = F.normalize(tokens_sp, p=2, dim=-1)
                 if (
                     use_mixup
                     and self._manifold_mixup is not None
@@ -1122,15 +1137,13 @@ class BiomassRegressor(LightningModule):
                         tokens_sp, batch, _ = self._manifold_mixup.apply(
                             tokens_sp, batch, force=True
                         )
-                        tokens_sp = F.normalize(tokens_sp, p=2, dim=-1)
+                        if self.use_token_l2norm:
+                            tokens_sp = F.normalize(tokens_sp, p=2, dim=-1)
                     except Exception:
                         pass
-                # Reconstruct CLS and patch tokens from the (possibly mixed) normalized tokens.
-                cls_tokens = tokens_sp[:, 0, :]      # (B, C)
-                pt_tokens = tokens_sp[:, 1:, :]      # (B, N, C)
+                pt_tokens = tokens_sp  # (B, N, C)
                 patch_mean = pt_tokens.mean(dim=1)   # (B, C)
-                features = torch.cat([cls_tokens, patch_mean], dim=-1)  # (B, 2C)
-                z = self.shared_bottleneck(features)
+                z = self.shared_bottleneck(patch_mean)
                 pred_reg3 = self._forward_reg3_logits(z)
                 pred_reg3_global = pred_reg3
                 ratio_patch_probs = None
@@ -1222,16 +1235,27 @@ class BiomassRegressor(LightningModule):
             y_ratio: Optional[Tensor] = batch.get("y_ratio", None)  # (B,3)
             ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
             if y_ratio is not None and ratio_mask is not None:
-                # Predict logits for (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
-                if self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
-                    logits_per_layer: List[Tensor] = []
-                    for idx, head in enumerate(self.layer_ratio_heads):
-                        logits_per_layer.append(head(z_layers[idx]))
-                    ratio_logits = average_layerwise_predictions(logits_per_layer)
+                # Predict probabilities for (Dry_Clover_g, Dry_Dead_g, Dry_Green_g).
+                # When patch-based reg3 is enabled and patch-averaged ratio distributions
+                # are available, we treat those as the primary ratio predictions so that
+                # training and inference both operate on patch-only features.
+                if self.use_patch_reg3 and ratio_patch_probs is not None:
+                    p_pred = ratio_patch_probs
                 else:
-                    ratio_logits = self.ratio_head(z)  # type: ignore[operator]
-                # Predicted probabilities
-                p_pred = F.softmax(ratio_logits, dim=-1)
+                    # Fall back to global bottleneck ratio head.
+                    if (
+                        self.use_layerwise_heads
+                        and self.layer_ratio_heads is not None
+                        and z_layers is not None
+                    ):
+                        logits_per_layer: List[Tensor] = []
+                        for idx, head in enumerate(self.layer_ratio_heads):
+                            logits_per_layer.append(head(z_layers[idx]))
+                        ratio_logits = average_layerwise_predictions(logits_per_layer)
+                    else:
+                        ratio_logits = self.ratio_head(z)  # type: ignore[operator]
+                    # Predicted probabilities from logits
+                    p_pred = F.softmax(ratio_logits, dim=-1)
                 # Ensure target is a proper distribution
                 p_true = y_ratio.clamp_min(0.0)
                 denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)

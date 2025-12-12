@@ -523,6 +523,7 @@ def extract_features_for_images(
     batch_size: int,
     num_workers: int,
     token_norm_state: Optional[dict] = None,
+    use_token_l2norm: bool = True,
 ) -> Tuple[List[str], torch.Tensor]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
@@ -532,9 +533,9 @@ def extract_features_for_images(
     feature_extractor.eval().to(device)
 
     # Optional global token-level LayerNorm reconstructed from exported head.
-    # When present, we will apply this LN + L2 normalization on CLS+patch tokens
-    # before forming CLS+mean(patch) features, to mirror training-time behavior
-    # for single-layer (non-layerwise) heads.
+    # When present, we will apply this LN + L2 normalization on patch tokens
+    # before forming global patch-based features (e.g. mean(patch)), to mirror
+    # training-time behavior for single-layer (non-layerwise) heads.
     global_token_norm = None
     if token_norm_state:
         import torch.nn as nn  # local import
@@ -554,23 +555,39 @@ def extract_features_for_images(
         for images, rel_paths in dl:
             images = images.to(device, non_blocking=True)
             if global_token_norm is None:
-                # Backward-compatible path: use CLS+mean(patch) features as returned
-                # by DinoV3FeatureExtractor.forward (DINO global LN only).
-                feats = feature_extractor(images)
+                if use_token_l2norm:
+                    # L2-only path: obtain patch tokens from the final DINO block,
+                    # apply L2 normalization on patch tokens, then build global
+                    # features from mean(patch) only. This mirrors training when
+                    # custom LayerNorm is disabled but L2 is enabled.
+                    _, pt = feature_extractor.forward_cls_and_tokens(images)
+                    if pt.dim() != 3:
+                        raise RuntimeError(
+                            f"Unexpected patch tokens shape in extract_features_for_images: {tuple(pt.shape)}"
+                        )
+                    tokens = F.normalize(pt, p=2, dim=-1)
+                    patch_mean = tokens.mean(dim=1)  # (B, C)
+                    feats = patch_mean
+                else:
+                    # Backward-compatible path: use global features as returned by
+                    # DinoV3FeatureExtractor.forward (historically CLS+mean(patch)).
+                    feats = feature_extractor(images)
             else:
-                # New path: obtain CLS and patch tokens from the final DINO block,
-                # apply our own global token-level LayerNorm + L2 normalization on
-                # CLS+patch tokens, then build CLS+mean(patch) features.
-                cls, pt = feature_extractor.forward_cls_and_tokens(images)
+                # New path: obtain patch tokens from the final DINO block, apply
+                # our own global token-level LayerNorm and (optionally) L2
+                # normalization on patch tokens, then build global features from
+                # mean(patch) only.
+                _, pt = feature_extractor.forward_cls_and_tokens(images)
                 if pt.dim() != 3:
-                    raise RuntimeError(f"Unexpected patch tokens shape in extract_features_for_images: {tuple(pt.shape)}")
-                tokens = torch.cat([cls.unsqueeze(1), pt], dim=1)  # (B, 1+N, C)
-                tokens = global_token_norm(tokens)
-                tokens = F.normalize(tokens, p=2, dim=-1)
-                cls_n = tokens[:, 0, :]
-                pt_n = tokens[:, 1:, :]
-                patch_mean = pt_n.mean(dim=1)
-                feats = torch.cat([cls_n, patch_mean], dim=-1)  # (B, 2C)
+                    raise RuntimeError(
+                        f"Unexpected patch tokens shape in extract_features_for_images: {tuple(pt.shape)}"
+                    )
+                # pt: (B, N, C)
+                tokens = global_token_norm(pt)
+                if use_token_l2norm:
+                    tokens = F.normalize(tokens, p=2, dim=-1)
+                patch_mean = tokens.mean(dim=1)  # (B, C)
+                feats = patch_mean
             feats_cpu.append(feats.detach().cpu().float())
             rels.extend(list(rel_paths))
     features = torch.cat(feats_cpu, dim=0) if feats_cpu else torch.empty((0, 0), dtype=torch.float32)
@@ -660,10 +677,11 @@ def predict_main_and_ratio_patch_mode(
     use_separate_bottlenecks: bool,
     layer_indices: Optional[List[int]] = None,
     token_norm_state: Optional[dict] = None,
+    use_token_l2norm: bool = True,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Patch-mode inference for a single head:
-      - For each image, obtain CLS and patch tokens from the DINO backbone.
+      - For each image, obtain patch tokens from the DINO backbone.
       - For each patch, apply the packed head on the patch token only (embedding_dim channels)
         and average per-patch main outputs to obtain image-level main predictions.
       - For ratio outputs (if present), apply the same head on the mean patch token.
@@ -689,7 +707,7 @@ def predict_main_and_ratio_patch_mode(
     head = head.eval().to(device)
 
     # Reconstruct optional token-level LayerNorms (per-layer and/or global) from
-    # the exported head state. These are used to normalize DINO CLS/patch tokens
+    # the exported head state. These are used to normalize DINO patch tokens
     # before feeding them into the exported head, matching training-time behavior.
     layer_token_norms = {}
     global_token_norm = None
@@ -743,29 +761,28 @@ def predict_main_and_ratio_patch_mode(
             images = images.to(device, non_blocking=True)
 
             # Multi-layer path: use DINO get_intermediate_layers to obtain per-layer
-            # CLS and patch tokens. For legacy packed heads, we apply the shared head
+            # patch tokens. For legacy packed heads, we apply the shared head
             # on each layer-specific patch feature and slice that layer's segment from
             # the final linear. For MultiLayerHeadExport (separate bottlenecks), we call
             # its explicit per-layer forward.
             if use_layerwise_heads and num_layers > 1 and layer_indices is not None and len(layer_indices) > 0:
-                cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
-                if len(cls_list) != len(pt_list) or len(cls_list) != num_layers:
-                    raise RuntimeError("Mismatch between CLS/patch token lists and num_layers in patch-mode multi-layer inference")
+                _, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
+                if len(pt_list) != num_layers:
+                    raise RuntimeError("Mismatch between patch token lists and num_layers in patch-mode multi-layer inference")
 
                 main_layers_batch: List[torch.Tensor] = []
                 ratio_layers_batch: List[torch.Tensor] = []
 
-                for l_idx, (cls_l, pt_l) in enumerate(zip(cls_list, pt_list)):
+                for l_idx, pt_l in enumerate(pt_list):
                     if pt_l.dim() != 3:
                         raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt_l.shape)}")
                     B, N, C = pt_l.shape
-                    # Optional per-layer token-level LN + L2 normalization on CLS+patch tokens
+                # Optional per-layer token-level LayerNorm and/or L2 normalization
+                # on patch tokens to mirror training-time behavior.
                     if layer_token_norms and l_idx in layer_token_norms:
-                        tokens = torch.cat([cls_l.unsqueeze(1), pt_l], dim=1)  # (B, 1+N, C)
-                        tokens = layer_token_norms[l_idx](tokens)
-                        tokens = F.normalize(tokens, p=2, dim=-1)
-                        cls_l = tokens[:, 0, :]
-                        pt_l = tokens[:, 1:, :]
+                        pt_l = layer_token_norms[l_idx](pt_l)
+                if use_token_l2norm:
+                    pt_l = F.normalize(pt_l, p=2, dim=-1)
                     patch_mean_l = pt_l.mean(dim=1)  # (B, C)
 
                     if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
@@ -847,18 +864,17 @@ def predict_main_and_ratio_patch_mode(
                     out_ratio = None
 
             else:
-                # Legacy single-layer path: use last-layer CLS and patch tokens only.
-                cls, pt = feature_extractor.forward_cls_and_tokens(images)
+                # Legacy single-layer path: use last-layer patch tokens only.
+                _, pt = feature_extractor.forward_cls_and_tokens(images)
                 if pt.dim() != 3:
                     raise RuntimeError(f"Unexpected patch tokens shape in patch-mode inference: {tuple(pt.shape)}")
                 B, N, C = pt.shape
-                # Optional global token-level LN + L2 normalization
+                # Optional global token-level LayerNorm and/or L2 normalization
+                # on patch tokens to mirror training-time behavior.
                 if global_token_norm is not None:
-                    tokens = torch.cat([cls.unsqueeze(1), pt], dim=1)  # (B, 1+N, C)
-                    tokens = global_token_norm(tokens)
-                    tokens = F.normalize(tokens, p=2, dim=-1)
-                    cls = tokens[:, 0, :]
-                    pt = tokens[:, 1:, :]
+                    pt = global_token_norm(pt)
+                if use_token_l2norm:
+                    pt = F.normalize(pt, p=2, dim=-1)
 
                 if head_num_main > 0:
                     # Patch-based main path.
@@ -920,13 +936,14 @@ def predict_main_and_ratio_global_multilayer(
     *,
     use_separate_bottlenecks: bool = False,
     token_norm_state: Optional[dict] = None,
+    use_token_l2norm: bool = True,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
-    Global (CLS+mean(patch)) multi-layer inference for a single head:
-      - For each image, obtain per-layer CLS and patch tokens from the DINO backbone
+    Global patch-based multi-layer inference for a single head (no CLS token):
+      - For each image, obtain per-layer patch tokens from the DINO backbone
         using get_intermediate_layers.
-      - For each layer, build CLS+mean(patch) features, apply the packed head,
-        slice that layer's segment, and then average predictions over layers.
+      - For each layer, build global features from mean(patch), apply the packed
+        head, slice that layer's segment, and then average predictions over layers.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
@@ -985,32 +1002,30 @@ def predict_main_and_ratio_global_multilayer(
     with torch.inference_mode():
         for images, rel_paths in dl:
             images = images.to(device, non_blocking=True)
-            cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
-            if len(cls_list) != len(pt_list) or len(cls_list) != num_layers:
-                raise RuntimeError("Mismatch between CLS/patch token lists and num_layers in global multi-layer inference")
+            _, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
+            if len(pt_list) != num_layers:
+                raise RuntimeError("Mismatch between patch token lists and num_layers in global multi-layer inference")
 
             main_layers_batch: List[torch.Tensor] = []
             ratio_layers_batch: List[torch.Tensor] = []
 
-            for l_idx, (cls_l, pt_l) in enumerate(zip(cls_list, pt_list)):
+            for l_idx, pt_l in enumerate(pt_list):
                 if pt_l.dim() != 3:
                     raise RuntimeError(f"Unexpected patch tokens shape in global multi-layer inference: {tuple(pt_l.shape)}")
                 B, N, C = pt_l.shape
-                # Optional per-layer token-level LN + L2 normalization on CLS+patch tokens
+                # Optional per-layer token-level LayerNorm and/or L2 normalization
+                # on patch tokens to mirror training-time behavior.
                 if layer_token_norms and l_idx in layer_token_norms:
-                    tokens = torch.cat([cls_l.unsqueeze(1), pt_l], dim=1)  # (B, 1+N, C)
-                    tokens = layer_token_norms[l_idx](tokens)
-                    tokens = F.normalize(tokens, p=2, dim=-1)
-                    cls_l = tokens[:, 0, :]
-                    pt_l = tokens[:, 1:, :]
+                    pt_l = layer_token_norms[l_idx](pt_l)
+                if use_token_l2norm:
+                    pt_l = F.normalize(pt_l, p=2, dim=-1)
                 patch_mean_l = pt_l.mean(dim=1)  # (B, C)
                 if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
                     # Explicit per-layer bottlenecks: call dedicated global-layer path.
-                    layer_main, layer_ratio = head.forward_global_layer(cls_l, patch_mean_l, l_idx)
+                    layer_main, layer_ratio = head.forward_global_layer(patch_mean_l, l_idx)
                 else:
-                    feats_l = torch.cat([cls_l, patch_mean_l], dim=-1)  # (B, 2C)
-
-                    out_all = head(feats_l)  # (B, head_total * num_layers)
+                    # Packed head expects global patch-based features with dimensionality C.
+                    out_all = head(patch_mean_l)  # (B, head_total * num_layers)
                     expected_dim = head_total * num_layers
                     if out_all.shape[1] != expected_dim:
                         raise RuntimeError(
@@ -1187,6 +1202,10 @@ def main():
     use_layerwise_heads_default = bool(first_meta.get("use_layerwise_heads", False))
     backbone_layer_indices_default = list(first_meta.get("backbone_layer_indices", []))
     use_separate_bottlenecks_default = bool(first_meta.get("use_separate_bottlenecks", False))
+    # Token-level normalization defaults (custom LN + L2 on DINO tokens).
+    use_token_norms_default = bool(first_meta.get("use_token_norms", False))
+    use_token_layernorm_default = bool(first_meta.get("use_token_layernorm", use_token_norms_default))
+    use_token_l2norm_default = bool(first_meta.get("use_token_l2norm", use_token_norms_default))
 
     # Build weighted/mean ensemble by running per-head feature extraction (supports per-head LoRA).
     # Only require that all heads share the same embedding_dim (backbone choice); ratio/patch
@@ -1238,6 +1257,15 @@ def main():
                 f"Head {head_pt} embedding_dim({head_embedding_dim}) != cfg.model.embedding_dim({cfg_embedding_dim}); "
                 "mixing heads trained on different backbones is unsupported in a single run."
             )
+
+        # Resolve per-head token normalization flags. For older heads that do not
+        # store explicit flags, fall back to `use_token_norms` when available.
+        use_token_layernorm_head = bool(
+            meta.get("use_token_layernorm", use_token_layernorm_default)
+        )
+        use_token_l2norm_head = bool(
+            meta.get("use_token_l2norm", use_token_l2norm_default)
+        )
 
         # Build a fresh backbone per head, load base DINO weights
         backbone = _make_backbone(pretrained=False)
@@ -1357,6 +1385,7 @@ def main():
                 use_separate_bottlenecks=use_separate_bottlenecks_head,
                 layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
                 token_norm_state=token_norm_state if token_norm_state else None,
+                use_token_l2norm=use_token_l2norm_head,
             )
         else:
             if use_layerwise_heads_head and len(backbone_layer_indices_head) > 0:
@@ -1377,6 +1406,7 @@ def main():
                     layer_indices=backbone_layer_indices_head,
                     use_separate_bottlenecks=use_separate_bottlenecks_head,
                     token_norm_state=token_norm_state if token_norm_state else None,
+                    use_token_l2norm=use_token_l2norm_head,
                 )
             else:
                 # Legacy single-layer path: extract CLS+mean(patch) only from last layer.
@@ -1391,6 +1421,7 @@ def main():
                     batch_size=batch_size,
                     num_workers=num_workers,
                     token_norm_state=token_norm_state if token_norm_state else None,
+                    use_token_l2norm=use_token_l2norm_head,
                 )
                 preds_main, preds_ratio = predict_from_features(
                     features_cpu=features_cpu,

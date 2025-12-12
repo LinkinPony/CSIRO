@@ -367,6 +367,19 @@ class HeadCheckpoint(Callback):
                     hasattr(pl_module, "global_token_norm")
                     and getattr(pl_module, "global_token_norm") is not None
                 ),
+                # Explicit flags recording whether custom token-level LayerNorm
+                # and L2 normalization were enabled during training. These allow
+                # the inference script to mirror training-time behavior.
+                "use_token_layernorm": bool(
+                    getattr(pl_module.hparams, "use_token_layernorm", True)
+                )
+                if hasattr(pl_module, "hparams")
+                else True,
+                "use_token_l2norm": bool(
+                    getattr(pl_module.hparams, "use_token_l2norm", True)
+                )
+                if hasattr(pl_module, "hparams")
+                else True,
             },
         }
         # Optionally bundle LoRA adapter payload alongside the head (to preserve the two-inputs rule at inference)

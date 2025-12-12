@@ -209,6 +209,7 @@ __marimo__/
 
 /data/
 /outputs/
+/outputs_backup/
 /weights/
 submission.csv
 /dinov3_weights/
