@@ -1,7 +1,7 @@
 # ===== Required user variables =====
 # Backward-compat: WEIGHTS_PT_PATH is ignored when HEAD_WEIGHTS_PT_PATH is provided.
 HEAD_WEIGHTS_PT_PATH = "weights/head/"  # regression head-only weights (.pt)
-DINO_WEIGHTS_PT_PATH = "dinov3_weights/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pt"  # frozen DINOv3 weights (.pt)
+DINO_WEIGHTS_PT_PATH = "dinov3_weights/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pt"  # frozen DINOv3 weights (.pt)
 INPUT_PATH = "data"  # dir containing test.csv & images, or a direct test.csv path
 OUTPUT_SUBMISSION_PATH = "submission.csv"
 DINOV3_PATH = "third_party/dinov3/dinov3"  # path to dinov3 source folder (contains dinov3/*)
@@ -10,6 +10,21 @@ PEFT_PATH = "third_party/peft/src"  # path to peft source folder (contains peft/
 # New: specify the project directory that contains both `configs/` and `src/` folders.
 # Example: PROJECT_DIR = "/media/dl/dataset/Git/CSIRO"
 PROJECT_DIR = "."
+
+# ===== Multi-GPU model-parallel inference (Scheme B) =====
+# When running the VERY large dinov3_vit7b16 backbone on 2x16GB GPUs (e.g., Kaggle T4),
+# we split the transformer blocks across cuda:0 and cuda:1 and move the token activations
+# across devices once at the split boundary.
+#
+# Notes:
+# - This is NOT data-parallel; it aims to *split model weights* across GPUs to fit in memory.
+# - Only enabled when >= 2 CUDA devices are available and the backbone is dinov3_vit7b16.
+USE_2GPU_MODEL_PARALLEL_FOR_VIT7B = True
+# Number of transformer blocks to place on cuda:0 (the remaining go to cuda:1).
+# For ViT7B (40 blocks), a 20/20 split is a reasonable default.
+VIT7B_MP_SPLIT_IDX = 20
+# Use fp16 weights for the backbone/head in model-parallel mode to fit on 2x16GB GPUs.
+VIT7B_MP_DTYPE = "fp32"  # one of: "fp16", "fp32"
 # ===================================
 # ==========================================================
 # INFERENCE SCRIPT (UPDATED REQUIREMENTS)
@@ -25,6 +40,7 @@ PROJECT_DIR = "."
 
 import os
 import sys
+import types
 from typing import Dict, List, Tuple, Optional
 
 import torch
@@ -91,6 +107,41 @@ if add_safe_globals is not None and PeftType is not None:  # type: ignore
     except Exception:
         pass
 
+def _torch_load_cpu(
+    path: str,
+    *,
+    mmap: Optional[bool] = None,
+    weights_only: Optional[bool] = True,
+) -> object:
+    """
+    Kaggle-friendly torch.load wrapper:
+    - Prefer weights_only=True to avoid pickle/object loading and silence warnings.
+    - Prefer mmap=True (if supported) to avoid reading huge checkpoints fully into RAM.
+    Falls back gracefully on older torch or if flags are unsupported.
+    """
+    # Always load onto CPU; we copy into GPU params via load_state_dict.
+    kwargs = {"map_location": "cpu"}
+    if weights_only is not None:
+        kwargs["weights_only"] = weights_only
+    if mmap is not None:
+        kwargs["mmap"] = mmap
+    try:
+        return torch.load(path, **kwargs)
+    except TypeError:
+        # Older torch without weights_only/mmap
+        return torch.load(path, map_location="cpu")
+    except Exception:
+        # If weights_only=True fails due to safe-unpickling constraints, fall back.
+        if weights_only is True:
+            try:
+                kwargs2 = {"map_location": "cpu"}
+                if mmap is not None:
+                    kwargs2["mmap"] = mmap
+                return torch.load(path, **kwargs2)  # weights_only omitted (defaults to legacy)
+            except Exception:
+                return torch.load(path, map_location="cpu")
+        raise
+
 def load_model_or_state(pt_path: str) -> Tuple[Optional[nn.Module], Optional[dict], dict]:
     if not os.path.isfile(pt_path):
         raise FileNotFoundError(f"Weights not found: {pt_path}")
@@ -101,7 +152,7 @@ def load_model_or_state(pt_path: str) -> Tuple[Optional[nn.Module], Optional[dic
     except Exception:
         pass
     # 2) Fallback to torch.load objects (may be state_dict or checkpoint dict)
-    obj = torch.load(pt_path, map_location="cpu")
+    obj = _torch_load_cpu(pt_path, mmap=None, weights_only=True)
     if isinstance(obj, dict) and "state_dict" in obj:
         return None, obj["state_dict"], obj.get("meta", {})
     if isinstance(obj, dict):
@@ -158,12 +209,368 @@ def load_state_and_meta(pt_path: str):
 def load_head_state(pt_path: str) -> Tuple[dict, dict, Optional[dict]]:
     if not os.path.isfile(pt_path):
         raise FileNotFoundError(f"Head weights not found: {pt_path}")
-    obj = torch.load(pt_path, map_location="cpu")
+    obj = _torch_load_cpu(pt_path, mmap=None, weights_only=True)
     if isinstance(obj, dict) and "state_dict" in obj:
         return obj["state_dict"], obj.get("meta", {}), obj.get("peft", None)
     if isinstance(obj, dict):
         return obj, {}, obj.get("peft", None)
     raise RuntimeError("Unsupported head weights file format. Expect a dict with 'state_dict'.")
+
+
+# ==========================================================
+# 2-GPU model-parallel helpers for dinov3_vit7b16 (Scheme B)
+# ==========================================================
+def _mp_get_devices() -> Optional[Tuple[torch.device, torch.device]]:
+    try:
+        if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+            return torch.device("cuda:0"), torch.device("cuda:1")
+    except Exception:
+        pass
+    return None
+
+
+def _mp_resolve_dtype(dtype_str: str) -> torch.dtype:
+    s = str(dtype_str or "").strip().lower()
+    if s in ("fp16", "float16", "half"):
+        return torch.float16
+    if s in ("fp32", "float32"):
+        return torch.float32
+    # Default: fp16 for memory
+    return torch.float16
+
+
+def _mp_get_attr_chain(obj, names: List[str]):
+    cur = obj
+    for n in names:
+        if cur is None:
+            return None
+        cur = getattr(cur, n, None)
+    return cur
+
+
+def _mp_get_backbone_for_attrs(backbone: nn.Module) -> nn.Module:
+    """
+    Best-effort resolve the underlying dinov3 backbone when wrapped (e.g., PEFT).
+    For PEFT, common patterns:
+      - peft_model.get_base_model()
+      - peft_model.base_model.model
+    We only need access to .blocks / .patch_embed / .norm / .rope_embed / tokens.
+    """
+    # 1) Direct attributes
+    if hasattr(backbone, "blocks"):
+        return backbone
+    # 2) PEFT-style: .base_model.model
+    base_model = getattr(backbone, "base_model", None)
+    if base_model is not None:
+        cand = getattr(base_model, "model", None)
+        if isinstance(cand, nn.Module) and hasattr(cand, "blocks"):
+            return cand
+        if isinstance(base_model, nn.Module) and hasattr(base_model, "blocks"):
+            return base_model
+    # 3) Some wrappers use .model
+    cand2 = getattr(backbone, "model", None)
+    if isinstance(cand2, nn.Module) and hasattr(cand2, "blocks"):
+        return cand2
+    return backbone
+
+
+def _mp_attach_flags(backbone: nn.Module, device0: torch.device, device1: torch.device, split_idx: int) -> None:
+    try:
+        backbone._mp_devices = (device0, device1)  # type: ignore[attr-defined]
+        backbone._mp_split_idx = int(split_idx)  # type: ignore[attr-defined]
+        backbone._mp_enabled = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _mp_get_devices_from_backbone(backbone: nn.Module) -> Optional[Tuple[torch.device, torch.device]]:
+    # Check common locations (feature_extractor wrapper, PEFT wrapper, underlying model).
+    for cand in (
+        backbone,
+        getattr(backbone, "backbone", None),  # e.g., DinoV3FeatureExtractor
+        getattr(backbone, "base_model", None),  # e.g., PEFT wrapper
+        _mp_get_attr_chain(backbone, ["base_model", "model"]),
+        getattr(backbone, "model", None),
+    ):
+        if cand is None:
+            continue
+        try:
+            mp = getattr(cand, "_mp_devices", None)
+            if isinstance(mp, (tuple, list)) and len(mp) == 2:
+                d0 = torch.device(mp[0])
+                d1 = torch.device(mp[1])
+                return d0, d1
+        except Exception:
+            continue
+    return None
+
+
+def _mp_materialize_param(module: nn.Module, name: str, device: torch.device) -> None:
+    """
+    Materialize a top-level nn.Parameter living on 'meta' onto a real device.
+    """
+    p = getattr(module, name, None)
+    if not isinstance(p, nn.Parameter):
+        return
+    if getattr(p, "device", None) is None:
+        return
+    if p.device.type != "meta":
+        return
+    new = torch.empty(p.shape, device=device, dtype=p.dtype)
+    setattr(module, name, nn.Parameter(new, requires_grad=p.requires_grad))
+
+
+def _mp_materialize_buffer(module: nn.Module, name: str, device: torch.device) -> None:
+    """
+    Materialize a registered buffer living on 'meta' onto a real device.
+    """
+    buf = module._buffers.get(name, None)  # type: ignore[attr-defined]
+    if buf is None or not isinstance(buf, torch.Tensor):
+        return
+    if buf.device.type != "meta":
+        return
+    module._buffers[name] = torch.empty(buf.shape, device=device, dtype=buf.dtype)  # type: ignore[attr-defined]
+
+
+def _mp_prepare_vit7b_backbone_two_gpu(
+    backbone: nn.Module,
+    *,
+    split_idx: int,
+    dtype: torch.dtype,
+    device0: torch.device,
+    device1: torch.device,
+) -> nn.Module:
+    """
+    Take a DinoVisionTransformer instantiated on device='meta' and materialize its
+    submodules across cuda:0 and cuda:1 (Scheme B).
+    """
+    # Underlying backbone (in case caller passes a wrapper, but here we usually pass the raw backbone)
+    m = _mp_get_backbone_for_attrs(backbone)
+
+    # 1) Set dtype on meta tensors before materialization (no real memory yet).
+    try:
+        m = m.to(dtype=dtype)
+    except Exception:
+        pass
+    # Keep RoPE periods in fp32 when present (matches official dinov3 defaults; tiny memory).
+    try:
+        rope = getattr(m, "rope_embed", None)
+        if rope is not None and hasattr(rope, "_buffers") and "periods" in rope._buffers:
+            rope._buffers["periods"] = rope._buffers["periods"].to(dtype=torch.float32)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # 2) Materialize "token" parameters on device0
+    for pname in ("cls_token", "mask_token", "storage_tokens"):
+        try:
+            _mp_materialize_param(m, pname, device0)
+        except Exception:
+            pass
+
+    # 3) Materialize patch_embed + rope_embed on device0
+    try:
+        if hasattr(m, "patch_embed") and isinstance(m.patch_embed, nn.Module):
+            m.patch_embed.to_empty(device=device0)
+    except Exception:
+        pass
+    try:
+        rope = getattr(m, "rope_embed", None)
+        if isinstance(rope, nn.Module):
+            # rope_embed has buffers, not params
+            try:
+                rope.to_empty(device=device0)  # type: ignore[attr-defined]
+            except Exception:
+                # fallback: materialize buffer(s) manually
+                _mp_materialize_buffer(rope, "periods", device0)
+    except Exception:
+        pass
+
+    # 4) Materialize transformer blocks split across devices
+    if not hasattr(m, "blocks") or not isinstance(m.blocks, nn.ModuleList):
+        raise RuntimeError("Backbone does not expose a ModuleList named 'blocks'; cannot model-parallelize.")
+    n_blocks = len(m.blocks)
+    split_idx = int(max(0, min(split_idx, n_blocks)))
+    for i, blk in enumerate(m.blocks):
+        target = device0 if i < split_idx else device1
+        try:
+            blk.to_empty(device=target)
+        except Exception:
+            # As a fallback, try moving (may allocate), but keep going
+            blk.to(device=target)
+
+    # 5) Materialize norms on device1 (final stage)
+    for norm_name in ("norm", "cls_norm", "local_cls_norm"):
+        try:
+            sub = getattr(m, norm_name, None)
+            if isinstance(sub, nn.Module):
+                sub.to_empty(device=device1)
+        except Exception:
+            pass
+
+    # 6) Attach flags for downstream code
+    _mp_attach_flags(m, device0, device1, split_idx)
+    return backbone
+
+
+def _mp_patch_dinov3_methods(backbone: nn.Module, *, split_idx: int, device0: torch.device, device1: torch.device) -> None:
+    """
+    Monkeypatch forward_features + get_intermediate_layers on the underlying dinov3 backbone
+    so it can run with blocks split across cuda:0/1.
+    """
+    m = _mp_get_backbone_for_attrs(backbone)
+
+    def _forward_features_mp(self, x, masks: Optional[torch.Tensor] = None):  # noqa: ANN001
+        # Only the Tensor path is needed for this repo's inference.
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("Model-parallel forward_features only supports Tensor inputs")
+
+        sp = int(max(0, min(int(split_idx), len(self.blocks))))
+        # Ensure inputs land on stage0 device
+        if x.device != device0:
+            x = x.to(device0, non_blocking=True)
+
+        # Prepare tokens on stage0
+        tokens, (H, W) = self.prepare_tokens_with_masks(x, masks)
+
+        # Pre-compute RoPE for both stages (same values; different device)
+        rope0 = None
+        rope1 = None
+        if getattr(self, "rope_embed", None) is not None:
+            rope0 = self.rope_embed(H=H, W=W)
+            # Copy sin/cos to stage1 once (cheap)
+            try:
+                sin0, cos0 = rope0
+                rope1 = (sin0.to(device1, non_blocking=True), cos0.to(device1, non_blocking=True))
+            except Exception:
+                rope1 = None
+
+        out = tokens
+        # Run blocks with a single activation transfer at the boundary
+        for i, blk in enumerate(self.blocks):
+            if i == sp:
+                out = out.to(device1, non_blocking=True)
+            rope = rope0 if i < sp else rope1
+            out = blk(out, rope)
+
+        # Ensure the post-block activations are on stage1 for final norm + downstream heads
+        if out.device != device1:
+            out = out.to(device1, non_blocking=True)
+
+        # Final norm(s) (on stage1)
+        if getattr(self, "untie_cls_and_patch_norms", False):
+            x_norm_cls_reg = self.cls_norm(out[:, : self.n_storage_tokens + 1])
+            x_norm_patch = self.norm(out[:, self.n_storage_tokens + 1 :])
+        else:
+            x_norm = self.norm(out)
+            x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
+            x_norm_patch = x_norm[:, self.n_storage_tokens + 1 :]
+
+        return {
+            "x_norm_clstoken": x_norm_cls_reg[:, 0],
+            "x_storage_tokens": x_norm_cls_reg[:, 1:],
+            "x_norm_patchtokens": x_norm_patch,
+            "x_prenorm": out,
+            "masks": masks,
+        }
+
+    def _get_intermediate_layers_mp(
+        self,
+        x: torch.Tensor,
+        *,
+        n=1,
+        reshape: bool = False,
+        return_class_token: bool = False,
+        return_extra_tokens: bool = False,
+        norm: bool = True,
+    ):
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("Model-parallel get_intermediate_layers expects a Tensor input")
+
+        sp = int(max(0, min(int(split_idx), len(self.blocks))))
+        # Prepare tokens on stage0
+        if x.device != device0:
+            x = x.to(device0, non_blocking=True)
+        tokens, (H, W) = self.prepare_tokens_with_masks(x)
+
+        total_block_len = len(self.blocks)
+        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        blocks_to_take = set(int(i) for i in blocks_to_take)
+
+        # Pre-compute RoPE for both stages
+        rope0 = None
+        rope1 = None
+        if getattr(self, "rope_embed", None) is not None:
+            rope0 = self.rope_embed(H=H, W=W)
+            try:
+                sin0, cos0 = rope0
+                rope1 = (sin0.to(device1, non_blocking=True), cos0.to(device1, non_blocking=True))
+            except Exception:
+                rope1 = None
+
+        outs_full: List[torch.Tensor] = []
+        out = tokens
+        for i, blk in enumerate(self.blocks):
+            if i == sp:
+                out = out.to(device1, non_blocking=True)
+            rope = rope0 if i < sp else rope1
+            out = blk(out, rope)
+            if i in blocks_to_take:
+                # Ensure captured outputs live on stage1 for downstream heads
+                if out.device != device1:
+                    outs_full.append(out.to(device1, non_blocking=True))
+                else:
+                    outs_full.append(out)
+
+        if len(outs_full) != len(blocks_to_take):
+            raise RuntimeError(f"only {len(outs_full)} / {len(blocks_to_take)} blocks found")
+
+        outputs = outs_full
+        if norm:
+            outputs_normed: List[torch.Tensor] = []
+            for out_i in outputs:
+                if getattr(self, "untie_cls_and_patch_norms", False):
+                    x_norm_cls_reg = self.cls_norm(out_i[:, : self.n_storage_tokens + 1])
+                    x_norm_patch = self.norm(out_i[:, self.n_storage_tokens + 1 :])
+                    outputs_normed.append(torch.cat((x_norm_cls_reg, x_norm_patch), dim=1))
+                else:
+                    outputs_normed.append(self.norm(out_i))
+            outputs = outputs_normed
+
+        class_tokens = [out_i[:, 0] for out_i in outputs]
+        extra_tokens = [out_i[:, 1 : self.n_storage_tokens + 1] for out_i in outputs]
+        patch_tokens = [out_i[:, self.n_storage_tokens + 1 :] for out_i in outputs]
+
+        if reshape:
+            B, _, h, w = x.shape
+            patch_tokens = [
+                out.reshape(B, h // self.patch_size, w // self.patch_size, -1).permute(0, 3, 1, 2).contiguous()
+                for out in patch_tokens
+            ]
+
+        if not return_class_token and not return_extra_tokens:
+            return tuple(patch_tokens)
+        if return_class_token and not return_extra_tokens:
+            return tuple(zip(patch_tokens, class_tokens))
+        if (not return_class_token) and return_extra_tokens:
+            return tuple(zip(patch_tokens, extra_tokens))
+        return tuple(zip(patch_tokens, class_tokens, extra_tokens))
+
+    # Bind methods to the underlying module instance
+    m.forward_features = types.MethodType(_forward_features_mp, m)  # type: ignore[method-assign]
+    m.get_intermediate_layers = types.MethodType(_get_intermediate_layers_mp, m)  # type: ignore[method-assign]
+    _mp_attach_flags(m, device0, device1, split_idx)
+
+
+def _module_param_dtype(m: nn.Module, *, default: torch.dtype = torch.float32) -> torch.dtype:
+    """
+    Best-effort infer module parameter dtype (for casting inputs to match weights).
+    """
+    try:
+        return next(m.parameters()).dtype
+    except Exception:
+        return default
+
+
 
 
 class DinoV3FeatureExtractor(nn.Module):
@@ -522,12 +929,17 @@ def extract_features_for_images(
     *,
     use_cls_token: bool = True,
 ) -> Tuple[List[str], torch.Tensor]:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mp_devs = _mp_get_devices_from_backbone(feature_extractor) if isinstance(feature_extractor, nn.Module) else None
+    device = mp_devs[0] if mp_devs is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
 
-    feature_extractor.eval().to(device)
+    # In model-parallel mode we MUST NOT move the full module to a single device.
+    if mp_devs is not None:
+        feature_extractor.eval()
+    else:
+        feature_extractor.eval().to(device)
 
     rels: List[str] = []
     feats_cpu: List[torch.Tensor] = []
@@ -557,13 +969,16 @@ def predict_from_features(
     use_layerwise_heads: bool,
     num_layers: int,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # For model-parallel backbone inference, prefer placing the head on stage1.
+    mp_devs = _mp_get_devices_from_backbone(head) if isinstance(head, nn.Module) else None
+    device = mp_devs[1] if mp_devs is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     head = head.eval().to(device)
     N = features_cpu.shape[0]
     preds_list: List[torch.Tensor] = []
+    head_dtype = _module_param_dtype(head, default=torch.float32)
     with torch.inference_mode():
         for i in range(0, N, max(1, batch_size)):
-            chunk = features_cpu[i : i + max(1, batch_size)].to(device, non_blocking=True)
+            chunk = features_cpu[i : i + max(1, batch_size)].to(device, non_blocking=True, dtype=head_dtype)
             out = head(chunk)
             preds_list.append(out.detach().cpu().float())
     if not preds_list:
@@ -641,7 +1056,9 @@ def predict_main_and_ratio_patch_mode(
         preds_main:    Tensor of shape (N_images, head_num_main)
         preds_ratio:   Tensor of shape (N_images, head_num_ratio) or None when head_num_ratio == 0
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mp_devs = _mp_get_devices_from_backbone(backbone) if isinstance(backbone, nn.Module) else None
+    device0 = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device1 = mp_devs[1] if mp_devs is not None else device0
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(
@@ -653,8 +1070,11 @@ def predict_main_and_ratio_patch_mode(
     )
 
     feature_extractor = DinoV3FeatureExtractor(backbone)
-    feature_extractor.eval().to(device)
-    head = head.eval().to(device)
+    # Do NOT move feature_extractor in model-parallel mode.
+    feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
+    # Place head on stage1 to avoid copying patch tokens back to cuda:0.
+    head = head.eval().to(device1)
+    head_dtype = _module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
     preds_main_list: List[torch.Tensor] = []
@@ -662,7 +1082,7 @@ def predict_main_and_ratio_patch_mode(
 
     with torch.inference_mode():
         for images, rel_paths in dl:
-            images = images.to(device, non_blocking=True)
+            images = images.to(device0, non_blocking=True)
 
             # Multi-layer path: use DINO get_intermediate_layers to obtain per-layer
             # CLS and patch tokens. For legacy packed heads, we apply the shared head
@@ -683,10 +1103,12 @@ def predict_main_and_ratio_patch_mode(
                     B, N, C = pt_l.shape
                     if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
                         # New path: explicit per-layer bottlenecks encoded in head.
+                        pt_l = pt_l.to(device1, non_blocking=True, dtype=head_dtype)
                         layer_main, layer_ratio = head.forward_patch_layer(pt_l, l_idx)
                     else:
                         if head_num_main > 0:
-                            patch_features_flat = pt_l.reshape(B * N, C)  # (B*N, C)
+                            # Ensure features live on head device
+                            patch_features_flat = pt_l.reshape(B * N, C).to(device1, non_blocking=True, dtype=head_dtype)  # (B*N, C)
                             out_all_patch = head(patch_features_flat)  # (B*N, head_total * L)
                             expected_dim = head_total * num_layers
                             if out_all_patch.shape[1] != expected_dim:
@@ -703,7 +1125,7 @@ def predict_main_and_ratio_patch_mode(
                             layer_main = torch.empty((B, 0), dtype=torch.float32, device=device)
 
                         if head_num_ratio > 0:
-                            patch_mean_l = pt_l.mean(dim=1)  # (B, C)
+                            patch_mean_l = pt_l.mean(dim=1).to(device1, non_blocking=True, dtype=head_dtype)  # (B, C)
                             out_all_global = head(patch_mean_l)  # (B, head_total * L)
                             if out_all_global.shape[1] != expected_dim:
                                 raise RuntimeError(
@@ -740,7 +1162,7 @@ def predict_main_and_ratio_patch_mode(
                 B, N, C = pt.shape
 
                 if head_num_main > 0:
-                    patch_features_flat = pt.reshape(B * N, C)  # (B*N, C) patch-only information
+                    patch_features_flat = pt.reshape(B * N, C).to(device1, non_blocking=True, dtype=head_dtype)  # (B*N, C)
                     out_all_patch = head(patch_features_flat)  # (B*N, head_total)
                     out_main_patch = out_all_patch[:, :head_num_main]
                     out_main_patch = out_main_patch.view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
@@ -749,7 +1171,7 @@ def predict_main_and_ratio_patch_mode(
 
                 # --- Ratio logits (if any) from global patch-mean features ---
                 if head_num_ratio > 0:
-                    patch_mean = pt.mean(dim=1)  # (B, C)
+                    patch_mean = pt.mean(dim=1).to(device1, non_blocking=True, dtype=head_dtype)  # (B, C)
                     out_all_global = head(patch_mean)  # (B, head_total)
                     out_ratio = out_all_global[:, head_num_main : head_num_main + head_num_ratio]  # (B, head_num_ratio)
                 else:
@@ -801,7 +1223,9 @@ def predict_main_and_ratio_global_multilayer(
         apply the packed head,
         slice that layer's segment, and then average predictions over layers.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mp_devs = _mp_get_devices_from_backbone(backbone) if isinstance(backbone, nn.Module) else None
+    device0 = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device1 = mp_devs[1] if mp_devs is not None else device0
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(
@@ -813,8 +1237,9 @@ def predict_main_and_ratio_global_multilayer(
     )
 
     feature_extractor = DinoV3FeatureExtractor(backbone)
-    feature_extractor.eval().to(device)
-    head = head.eval().to(device)
+    feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
+    head = head.eval().to(device1)
+    head_dtype = _module_param_dtype(head, default=torch.float32)
 
     num_layers = len(layer_indices)
     if num_layers <= 0:
@@ -826,7 +1251,7 @@ def predict_main_and_ratio_global_multilayer(
 
     with torch.inference_mode():
         for images, rel_paths in dl:
-            images = images.to(device, non_blocking=True)
+            images = images.to(device0, non_blocking=True)
             cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
             if len(cls_list) != len(pt_list) or len(cls_list) != num_layers:
                 raise RuntimeError("Mismatch between CLS/patch token lists and num_layers in global multi-layer inference")
@@ -838,7 +1263,8 @@ def predict_main_and_ratio_global_multilayer(
                 if pt_l.dim() != 3:
                     raise RuntimeError(f"Unexpected patch tokens shape in global multi-layer inference: {tuple(pt_l.shape)}")
                 B, N, C = pt_l.shape
-                patch_mean_l = pt_l.mean(dim=1)  # (B, C)
+                cls_l = cls_l.to(device1, non_blocking=True, dtype=head_dtype)
+                patch_mean_l = pt_l.mean(dim=1).to(device1, non_blocking=True, dtype=head_dtype)  # (B, C)
                 if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
                     # Explicit per-layer bottlenecks: call dedicated global-layer path.
                     layer_main, layer_ratio = head.forward_global_layer(cls_l, patch_mean_l, l_idx)
@@ -848,6 +1274,7 @@ def predict_main_and_ratio_global_multilayer(
                         if use_cls_token
                         else patch_mean_l
                     )
+                    feats_l = feats_l.to(device1, non_blocking=True, dtype=head_dtype)
 
                     out_all = head(feats_l)  # (B, head_total * num_layers)
                     expected_dim = head_total * num_layers
@@ -916,13 +1343,14 @@ def predict_for_images(
     batch_size: int,
     num_workers: int,
 ) -> Dict[str, Tuple[float, float, float]]:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mp_devs = _mp_get_devices_from_backbone(model) if isinstance(model, nn.Module) else None
+    device = mp_devs[0] if mp_devs is not None else ("cuda" if torch.cuda.is_available() else "cpu")
 
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
 
-    model.eval().to(device)
+    model.eval() if mp_devs is not None else model.eval().to(device)
 
     preds: Dict[str, Tuple[float, float, float]] = {}
     with torch.inference_mode():
@@ -1043,7 +1471,9 @@ def main():
     num_heads_used: int = 0
 
     # Preload DINO backbone state (reused per-head)
-    dino_state = torch.load(DINO_WEIGHTS_PT_PATH, map_location="cpu")
+    # IMPORTANT for Kaggle (31GB RAM): ViT7B fp32 checkpoints are ~26GB on disk and can OOM if fully loaded into RAM.
+    # Use mmap=True (if supported) to memory-map the checkpoint and stream tensors into GPU params during load_state_dict.
+    dino_state = _torch_load_cpu(DINO_WEIGHTS_PT_PATH, mmap=True, weights_only=True)
     if isinstance(dino_state, dict) and "state_dict" in dino_state:
         dino_state = dino_state["state_dict"]
 
@@ -1071,12 +1501,39 @@ def main():
                 "mixing heads trained on different backbones is unsupported in a single run."
             )
 
-        # Build a fresh backbone per head, load base DINO weights
-        backbone = _make_backbone(pretrained=False)
-        try:
-            backbone.load_state_dict(dino_state, strict=True)
-        except Exception:
-            backbone.load_state_dict(dino_state, strict=False)
+        # Build a fresh backbone per head, load base DINO weights.
+        # For the VERY large vit7b16, use Scheme B (2-GPU model parallel) to fit on 2x16GB.
+        use_mp = (
+            bool(USE_2GPU_MODEL_PARALLEL_FOR_VIT7B)
+            and (backbone_name in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"))
+            and (_mp_get_devices() is not None)
+        )
+        if use_mp:
+            dev0, dev1 = _mp_get_devices()  # type: ignore[assignment]
+            split_idx = int(VIT7B_MP_SPLIT_IDX)
+            mp_dtype = _mp_resolve_dtype(VIT7B_MP_DTYPE)
+            # Instantiate on meta to avoid CPU RAM spikes
+            backbone = _make_backbone(pretrained=False, device="meta")
+            _mp_prepare_vit7b_backbone_two_gpu(
+                backbone,
+                split_idx=split_idx,
+                dtype=mp_dtype,
+                device0=dev0,
+                device1=dev1,
+            )
+            # Load weights into already-sharded modules
+            try:
+                backbone.load_state_dict(dino_state, strict=True)
+            except Exception:
+                backbone.load_state_dict(dino_state, strict=False)
+            # Patch methods to support cross-device execution
+            _mp_patch_dinov3_methods(backbone, split_idx=split_idx, device0=dev0, device1=dev1)
+        else:
+            backbone = _make_backbone(pretrained=False)
+            try:
+                backbone.load_state_dict(dino_state, strict=True)
+            except Exception:
+                backbone.load_state_dict(dino_state, strict=False)
 
         # Inject per-head LoRA adapters if bundle contains PEFT payload
         try:
@@ -1097,6 +1554,12 @@ def main():
                     backbone = get_peft_model(backbone, peft_config)
                     set_peft_model_state_dict(backbone, peft_state, adapter_name="default")
                     backbone.eval()
+                    # Preserve model-parallel metadata when wrapping
+                    if use_mp:
+                        try:
+                            _mp_attach_flags(backbone, dev0, dev1, split_idx)  # type: ignore[arg-type]
+                        except Exception:
+                            pass
         except Exception as _e:
             print(f"[WARN] PEFT injection skipped for {head_pt}: {_e}")
 
@@ -1162,6 +1625,16 @@ def main():
                 input_dim=head_embedding_dim if (use_patch_reg3_head or (not use_cls_token_head)) else None,
             )
         head_module.load_state_dict(state, strict=True)
+        # When using 2-GPU model-parallel ViT7B, default to fp16 head weights on stage1
+        # to match backbone output dtype and reduce memory/compute on Kaggle T4.
+        if use_mp:
+            try:
+                head_module = head_module.to(device=dev1, dtype=mp_dtype)  # type: ignore[arg-type]
+            except Exception:
+                try:
+                    head_module = head_module.to(device=dev1)  # type: ignore[arg-type]
+                except Exception:
+                    pass
 
         if use_patch_reg3_head:
             # Patch-based main regression: compute per-patch predictions and average.

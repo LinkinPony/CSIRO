@@ -282,12 +282,39 @@ def _find_swa_average_model_state(ckpt_obj: dict) -> dict | None:
     callbacks_state = ckpt_obj.get("callbacks", None)
     if not isinstance(callbacks_state, dict):
         return None
-    for cb_state in callbacks_state.values():
+    for cb_name, cb_state in callbacks_state.items():
         if not isinstance(cb_state, dict):
             continue
         avg_state = cb_state.get("average_model_state", None)
-        if isinstance(avg_state, dict) and avg_state:
-            return avg_state
+        if not (isinstance(avg_state, dict) and avg_state):
+            continue
+
+        # IMPORTANT:
+        # Lightning checkpoints can contain a non-empty `average_model_state`
+        # even before SWA has actually started averaging (e.g., when
+        # swa_epoch_start is late in training). In that case the callback state
+        # typically reports `n_averaged == 0` and `latest_update_epoch == -1`,
+        # and `average_model_state` is effectively an initial copy (often close
+        # to epoch-0 init). Exporting such a head would look like "SWA == epoch0".
+        n_averaged = cb_state.get("n_averaged", cb_state.get("num_averaged", None))
+        latest_update_epoch = cb_state.get("latest_update_epoch", None)
+        try:
+            n_avg_int = int(n_averaged) if n_averaged is not None else None
+        except Exception:
+            n_avg_int = None
+        try:
+            latest_update_int = int(latest_update_epoch) if latest_update_epoch is not None else None
+        except Exception:
+            latest_update_int = None
+
+        if (n_avg_int is not None and n_avg_int <= 0) or (latest_update_int is not None and latest_update_int < 0):
+            print(
+                f"[SWA] Found average_model_state in callback '{cb_name}', but SWA has not averaged any weights yet "
+                f"(n_averaged={n_averaged}, latest_update_epoch={latest_update_epoch}); skipping."
+            )
+            continue
+
+        return avg_state
     return None
 
 
@@ -316,7 +343,10 @@ def _export_swa_head_from_checkpoint(ckpt_path: Path, dst_dir: Path) -> tuple[Pa
     avg_state = _find_swa_average_model_state(ckpt_obj)
     if not isinstance(avg_state, dict) or not avg_state:
         # No SWA information in this checkpoint
-        print(f"[SWA] No average_model_state found in checkpoint callbacks (SWA may be disabled or not checkpointed).")
+        print(
+            "[SWA] No usable average_model_state found in checkpoint callbacks "
+            "(SWA may be disabled, not started yet, or not checkpointed)."
+        )
         return None
 
     # Instantiate model from checkpoint hyperparameters and then load SWA-averaged weights

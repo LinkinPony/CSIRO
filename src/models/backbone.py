@@ -33,6 +33,7 @@ def _resolve_dinov3_repo_or_dir() -> str:
 
 
 _DINOV3_REPO_OR_DIR = _resolve_dinov3_repo_or_dir()
+_DINOV3_HUB_SOURCE = "local" if Path(_DINOV3_REPO_OR_DIR).is_dir() else "github"
 
 
 class DinoV3FeatureExtractor(nn.Module):
@@ -272,6 +273,7 @@ def load_dinov3_vitl16(
         model = torch.hub.load(
             repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vitl16",
+            source=_DINOV3_HUB_SOURCE,
             pretrained=False,
         )
         state = torch.load(weights_path, map_location="cpu")
@@ -285,6 +287,7 @@ def load_dinov3_vitl16(
         model = torch.hub.load(
             repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vitl16",
+            source=_DINOV3_HUB_SOURCE,
             pretrained=pretrained,
             weights=weights_url,
             check_hash=check_hash,
@@ -294,6 +297,7 @@ def load_dinov3_vitl16(
     model = torch.hub.load(
         repo_or_dir=_DINOV3_REPO_OR_DIR,
         model="dinov3_vitl16",
+        source=_DINOV3_HUB_SOURCE,
         pretrained=pretrained,
     )
     return model
@@ -310,6 +314,7 @@ def load_dinov3_vith16plus(
         model = torch.hub.load(
             repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vith16plus",
+            source=_DINOV3_HUB_SOURCE,
             pretrained=False,
         )
         state = torch.load(weights_path, map_location="cpu")
@@ -322,6 +327,7 @@ def load_dinov3_vith16plus(
         model = torch.hub.load(
             repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vith16plus",
+            source=_DINOV3_HUB_SOURCE,
             pretrained=pretrained,
             weights=weights_url,
             check_hash=check_hash,
@@ -331,6 +337,7 @@ def load_dinov3_vith16plus(
     model = torch.hub.load(
         repo_or_dir=_DINOV3_REPO_OR_DIR,
         model="dinov3_vith16plus",
+        source=_DINOV3_HUB_SOURCE,
         pretrained=pretrained,
     )
     return model
@@ -353,6 +360,7 @@ def load_dinov3_vit7b16(
         model = torch.hub.load(
             repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vit7b16",
+            source=_DINOV3_HUB_SOURCE,
             pretrained=False,
         )
         state = torch.load(weights_path, map_location="cpu")
@@ -366,6 +374,7 @@ def load_dinov3_vit7b16(
         model = torch.hub.load(
             repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vit7b16",
+            source=_DINOV3_HUB_SOURCE,
             pretrained=pretrained,
             weights=weights_url,
             check_hash=check_hash,
@@ -375,6 +384,7 @@ def load_dinov3_vit7b16(
     model = torch.hub.load(
         repo_or_dir=_DINOV3_REPO_OR_DIR,
         model="dinov3_vit7b16",
+        source=_DINOV3_HUB_SOURCE,
         pretrained=pretrained,
     )
     return model
