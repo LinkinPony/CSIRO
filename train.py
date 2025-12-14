@@ -70,7 +70,12 @@ def main():
             repo_root = Path(__file__).parent
             dinov3_dir = repo_root / "dinov3_weights"
             dinov3_dir.mkdir(parents=True, exist_ok=True)
-            dinov3_dst = dinov3_dir / "dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pt"
+            # Copy using the *source* filename so different backbones (e.g. vit7b) do not
+            # overwrite each other. We normalize the extension to .pt for consistency.
+            src_name = Path(str(dinov3_src)).name
+            if src_name.endswith(".pth"):
+                src_name = src_name[:-4] + ".pt"
+            dinov3_dst = dinov3_dir / src_name
             if not dinov3_dst.is_file() or os.path.getsize(dinov3_dst) == 0:
                 shutil.copyfile(str(dinov3_src), str(dinov3_dst))
     except Exception as e:

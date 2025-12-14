@@ -214,6 +214,8 @@ def build_feature_extractor_offline(dinov3_source_dir: str, dino_weights_path: s
             from dinov3.hub.backbones import dinov3_vith16plus as _make_backbone  # type: ignore
         elif backbone_name == "dinov3_vitl16":
             from dinov3.hub.backbones import dinov3_vitl16 as _make_backbone  # type: ignore
+        elif backbone_name in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"):
+            from dinov3.hub.backbones import dinov3_vit7b16 as _make_backbone  # type: ignore
         else:
             raise ImportError(f"Unsupported backbone: {backbone_name}")
     except Exception as e:

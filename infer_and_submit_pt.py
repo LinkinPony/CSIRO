@@ -987,6 +987,8 @@ def main():
             from dinov3.hub.backbones import dinov3_vith16plus as _make_backbone  # type: ignore
         elif backbone_name == "dinov3_vitl16":
             from dinov3.hub.backbones import dinov3_vitl16 as _make_backbone  # type: ignore
+        elif backbone_name in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"):
+            from dinov3.hub.backbones import dinov3_vit7b16 as _make_backbone  # type: ignore
         else:
             raise ImportError(f"Unsupported backbone in config: {backbone_name}")
     except Exception:

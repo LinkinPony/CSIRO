@@ -1,4 +1,6 @@
 from typing import Optional, Tuple
+from pathlib import Path
+import os
 import math
 
 import torch
@@ -8,6 +10,29 @@ from .layer_utils import (
     normalize_layer_indices,
     split_cls_and_patches_from_intermediate,
 )
+
+
+def _resolve_dinov3_repo_or_dir() -> str:
+    """
+    Resolve the torch.hub repo_or_dir for DINOv3.
+
+    Prefer the vendored copy under third_party/ for offline and reproducible runs.
+    A manual override can be provided via the DINOV3_REPO_OR_DIR environment variable.
+    """
+    env = os.environ.get("DINOV3_REPO_OR_DIR", "").strip()
+    if env:
+        return env
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        local_repo = repo_root / "third_party" / "dinov3"
+        if (local_repo / "hubconf.py").is_file():
+            return str(local_repo)
+    except Exception:
+        pass
+    return "facebookresearch/dinov3"
+
+
+_DINOV3_REPO_OR_DIR = _resolve_dinov3_repo_or_dir()
 
 
 class DinoV3FeatureExtractor(nn.Module):
@@ -245,7 +270,7 @@ def load_dinov3_vitl16(
     # Prefer explicit offline weights if provided
     if weights_path:
         model = torch.hub.load(
-            repo_or_dir="facebookresearch/dinov3",
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vitl16",
             pretrained=False,
         )
@@ -258,7 +283,7 @@ def load_dinov3_vitl16(
 
     if weights_url:
         model = torch.hub.load(
-            repo_or_dir="facebookresearch/dinov3",
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vitl16",
             pretrained=pretrained,
             weights=weights_url,
@@ -267,7 +292,7 @@ def load_dinov3_vitl16(
         return model
 
     model = torch.hub.load(
-        repo_or_dir="facebookresearch/dinov3",
+        repo_or_dir=_DINOV3_REPO_OR_DIR,
         model="dinov3_vitl16",
         pretrained=pretrained,
     )
@@ -283,7 +308,7 @@ def load_dinov3_vith16plus(
     # Prefer explicit offline weights if provided
     if weights_path:
         model = torch.hub.load(
-            repo_or_dir="facebookresearch/dinov3",
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vith16plus",
             pretrained=False,
         )
@@ -295,7 +320,7 @@ def load_dinov3_vith16plus(
 
     if weights_url:
         model = torch.hub.load(
-            repo_or_dir="facebookresearch/dinov3",
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
             model="dinov3_vith16plus",
             pretrained=pretrained,
             weights=weights_url,
@@ -304,11 +329,56 @@ def load_dinov3_vith16plus(
         return model
 
     model = torch.hub.load(
-        repo_or_dir="facebookresearch/dinov3",
+        repo_or_dir=_DINOV3_REPO_OR_DIR,
         model="dinov3_vith16plus",
         pretrained=pretrained,
     )
     return model
+
+
+def load_dinov3_vit7b16(
+    pretrained: bool = True,
+    weights_url: Optional[str] = None,
+    weights_path: Optional[str] = None,
+    check_hash: bool = False,
+) -> nn.Module:
+    """
+    DINOv3 ViT-7B/16 backbone (embed_dim=4096, depth=40).
+
+    Official LVD1689M pretrain weights filename:
+      dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth
+    """
+    # Prefer explicit offline weights if provided
+    if weights_path:
+        model = torch.hub.load(
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
+            model="dinov3_vit7b16",
+            pretrained=False,
+        )
+        state = torch.load(weights_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        # Load with strict=False to be robust to minor key mismatches
+        model.load_state_dict(state, strict=False)
+        return model
+
+    if weights_url:
+        model = torch.hub.load(
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
+            model="dinov3_vit7b16",
+            pretrained=pretrained,
+            weights=weights_url,
+            check_hash=check_hash,
+        )
+        return model
+
+    model = torch.hub.load(
+        repo_or_dir=_DINOV3_REPO_OR_DIR,
+        model="dinov3_vit7b16",
+        pretrained=pretrained,
+    )
+    return model
+
 
 def build_feature_extractor(
     backbone_name: str,
@@ -326,6 +396,12 @@ def build_feature_extractor(
         )
     elif backbone_name == "dinov3_vith16plus":
         backbone = load_dinov3_vith16plus(
+            pretrained=use_pretrained,
+            weights_url=weights_url if not weights_path else None,
+            weights_path=weights_path,
+        )
+    elif backbone_name in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"):
+        backbone = load_dinov3_vit7b16(
             pretrained=use_pretrained,
             weights_url=weights_url if not weights_path else None,
             weights_path=weights_path,
