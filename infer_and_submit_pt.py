@@ -519,6 +519,8 @@ def extract_features_for_images(
     std: List[float],
     batch_size: int,
     num_workers: int,
+    *,
+    use_cls_token: bool = True,
 ) -> Tuple[List[str], torch.Tensor]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tf = build_transforms(image_size=image_size, mean=mean, std=std)
@@ -532,7 +534,12 @@ def extract_features_for_images(
     with torch.inference_mode():
         for images, rel_paths in dl:
             images = images.to(device, non_blocking=True)
-            feats = feature_extractor(images)
+            if use_cls_token:
+                feats = feature_extractor(images)
+            else:
+                # Use patch-mean only (no CLS) for global features.
+                _, pt = feature_extractor.forward_cls_and_tokens(images)  # type: ignore[attr-defined]
+                feats = pt.mean(dim=1)
             feats_cpu.append(feats.detach().cpu().float())
             rels.extend(list(rel_paths))
     features = torch.cat(feats_cpu, dim=0) if feats_cpu else torch.empty((0, 0), dtype=torch.float32)
@@ -782,12 +789,16 @@ def predict_main_and_ratio_global_multilayer(
     layer_indices: List[int],
     *,
     use_separate_bottlenecks: bool = False,
+    use_cls_token: bool = True,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
-    Global (CLS+mean(patch)) multi-layer inference for a single head:
+    Global multi-layer inference for a single head:
       - For each image, obtain per-layer CLS and patch tokens from the DINO backbone
         using get_intermediate_layers.
-      - For each layer, build CLS+mean(patch) features, apply the packed head,
+      - For each layer, build the global feature vector:
+          - use_cls_token=True:  [CLS ; mean(patch)]
+          - use_cls_token=False: mean(patch)
+        apply the packed head,
         slice that layer's segment, and then average predictions over layers.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -832,7 +843,11 @@ def predict_main_and_ratio_global_multilayer(
                     # Explicit per-layer bottlenecks: call dedicated global-layer path.
                     layer_main, layer_ratio = head.forward_global_layer(cls_l, patch_mean_l, l_idx)
                 else:
-                    feats_l = torch.cat([cls_l, patch_mean_l], dim=-1)  # (B, 2C)
+                    feats_l = (
+                        torch.cat([cls_l, patch_mean_l], dim=-1)
+                        if use_cls_token
+                        else patch_mean_l
+                    )
 
                     out_all = head(feats_l)  # (B, head_total * num_layers)
                     expected_dim = head_total * num_layers
@@ -1008,6 +1023,7 @@ def main():
     head_total_outputs_default = int(first_meta.get("head_total_outputs", num_outputs_main_default + num_outputs_ratio_default))
     ratio_components_default = first_meta.get("ratio_components", [])
     use_patch_reg3_default = bool(first_meta.get("use_patch_reg3", False))
+    use_cls_token_default = bool(first_meta.get("use_cls_token", True))
     use_layerwise_heads_default = bool(first_meta.get("use_layerwise_heads", False))
     backbone_layer_indices_default = list(first_meta.get("backbone_layer_indices", []))
     use_separate_bottlenecks_default = bool(first_meta.get("use_separate_bottlenecks", False))
@@ -1093,6 +1109,8 @@ def main():
         # Therefore, only heads that explicitly declare `use_patch_reg3: true` in meta
         # are treated as patch-mode heads; all others default to the legacy global path.
         use_patch_reg3_head = bool(meta.get("use_patch_reg3", False))
+        # Whether this head expects CLS in global features.
+        use_cls_token_head = bool(meta.get("use_cls_token", use_cls_token_default))
         # Determine whether this head uses layer-wise heads and which backbone layers.
         use_layerwise_heads_head = bool(meta.get("use_layerwise_heads", use_layerwise_heads_default))
         backbone_layer_indices_head = list(meta.get("backbone_layer_indices", backbone_layer_indices_default))
@@ -1115,6 +1133,7 @@ def main():
                 head_activation=head_activation,
                 dropout=head_dropout,
                 use_patch_reg3=use_patch_reg3_head,
+                use_cls_token=use_cls_token_head,
                 num_layers=num_layers_eff,
             )
         else:
@@ -1136,9 +1155,9 @@ def main():
                 dropout=head_dropout,
                 use_output_softplus=False,
                 # For patch-mode heads, the packed MLP expects patch-token dimensionality
-                # (embedding_dim) as input. Legacy heads default to CLS+mean(patch) with
-                # 2 * embedding_dim and therefore do not override input_dim.
-                input_dim=head_embedding_dim if use_patch_reg3_head else None,
+                # (embedding_dim) as input. Global heads default to CLS+mean(patch) with
+                # 2 * embedding_dim; when CLS is disabled, they use mean(patch) with embedding_dim.
+                input_dim=head_embedding_dim if (use_patch_reg3_head or (not use_cls_token_head)) else None,
             )
         head_module.load_state_dict(state, strict=True)
 
@@ -1167,7 +1186,7 @@ def main():
             )
         else:
             if use_layerwise_heads_head and len(backbone_layer_indices_head) > 0:
-                # Global multi-layer path: CLS+mean(patch) per layer with per-layer heads.
+                # Global multi-layer path: per-layer global features (CLS+mean(patch) or mean(patch)).
                 rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_global_multilayer(
                     backbone=backbone,
                     head=head_module,
@@ -1183,9 +1202,10 @@ def main():
                     head_total=head_total,
                     layer_indices=backbone_layer_indices_head,
                     use_separate_bottlenecks=use_separate_bottlenecks_head,
+                    use_cls_token=use_cls_token_head,
                 )
             else:
-                # Legacy single-layer path: extract CLS+mean(patch) only from last layer.
+                # Legacy single-layer path: extract global features from last layer.
                 feature_extractor = DinoV3FeatureExtractor(backbone)
                 rels_in_order, features_cpu = extract_features_for_images(
                     feature_extractor=feature_extractor,
@@ -1196,6 +1216,7 @@ def main():
                     std=std,
                     batch_size=batch_size,
                     num_workers=num_workers,
+                    use_cls_token=use_cls_token_head,
                 )
                 preds_main, preds_ratio = predict_from_features(
                     features_cpu=features_cpu,

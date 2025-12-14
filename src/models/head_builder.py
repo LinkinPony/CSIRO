@@ -91,6 +91,7 @@ def build_bottleneck_mlp(
     head_activation: str = "relu",
     dropout: float = 0.0,
     use_patch_reg3: bool = False,
+    use_cls_token: bool = True,
 ) -> nn.Sequential:
     """
     Build the shared/ per-layer bottleneck MLP used between DINO features and
@@ -104,14 +105,18 @@ def build_bottleneck_mlp(
         use_patch_reg3: If True, the bottleneck expects patch-token dimensionality
                         (C) as input; otherwise it expects CLS+mean(patch) with
                         2 * C features.
+        use_cls_token: If False (and use_patch_reg3 is False), the bottleneck expects
+                       mean(patch) with C features instead of CLS+mean(patch) with 2C.
     """
     hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
     act_name = (head_activation or "").lower()
 
     layers: List[nn.Module] = []
     # When use_patch_reg3 is enabled, the bottleneck operates directly on patch
-    # token dimensionality (C). Otherwise, it expects CLS concat mean(patch) (2C).
-    in_dim = embedding_dim if use_patch_reg3 else (embedding_dim * 2)
+    # token dimensionality (C). Otherwise, it expects:
+    #   - CLS concat mean(patch) (2C) when use_cls_token is True
+    #   - mean(patch) only (C) when use_cls_token is False
+    in_dim = embedding_dim if (use_patch_reg3 or (not use_cls_token)) else (embedding_dim * 2)
 
     if dropout and dropout > 0:
         layers.append(nn.Dropout(dropout))
@@ -162,6 +167,7 @@ class MultiLayerHeadExport(nn.Module):
         head_activation: str = "relu",
         dropout: float = 0.0,
         use_patch_reg3: bool = False,
+        use_cls_token: bool = True,
         num_layers: int = 1,
     ) -> None:
         super().__init__()
@@ -172,6 +178,7 @@ class MultiLayerHeadExport(nn.Module):
         self.num_outputs_main = int(num_outputs_main)
         self.num_outputs_ratio = int(num_outputs_ratio)
         self.use_patch_reg3 = bool(use_patch_reg3)
+        self.use_cls_token = bool(use_cls_token)
         self.num_layers = int(num_layers)
 
         # Build one bottleneck MLP per selected backbone layer.
@@ -183,6 +190,7 @@ class MultiLayerHeadExport(nn.Module):
                     head_activation=head_activation,
                     dropout=dropout,
                     use_patch_reg3=self.use_patch_reg3,
+                    use_cls_token=self.use_cls_token,
                 )
                 for _ in range(self.num_layers)
             ]
@@ -230,14 +238,15 @@ class MultiLayerHeadExport(nn.Module):
         layer_idx: int,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Global (CLS+mean(patch)) path for a single backbone layer.
+        Global path for a single backbone layer.
         """
         if not (0 <= layer_idx < self.num_layers):
             raise IndexError(f"layer_idx {layer_idx} out of range for num_layers={self.num_layers}")
 
-        # When use_patch_reg3 is False, the bottleneck expects CLS+mean(patch) (2C).
-        # We still call this method only in that regime from inference code.
-        feats = torch.cat([cls, patch_mean], dim=-1)
+        # When use_patch_reg3 is False, the bottleneck expects either:
+        #   - CLS+mean(patch) (2C) when use_cls_token is True
+        #   - mean(patch)     (C)  when use_cls_token is False
+        feats = torch.cat([cls, patch_mean], dim=-1) if self.use_cls_token else patch_mean
         bottleneck = self.layer_bottlenecks[layer_idx]
         z = bottleneck(feats)
 

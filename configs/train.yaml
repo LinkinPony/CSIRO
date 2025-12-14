@@ -1,5 +1,5 @@
 seed: 42
-version: mainfold-mixup-no-patch-reg3-multilayer
+version: manifold-mixup-no-cls-layer-last4-small-mixup
 data:
   root: data
   train_csv: train.csv
@@ -78,14 +78,14 @@ data:
     # Feature-level manifold mixup on the shared bottleneck representation z
     manifold_mixup:
       enabled: true
-      prob: 1.0
-      alpha: 2.0
+      prob: 0.5
+      alpha: 0.5
     cutmix:
       enabled: false
       alpha: 0.5
       # minmax: [0.3, 0.7]  # optional clamp for bbox size; comment to disable
       use_prev_for_bsz1: true
-    no_augment_prob: 0.1
+    no_augment_prob: 0.3
   normalization:
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
@@ -108,6 +108,15 @@ model:
     activation: relu
     dropout: 0.2
     use_output_softplus: true
+    # Whether to include the ViT/DINO CLS token in the *global* feature vector.
+    #
+    # - true  (default): global feature = [CLS ; mean(patch)] with shape (B, 2C)
+    # - false:          global feature = mean(patch) with shape (B, C)
+    #
+    # This flag affects the legacy/global path (use_patch_reg3: false) in both
+    # single-layer and multi-layer training/inference. Patch-mode reg3 uses patch
+    # tokens directly and is therefore unaffected.
+    use_cls_token: false
     # When enabled, use a patch-based main regression path:
     #   - For each patch token, apply the shared MLP head (CLS concatenated with patch token),
     #   - Average per-patch predictions to obtain the image-level output.
@@ -121,7 +130,7 @@ model:
     separate_bottlenecks: true
     # Indices refer to DINOv3 transformer blocks (0-based). For dinov3_vith16plus
     # the depth is 32, so valid indices are in [0, 31]. Example: use the last 4 layers.
-    indices: [25, 27, 29, 31]
+    indices: [28, 29,30 ,31]
 
 mtl:
   enabled: true

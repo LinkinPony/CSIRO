@@ -303,6 +303,8 @@ def train_single_split(
         # Head activation is configurable via YAML; default to ReLU for backward compatibility.
         head_activation=str(cfg["model"]["head"].get("activation", "relu")),
         use_output_softplus=bool(cfg["model"]["head"].get("use_output_softplus", True)),
+        # Whether to include CLS token in global features (CLS+mean(patch) vs mean(patch) only)
+        use_cls_token=bool(cfg["model"]["head"].get("use_cls_token", True)),
         # Optional patch-based main regression path (scheme A: only main task uses patch path).
         use_patch_reg3=bool(cfg["model"]["head"].get("use_patch_reg3", False)),
         log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),

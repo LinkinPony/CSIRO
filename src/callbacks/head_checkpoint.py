@@ -61,6 +61,8 @@ class HeadCheckpoint(Callback):
             # Patch-mode heads use patch-token dimensionality as input (embedding_dim),
             # whereas legacy heads expect CLS+mean(patch) with 2 * embedding_dim.
             use_patch_reg3 = bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False
+            # Whether the global feature includes CLS token (2C) or uses patch-mean only (C).
+            use_cls_token = bool(getattr(pl_module.hparams, "use_cls_token", True)) if hasattr(pl_module, "hparams") else True
             use_layerwise_heads = bool(getattr(pl_module.hparams, "use_layerwise_heads", False)) if hasattr(pl_module, "hparams") else False
             backbone_layer_indices = list(getattr(pl_module.hparams, "backbone_layer_indices", [])) if hasattr(pl_module, "hparams") else []
             use_separate_bottlenecks = bool(
@@ -101,6 +103,7 @@ class HeadCheckpoint(Callback):
                     head_activation=head_activation,
                     dropout=dropout,
                     use_patch_reg3=use_patch_reg3,
+                    use_cls_token=use_cls_token,
                     num_layers=num_layers,
                 )
 
@@ -156,7 +159,10 @@ class HeadCheckpoint(Callback):
                     head_activation=str(getattr(pl_module.hparams, "head_activation", "relu")),
                     dropout=float(getattr(pl_module.hparams, "dropout", 0.0)),
                     use_output_softplus=use_output_softplus_eff,
-                    input_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024)) if use_patch_reg3 else None,
+                    # Patch-mode uses C. Global mode uses 2C when CLS is included, otherwise C.
+                    input_dim=int(getattr(pl_module.hparams, "embedding_dim", 1024))
+                    if (use_patch_reg3 or (not use_cls_token))
+                    else None,
                 )
 
             def collect_linears(m: nn.Module):
@@ -289,6 +295,8 @@ class HeadCheckpoint(Callback):
                 # Whether the main regression head was trained using per-patch predictions
                 # averaged over patches (scheme A), or using a single CLS+mean(patch) feature.
                 "use_patch_reg3": bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False,
+                # Whether global features included CLS token during training.
+                "use_cls_token": bool(getattr(pl_module.hparams, "use_cls_token", True)) if hasattr(pl_module, "hparams") else True,
                 # Multi-layer configuration: whether layer-wise heads were used and which
                 # backbone blocks were selected.
                 "use_layerwise_heads": bool(getattr(pl_module.hparams, "use_layerwise_heads", False)) if hasattr(pl_module, "hparams") else False,

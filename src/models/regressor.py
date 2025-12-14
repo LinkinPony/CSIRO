@@ -206,6 +206,10 @@ class BiomassRegressor(LightningModule):
         head_hidden_dims: Optional[List[int]] = None,
         head_activation: str = "relu",
         use_output_softplus: bool = True,
+        # Whether to include CLS token in the global feature vector.
+        # If True:  global feature = [CLS ; mean(patch)] with 2 * embedding_dim channels.
+        # If False: global feature = mean(patch) with embedding_dim channels.
+        use_cls_token: bool = True,
         # Optional patch-based main regression path (per-patch prediction then average)
         use_patch_reg3: bool = False,
         log_scale_targets: bool = False,
@@ -308,13 +312,15 @@ class BiomassRegressor(LightningModule):
         # directly on patch-token dimensionality (embedding_dim), and global features are
         # reduced to this size before entering the bottleneck.
         use_patch = bool(use_patch_reg3)
+        self.use_cls_token: bool = bool(use_cls_token)
+        use_cls = self.use_cls_token
 
         def _build_bottleneck() -> nn.Sequential:
             layers: List[nn.Module] = []
             if use_patch:
                 in_dim = embedding_dim
             else:
-                in_dim = embedding_dim * 2
+                in_dim = embedding_dim * 2 if use_cls else embedding_dim
             if dropout and dropout > 0:
                 layers.append(nn.Dropout(dropout))
 
@@ -601,10 +607,17 @@ class BiomassRegressor(LightningModule):
             z_global:         (B, bottleneck_dim) shared bottleneck from CLS+mean(patch)
         """
         if not self.use_patch_reg3:
-            # Legacy path: CLS concat mean(patch) -> shared_bottleneck -> reg3_heads
+            # Legacy/global path:
+            #  - use_cls_token=True:  CLS concat mean(patch) -> shared_bottleneck -> reg3_heads
+            #  - use_cls_token=False: mean(patch)           -> shared_bottleneck -> reg3_heads
             if images is None:
                 raise ValueError("images must be provided when use_patch_reg3 is False")
-            features = self.feature_extractor(images)
+            if self.use_cls_token:
+                features = self.feature_extractor(images)
+            else:
+                # Avoid feeding CLS into the bottleneck by constructing a patch-mean-only feature.
+                _, pt = self.feature_extractor.forward_cls_and_tokens(images)
+                features = pt.mean(dim=1)  # (B, C)
             z = self.shared_bottleneck(features)
             pred_reg3_logits = self._forward_reg3_logits(z)
             return pred_reg3_logits, z
@@ -640,12 +653,23 @@ class BiomassRegressor(LightningModule):
         images: Optional[Tensor] = None,
         cls_list: Optional[List[Tensor]] = None,
         pt_list: Optional[List[Tensor]] = None,
+        feats_list: Optional[List[Tensor]] = None,
     ) -> Tuple[Tensor, Tensor, List[Tensor]]:
         """
         Multi-layer main regression path:
           - For each selected backbone layer, build a bottleneck feature z_l,
           - Apply a layer-specific reg3 head on z_l (or per-patch z_l when use_patch_reg3 is enabled),
           - Average predictions and bottleneck features over layers.
+
+        Args:
+            images:     Optional input images (used when cls/pt/feats are not provided).
+            cls_list:   Optional list of per-layer CLS tokens (B, C).
+            pt_list:    Optional list of per-layer patch tokens (B, N, C).
+            feats_list: Optional list of per-layer *global feature vectors* (B, F),
+                        where F is either C (mean(patch)) when use_cls_token=False,
+                        or 2C ([CLS; mean(patch)]) when use_cls_token=True.
+
+                        This is only supported when use_patch_reg3 is False.
 
         Returns:
             pred_reg3_logits: (B, num_outputs) averaged over layers
@@ -659,7 +683,36 @@ class BiomassRegressor(LightningModule):
         if len(self.backbone_layer_indices) == 0:
             raise RuntimeError("backbone_layer_indices is empty in multi-layer path")
 
-        # Obtain CLS and patch tokens for all requested layers in a single backbone forward,
+        # Option A: caller provided precomputed per-layer global features (only for non-patch mode).
+        if feats_list is not None:
+            if self.use_patch_reg3:
+                raise RuntimeError("feats_list is unsupported when use_patch_reg3 is True")
+            if len(feats_list) != len(self.backbone_layer_indices):
+                raise RuntimeError(
+                    "Mismatch between feats_list length and backbone_layer_indices in multi-layer path"
+                )
+            z_layers: List[Tensor] = []
+            pred_layers: List[Tensor] = []
+            for layer_idx, feats in enumerate(feats_list):
+                # Select per-layer bottleneck if available; otherwise fall back to shared one.
+                if self.layer_bottlenecks is not None:
+                    bottleneck = self.layer_bottlenecks[layer_idx]
+                else:
+                    bottleneck = self.shared_bottleneck
+                z_l = bottleneck(feats)  # (B, bottleneck_dim)
+                z_layers.append(z_l)
+                # Select layer-specific reg3 heads if available; otherwise fall back to shared heads.
+                if self.layer_reg3_heads is not None:
+                    heads_l = list(self.layer_reg3_heads[layer_idx])
+                else:
+                    heads_l = list(self.reg3_heads)
+                pred_l = self._forward_reg3_logits_for_heads(z_l, heads_l)  # (B, num_outputs)
+                pred_layers.append(pred_l)
+            pred_reg3_logits = average_layerwise_predictions(pred_layers)
+            z_global = average_layerwise_predictions(z_layers)
+            return pred_reg3_logits, z_global, z_layers
+
+        # Option B: obtain CLS/patch tokens for all requested layers in a single backbone forward,
         # unless they were already provided (e.g., after manifold mixup on backbone outputs).
         if cls_list is None or pt_list is None:
             if images is None:
@@ -676,12 +729,18 @@ class BiomassRegressor(LightningModule):
         pred_layers: List[Tensor] = []
 
         if not self.use_patch_reg3:
-            # CLS + mean(patch) per layer
+            # Global feature per layer:
+            #  - use_cls_token=True:  [CLS ; mean(patch)] -> (B, 2C)
+            #  - use_cls_token=False: mean(patch)         -> (B, C)
             for layer_idx, (cls, pt) in enumerate(zip(cls_list, pt_list)):
                 if pt.dim() != 3:
                     raise RuntimeError(f"Unexpected patch tokens shape in multi-layer reg3: {tuple(pt.shape)}")
                 patch_mean = pt.mean(dim=1)  # (B, C)
-                feats = torch.cat([cls, patch_mean], dim=-1)  # (B, 2C)
+                feats = (
+                    torch.cat([cls, patch_mean], dim=-1)
+                    if self.use_cls_token
+                    else patch_mean
+                )
                 # Select per-layer bottleneck if available; otherwise fall back to shared one.
                 if self.layer_bottlenecks is not None:
                     bottleneck = self.layer_bottlenecks[layer_idx]
@@ -885,30 +944,66 @@ class BiomassRegressor(LightningModule):
         z: Tensor
         z_layers: Optional[List[Tensor]] = None
         if self.use_layerwise_heads:
-            # Multi-layer path: obtain per-layer CLS and patch tokens from the backbone,
-            # optionally apply manifold mixup on the DINO patch tokens, then build
-            # bottleneck features and heads on top.
+            # Multi-layer path: obtain per-layer CLS and patch tokens from the backbone.
+            #
+            # IMPORTANT (manifold mixup):
+            # - For global (non-patch) reg3, the model consumes a per-layer *global feature*
+            #   (either [CLS; mean(patch)] or mean(patch) only). Therefore we apply mixup
+            #   directly on that per-layer feature tensor so CLS is mixed consistently.
+            # - For patch-mode reg3, the model consumes patch tokens. Therefore we apply
+            #   mixup on the patch tokens (per layer) only.
             cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
                 images, self.backbone_layer_indices
             )
-            if (
-                use_mixup
-                and self._manifold_mixup is not None
-                and (stage == "train")
-                and (not is_ndvi_only)
-            ):
-                try:
-                    # Stack per-layer patch tokens into a single tensor of shape (B, L, N, C)
-                    # so that manifold mixup operates on DINO outputs along the batch dim.
-                    pt_stack = torch.stack(pt_list, dim=1)
-                    pt_stack, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
-                    # Unstack back into a list of (B, N, C) tensors per layer.
-                    pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
-                except Exception:
-                    pass
-            pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(
-                images=None, cls_list=cls_list, pt_list=pt_list
-            )
+            if not self.use_patch_reg3:
+                # Build per-layer global features (B, F) where F is C or 2C depending on use_cls_token.
+                patch_mean_list: List[Tensor] = [pt.mean(dim=1) for pt in pt_list]
+                feats_list: List[Tensor] = []
+                for cls_l, pm_l in zip(cls_list, patch_mean_list):
+                    feats_list.append(
+                        torch.cat([cls_l, pm_l], dim=-1) if self.use_cls_token else pm_l
+                    )
+
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                ):
+                    try:
+                        # Stack into (B, L, F) so manifold mixup operates on the batch dim
+                        # while keeping layer structure intact.
+                        feats_stack = torch.stack(feats_list, dim=1)
+                        feats_stack, batch, _ = self._manifold_mixup.apply(
+                            feats_stack, batch, force=True
+                        )
+                        feats_list = [feats_stack[:, i] for i in range(feats_stack.shape[1])]
+                    except Exception:
+                        pass
+
+                pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(
+                    images=None, feats_list=feats_list
+                )
+            else:
+                # Patch-mode: optionally apply manifold mixup on the DINO patch tokens.
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                ):
+                    try:
+                        # Stack per-layer patch tokens into a single tensor of shape (B, L, N, C)
+                        # so that manifold mixup operates on DINO outputs along the batch dim.
+                        pt_stack = torch.stack(pt_list, dim=1)
+                        pt_stack, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
+                        # Unstack back into a list of (B, N, C) tensors per layer.
+                        pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
+                    except Exception:
+                        pass
+                pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(
+                    images=None, cls_list=cls_list, pt_list=pt_list
+                )
         else:
             if self.use_patch_reg3:
                 # Patch-based main regression path: obtain backbone patch tokens, apply
@@ -928,9 +1023,15 @@ class BiomassRegressor(LightningModule):
                         pass
                 pred_reg3, z = self._compute_reg3_from_images(images=None, pt_tokens=pt_tokens)
             else:
-                # Legacy CLS+mean(patch) path: apply manifold mixup directly on the
-                # DINO global features (CLS concat mean(patch)) before the bottleneck.
-                features = self.feature_extractor(images)
+                # Legacy/global path: apply manifold mixup directly on the *global* DINO feature
+                # used by the bottleneck:
+                #   - use_cls_token=True:  [CLS ; mean(patch)]  (B, 2C)
+                #   - use_cls_token=False: mean(patch)          (B, C)
+                if self.use_cls_token:
+                    features = self.feature_extractor(images)
+                else:
+                    _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                    features = pt_tokens.mean(dim=1)
                 if (
                     use_mixup
                     and self._manifold_mixup is not None
