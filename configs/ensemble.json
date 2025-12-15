@@ -1,11 +1,10 @@
 {
   "enabled": false,
   "versions": [
-    "ratio-mlp-2560-manifold-mixup-extreme",
-    "multilayer-patch-7-15-23-31",
-    "multilayer-patch-last4",
-    "multilayer-patch-last4-log",
-    "multilayer-patch-7-15-23-31-sam-0.01-small-lr"
+    "patch-reg3-seprate_head",
+    "mainfold-mixup-no-patch-reg3-multilayer",
+    "mainfold-mixup-no-patch-reg3-multilayer-log",
+    "vit7b-layer37-39"
   ]
 }
 

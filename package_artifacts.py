@@ -87,22 +87,59 @@ def _copy_snapshot_into_weights(
         print(f"[CFG] Failed to copy config snapshot into weights/: {e}")
 
 
+def _copy_version_snapshot_into_weights(
+    snapshot_path: Path | None,
+    *,
+    weights_dir: Path,
+    version: str,
+) -> None:
+    """
+    Copy a per-version training config snapshot into:
+      weights/configs/versions/<version>/train.yaml
+
+    This is used for multi-model / multi-backbone ensembles so that inference can
+    load the correct backbone + data settings per model, instead of relying on a
+    single global weights/configs/train.yaml.
+    """
+    try:
+        ver = str(version or "").strip()
+        if not ver:
+            return
+        dst_cfg_dir = weights_dir / "configs" / "versions" / ver
+        dst_cfg_dir.mkdir(parents=True, exist_ok=True)
+        if snapshot_path is not None and snapshot_path.is_file():
+            import shutil as _shutil
+
+            dst_cfg_path = dst_cfg_dir / "train.yaml"
+            _shutil.copyfile(str(snapshot_path), str(dst_cfg_path))
+            print(f"[CFG] Copied per-version snapshot config: {snapshot_path} -> {dst_cfg_path}")
+    except Exception as e:
+        print(f"[CFG] Failed to copy per-version snapshot config into weights/: {e}")
+
+
 def load_ensemble_cfg(repo_root: Path) -> dict:
     """
     Read configs/ensemble.json if present. Returns dict with at least:
       - enabled: bool
-      - versions: list[str]
+      - versions: list[str]   (legacy)
+      - models: list[dict]    (new; each item may include 'version', 'weight', 'backbone', etc.)
     """
     try:
         path = repo_root / "configs" / "ensemble.json"
         if not path.is_file():
-            return {"enabled": False, "versions": []}
+            return {"enabled": False, "versions": [], "models": []}
         import json as _json
         with open(path, "r", encoding="utf-8") as f:
             obj = _json.load(f)
         if not isinstance(obj, dict):
-            return {"enabled": False, "versions": []}
+            return {"enabled": False, "versions": [], "models": []}
         enabled = bool(obj.get("enabled", False))
+        # New schema: explicit model objects
+        models = obj.get("models", [])
+        if not isinstance(models, list):
+            models = []
+        models = [m for m in models if isinstance(m, dict)]
+
         # Backward-compat: accept single 'version' or list 'versions'
         versions = obj.get("versions", None)
         if versions is None:
@@ -113,9 +150,9 @@ def load_ensemble_cfg(repo_root: Path) -> dict:
                 versions = [str(v) for v in versions if isinstance(v, (str, int, float)) and str(v)]
             else:
                 versions = []
-        return {"enabled": enabled, "versions": versions}
+        return {"enabled": enabled, "versions": versions, "models": models}
     except Exception:
-        return {"enabled": False, "versions": []}
+        return {"enabled": False, "versions": [], "models": []}
 
 
 def resolve_dirs(cfg: dict) -> tuple[Path, Path]:
@@ -433,9 +470,28 @@ def main():
 
     # Multi-version ensemble packaging path
     enabled = bool(ensemble_cfg.get("enabled", False))
-    versions: list[str] = list(ensemble_cfg.get("versions", []))
+    models_cfg = ensemble_cfg.get("models", [])
+    if not isinstance(models_cfg, list):
+        models_cfg = []
+    # Prefer new schema: explicit models list. Fallback to legacy versions list.
+    versions: list[str] = []
+    if enabled and len(models_cfg) > 0:
+        for m in models_cfg:
+            if not isinstance(m, dict):
+                continue
+            v = m.get("version", None)
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                versions.append(str(v).strip())
+        # Deduplicate while preserving order
+        seen = set()
+        versions = [v for v in versions if not (v in seen or seen.add(v))]
+        print(f"[ENSEMBLE] Multi-model packaging enabled. Versions: {versions}")
+    else:
+        versions = list(ensemble_cfg.get("versions", []))
+        if enabled and len(versions) > 0:
+            print(f"[ENSEMBLE] Multi-version packaging enabled. Versions: {versions}")
+
     if enabled and len(versions) > 0:
-        print(f"[ENSEMBLE] Multi-version packaging enabled. Versions: {versions}")
         select_best = bool(getattr(args, "best", False))
         use_swa = not bool(getattr(args, "no_swa", False))
 
@@ -449,165 +505,247 @@ def main():
             tmp_cfg["version"] = ver
             v_log_dir, v_ckpt_dir = resolve_dirs(tmp_cfg)
 
-            # Detect kfold by listing fold_* directories
-            fold_dirs = [p for p in v_ckpt_dir.glob("fold_*") if p.is_dir()]
-            if fold_dirs:
-                fold_dirs.sort(key=lambda p: p.name)
-                exported = []
-                for fold_dir in fold_dirs:
-                    try:
-                        fold_idx = int(str(fold_dir.name).split("_", 1)[1])
-                    except Exception:
-                        # fallback: enumerate
-                        fold_idx = None
-                    dst_dir = weights_dir / "head" / ver / (f"fold_{fold_idx}" if fold_idx is not None else fold_dir.name)
-
-                    # Try SWA export
-                    chosen: Path | None = None
-                    dst_path: Path | None = None
-                    if use_swa:
-                        last_ckpt = fold_dir / "last.ckpt"
-                        if last_ckpt.is_file():
-                            ckpt_for_swa = last_ckpt
-                        else:
-                            ckpt_candidates = [p for p in fold_dir.glob("*.ckpt") if p.is_file()]
-                            ckpt_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                            ckpt_for_swa = ckpt_candidates[0] if ckpt_candidates else None
-                        if ckpt_for_swa is not None:
-                            print(f"[SWA] {ver} fold {fold_dir.name}: attempting SWA export from {ckpt_for_swa}")
-                            res = _export_swa_head_from_checkpoint(ckpt_for_swa, dst_dir)
-                            if res is not None:
-                                chosen, dst_path = res
-                                exported.append((chosen, dst_path))
-                                try:
-                                    rel = dst_path.relative_to(weights_dir / "head")
-                                    packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
-                                except Exception:
-                                    pass
-                                # Copy z_score.json for this version/fold if present
-                                zsrc = v_log_dir / fold_dir.name / "z_score.json"
-                                if zsrc.is_file():
-                                    try:
-                                        shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
-                                    except Exception:
-                                        pass
-                                # done this fold
-                                continue
-                            else:
-                                print(f"[SWA] {ver} fold {fold_dir.name}: SWA export failed; fallback to raw head-epoch*.pt.")
-
-                    # Fallback to raw head-epoch*.pt under fold_dir/head
-                    fold_ckpt_head_dir = fold_dir / "head"
-                    head_files = list_head_checkpoints(fold_ckpt_head_dir)
-                    if not head_files:
-                        raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
-                    if select_best:
-                        metrics_csv = find_latest_metrics_csv(v_log_dir / fold_dir.name)
-                        chosen = None
-                        if metrics_csv is not None:
-                            best_epoch = pick_best_epoch_from_metrics(metrics_csv)
-                            if best_epoch is not None:
-                                p = find_head_by_epoch(fold_ckpt_head_dir, best_epoch)
-                                if p is not None:
-                                    chosen = p
-                        if chosen is None:
-                            chosen = pick_latest_head(head_files)
-                    else:
-                        chosen = pick_latest_head(head_files)
-                    if chosen is None:
-                        raise FileNotFoundError(f"Failed to determine a head checkpoint for {ver}/{fold_dir.name}.")
-                    if dst_dir.exists() and dst_dir.is_dir():
-                        shutil.rmtree(dst_dir)
-                    dst_dir.mkdir(parents=True, exist_ok=True)
-                    dst_path = dst_dir / "infer_head.pt"
-                    shutil.copyfile(str(chosen), str(dst_path))
-                    exported.append((chosen, dst_path))
-                    try:
-                        rel = dst_path.relative_to(weights_dir / "head")
-                        packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
-                    except Exception:
-                        pass
-                    zsrc = v_log_dir / fold_dir.name / "z_score.json"
-                    if zsrc.is_file():
-                        try:
-                            shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
-                        except Exception:
-                            pass
-
-                print(f"[ENSEMBLE] Packaged heads for version '{ver}':")
-                for src_path, dst_path in exported:
-                    print(f" - {src_path} -> {dst_path}")
-            else:
-                # Single-run directory
+            # If train_all exists for this version, prefer packaging ONLY train_all.
+            # This avoids exporting fold_*/ heads when a consolidated train_all head exists.
+            train_all_dir = v_ckpt_dir / "train_all"
+            if train_all_dir.exists() and train_all_dir.is_dir():
                 dst_dir = weights_dir / "head" / ver
-                # Try SWA
-                chosen: Path | None = None
+                exported: list[tuple[Path, Path]] = []
+
+                chosen_ckpt: Path | None = None
+                copied_head: Path | None = None
                 if use_swa:
-                    main_last_ckpt = v_ckpt_dir / "last.ckpt"
-                    if main_last_ckpt.is_file():
-                        ckpt_for_swa = main_last_ckpt
+                    last_ckpt = train_all_dir / "last.ckpt"
+                    if last_ckpt.is_file():
+                        ckpt_for_swa = last_ckpt
                     else:
-                        ckpt_candidates = [p for p in v_ckpt_dir.glob("*.ckpt") if p.is_file()]
+                        ckpt_candidates = [p for p in train_all_dir.glob("*.ckpt") if p.is_file()]
                         ckpt_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                         ckpt_for_swa = ckpt_candidates[0] if ckpt_candidates else None
                     if ckpt_for_swa is not None:
-                        print(f"[SWA] {ver}: attempting SWA export from {ckpt_for_swa}")
+                        print(f"[SWA] {ver} train_all: attempting SWA export from {ckpt_for_swa}")
                         res = _export_swa_head_from_checkpoint(ckpt_for_swa, dst_dir)
                         if res is not None:
-                            chosen, copied_head = res
-                            print(f"Copied SWA head checkpoint: {chosen} -> {copied_head}")
+                            chosen_ckpt, copied_head = res
+                            exported.append((chosen_ckpt, copied_head))
                             try:
                                 rel = copied_head.relative_to(weights_dir / "head")
                                 packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
                             except Exception:
                                 pass
-                            # Copy z_score.json for this version if present
-                            zsrc = v_log_dir / "z_score.json"
-                            if zsrc.is_file():
-                                try:
-                                    shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
-                                except Exception:
-                                    pass
                         else:
-                            print(f"[SWA] {ver}: SWA export failed; fallback to raw head-epoch*.pt.")
-                if chosen is None:
-                    # Legacy raw copy
-                    head_dir = v_ckpt_dir / "head"
+                            print(f"[SWA] {ver} train_all: SWA export failed; fallback to raw head-epoch*.pt.")
+
+                if copied_head is None:
+                    # Fallback to raw head-epoch*.pt under train_all/head
+                    head_dir = train_all_dir / "head"
                     head_files = list_head_checkpoints(head_dir)
                     if not head_files:
                         raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
+                    chosen_head: Path | None = None
                     if select_best:
-                        metrics_csv = find_latest_metrics_csv(v_log_dir)
-                        chosen = None
+                        metrics_csv = find_latest_metrics_csv(v_log_dir / "train_all")
+                        # Fallback to root metrics.csv if train_all metrics are absent
+                        if metrics_csv is None:
+                            metrics_csv = find_latest_metrics_csv(v_log_dir)
                         if metrics_csv is not None:
                             best_epoch = pick_best_epoch_from_metrics(metrics_csv)
                             if best_epoch is not None:
                                 p = find_head_by_epoch(head_dir, best_epoch)
                                 if p is not None:
-                                    chosen = p
-                        if chosen is None:
-                            chosen = pick_latest_head(head_files)
+                                    chosen_head = p
+                        if chosen_head is None:
+                            chosen_head = pick_latest_head(head_files)
                     else:
-                        chosen = pick_latest_head(head_files)
-                    if chosen is None:
-                        raise FileNotFoundError(f"Failed to determine a head checkpoint for version {ver}.")
+                        chosen_head = pick_latest_head(head_files)
+                    if chosen_head is None:
+                        raise FileNotFoundError(f"Failed to determine a train_all head checkpoint for version {ver}.")
                     if dst_dir.exists() and dst_dir.is_dir():
                         shutil.rmtree(dst_dir)
                     dst_dir.mkdir(parents=True, exist_ok=True)
                     copied_head = dst_dir / "infer_head.pt"
-                    shutil.copyfile(str(chosen), str(copied_head))
-                    print(f"Copied head checkpoint: {chosen} -> {copied_head}")
+                    shutil.copyfile(str(chosen_head), str(copied_head))
+                    exported.append((chosen_head, copied_head))
                     try:
                         rel = copied_head.relative_to(weights_dir / "head")
                         packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
                     except Exception:
                         pass
+
+                # Copy z_score.json for train_all (best effort)
+                zsrc = v_log_dir / "train_all" / "z_score.json"
+                if not zsrc.is_file():
                     zsrc = v_log_dir / "z_score.json"
-                    if zsrc.is_file():
+                if zsrc.is_file():
+                    try:
+                        shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                    except Exception:
+                        pass
+
+                print(f"[ENSEMBLE] Packaged train_all head for version '{ver}':")
+                for src_path, dst_path in exported:
+                    print(f" - {src_path} -> {dst_path}")
+
+            else:
+                # Detect kfold by listing fold_* directories
+                fold_dirs = [p for p in v_ckpt_dir.glob("fold_*") if p.is_dir()]
+                if fold_dirs:
+                    fold_dirs.sort(key=lambda p: p.name)
+                    exported = []
+                    for fold_dir in fold_dirs:
                         try:
-                            shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                            fold_idx = int(str(fold_dir.name).split("_", 1)[1])
+                        except Exception:
+                            # fallback: enumerate
+                            fold_idx = None
+                        dst_dir = weights_dir / "head" / ver / (f"fold_{fold_idx}" if fold_idx is not None else fold_dir.name)
+
+                        # Try SWA export
+                        chosen: Path | None = None
+                        dst_path: Path | None = None
+                        if use_swa:
+                            last_ckpt = fold_dir / "last.ckpt"
+                            if last_ckpt.is_file():
+                                ckpt_for_swa = last_ckpt
+                            else:
+                                ckpt_candidates = [p for p in fold_dir.glob("*.ckpt") if p.is_file()]
+                                ckpt_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                                ckpt_for_swa = ckpt_candidates[0] if ckpt_candidates else None
+                            if ckpt_for_swa is not None:
+                                print(f"[SWA] {ver} fold {fold_dir.name}: attempting SWA export from {ckpt_for_swa}")
+                                res = _export_swa_head_from_checkpoint(ckpt_for_swa, dst_dir)
+                                if res is not None:
+                                    chosen, dst_path = res
+                                    exported.append((chosen, dst_path))
+                                    try:
+                                        rel = dst_path.relative_to(weights_dir / "head")
+                                        packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                                    except Exception:
+                                        pass
+                                    # Copy z_score.json for this version/fold if present
+                                    zsrc = v_log_dir / fold_dir.name / "z_score.json"
+                                    if zsrc.is_file():
+                                        try:
+                                            shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                                        except Exception:
+                                            pass
+                                    # done this fold
+                                    continue
+                                else:
+                                    print(f"[SWA] {ver} fold {fold_dir.name}: SWA export failed; fallback to raw head-epoch*.pt.")
+
+                        # Fallback to raw head-epoch*.pt under fold_dir/head
+                        fold_ckpt_head_dir = fold_dir / "head"
+                        head_files = list_head_checkpoints(fold_ckpt_head_dir)
+                        if not head_files:
+                            raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
+                        if select_best:
+                            metrics_csv = find_latest_metrics_csv(v_log_dir / fold_dir.name)
+                            chosen = None
+                            if metrics_csv is not None:
+                                best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+                                if best_epoch is not None:
+                                    p = find_head_by_epoch(fold_ckpt_head_dir, best_epoch)
+                                    if p is not None:
+                                        chosen = p
+                            if chosen is None:
+                                chosen = pick_latest_head(head_files)
+                        else:
+                            chosen = pick_latest_head(head_files)
+                        if chosen is None:
+                            raise FileNotFoundError(f"Failed to determine a head checkpoint for {ver}/{fold_dir.name}.")
+                        if dst_dir.exists() and dst_dir.is_dir():
+                            shutil.rmtree(dst_dir)
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        dst_path = dst_dir / "infer_head.pt"
+                        shutil.copyfile(str(chosen), str(dst_path))
+                        exported.append((chosen, dst_path))
+                        try:
+                            rel = dst_path.relative_to(weights_dir / "head")
+                            packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
                         except Exception:
                             pass
+                        zsrc = v_log_dir / fold_dir.name / "z_score.json"
+                        if zsrc.is_file():
+                            try:
+                                shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                            except Exception:
+                                pass
+
+                    print(f"[ENSEMBLE] Packaged heads for version '{ver}':")
+                    for src_path, dst_path in exported:
+                        print(f" - {src_path} -> {dst_path}")
+                else:
+                    # Single-run directory
+                    dst_dir = weights_dir / "head" / ver
+                    # Try SWA
+                    chosen: Path | None = None
+                    if use_swa:
+                        main_last_ckpt = v_ckpt_dir / "last.ckpt"
+                        if main_last_ckpt.is_file():
+                            ckpt_for_swa = main_last_ckpt
+                        else:
+                            ckpt_candidates = [p for p in v_ckpt_dir.glob("*.ckpt") if p.is_file()]
+                            ckpt_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                            ckpt_for_swa = ckpt_candidates[0] if ckpt_candidates else None
+                        if ckpt_for_swa is not None:
+                            print(f"[SWA] {ver}: attempting SWA export from {ckpt_for_swa}")
+                            res = _export_swa_head_from_checkpoint(ckpt_for_swa, dst_dir)
+                            if res is not None:
+                                chosen, copied_head = res
+                                print(f"Copied SWA head checkpoint: {chosen} -> {copied_head}")
+                                try:
+                                    rel = copied_head.relative_to(weights_dir / "head")
+                                    packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                                except Exception:
+                                    pass
+                                # Copy z_score.json for this version if present
+                                zsrc = v_log_dir / "z_score.json"
+                                if zsrc.is_file():
+                                    try:
+                                        shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                                    except Exception:
+                                        pass
+                            else:
+                                print(f"[SWA] {ver}: SWA export failed; fallback to raw head-epoch*.pt.")
+                    if chosen is None:
+                        # Legacy raw copy
+                        head_dir = v_ckpt_dir / "head"
+                        head_files = list_head_checkpoints(head_dir)
+                        if not head_files:
+                            raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
+                        if select_best:
+                            metrics_csv = find_latest_metrics_csv(v_log_dir)
+                            chosen = None
+                            if metrics_csv is not None:
+                                best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+                                if best_epoch is not None:
+                                    p = find_head_by_epoch(head_dir, best_epoch)
+                                    if p is not None:
+                                        chosen = p
+                            if chosen is None:
+                                chosen = pick_latest_head(head_files)
+                        else:
+                            chosen = pick_latest_head(head_files)
+                        if chosen is None:
+                            raise FileNotFoundError(f"Failed to determine a head checkpoint for version {ver}.")
+                        if dst_dir.exists() and dst_dir.is_dir():
+                            shutil.rmtree(dst_dir)
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        copied_head = dst_dir / "infer_head.pt"
+                        shutil.copyfile(str(chosen), str(copied_head))
+                        print(f"Copied head checkpoint: {chosen} -> {copied_head}")
+                        try:
+                            rel = copied_head.relative_to(weights_dir / "head")
+                            packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                        except Exception:
+                            pass
+                        zsrc = v_log_dir / "z_score.json"
+                        if zsrc.is_file():
+                            try:
+                                shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                            except Exception:
+                                pass
 
         # Write packaged ensemble manifest
         if packaged_head_rel_paths:
@@ -629,6 +767,13 @@ def main():
         copy_tree(repo_root / "configs", weights_dir / "configs")
         # Override configs/train.yaml with snapshot from canonical version if available
         _copy_snapshot_into_weights(canonical_snapshot, repo_root, weights_dir)
+        # Also store per-version snapshots so inference can pick backbone/data per model.
+        for ver in versions:
+            _copy_version_snapshot_into_weights(
+                _find_config_snapshot_for_version(cfg, repo_root, ver),
+                weights_dir=weights_dir,
+                version=ver,
+            )
         copy_tree(repo_root / "src", weights_dir / "src")
         copy_optional_third_party(repo_root, weights_dir)
         scripts_copied = copy_top_level_scripts(repo_root, weights_dir)
