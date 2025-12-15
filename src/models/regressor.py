@@ -1389,36 +1389,40 @@ class BiomassRegressor(LightningModule):
         optimizer_closure,
         **kwargs: Any,
     ) -> None:
-        # IMPORTANT:
-        # `optimizer_closure()` is the Lightning-generated callable that runs the forward pass
-        # + `training_step` + backward. If we call it here, we MUST NOT pass it again into
-        # `optimizer.step(closure=...)` for standard optimizers like AdamW, otherwise the
-        # closure will run a second time (extra forward/backward, slower, and changes grads).
+        # Lightning automatic optimization passes in an `optimizer_closure` that runs:
+        #   training_step -> (optional) zero_grad -> backward
         #
-        # We run the closure once up-front so we can safely skip stepping when no grads were
-        # produced (avoids AMP GradScaler assertions).
-        optimizer_closure()
-        # Check if any parameter has gradients; if not, skip stepping
-        has_grad = False
-        for group in optimizer.param_groups:
-            for p in group.get("params", []):
-                if getattr(p, "grad", None) is not None:
-                    has_grad = True
-                    break
-            if has_grad:
-                break
-        if not has_grad:
-            # No gradients this step (e.g., auxiliary-only step got skipped); avoid scaler.step assertion
-            return
+        # When overriding this hook, Lightning requires that the closure gets executed, otherwise the loop will
+        # error when consuming the closure result. Importantly, we must execute the closure **exactly once** per
+        # optimizer step. Calling `optimizer_closure()` manually and then calling `optimizer.step(closure=...)`
+        # would execute it twice under common precision plugins (and under most torch optimizers that call the
+        # closure), causing an extra forward/backward and changing gradients.
+        #
+        # We therefore wrap the closure to (a) execute it once, (b) detect the "no grads" case, and (c) return
+        # `None` to signal AMP precision plugins to skip `scaler.step()` (avoids GradScaler assertions).
+        def _has_any_grad() -> bool:
+            for group in optimizer.param_groups:
+                for p in group.get("params", []):
+                    if getattr(p, "grad", None) is not None:
+                        return True
+            return False
 
         # SAM requires a two-step update with an extra forward-backward pass.
         if isinstance(optimizer, SAM):
+            optimizer_closure()
+            if not _has_any_grad():
+                # No gradients this step; avoid scaler.step assertion and skip SAM update
+                return
             optimizer.first_step(zero_grad=True)
             optimizer_closure()
             optimizer.second_step(zero_grad=True)
         else:
-            # Proceed with default stepping (closure already executed above).
-            optimizer.step()
+            def _closure():
+                loss = optimizer_closure()
+                # If no gradients were produced, return None so AMP plugins will skip stepping
+                return None if not _has_any_grad() else loss
+
+            optimizer.step(closure=_closure)
             optimizer.zero_grad(set_to_none=True)
 
     def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
