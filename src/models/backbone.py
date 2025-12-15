@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 from pathlib import Path
 import os
 import math
+import warnings
 
 import torch
 from torch import Tensor, nn
@@ -395,7 +396,139 @@ def build_feature_extractor(
     pretrained: bool = True,
     weights_url: Optional[str] = None,
     weights_path: Optional[str] = None,
+    gradient_checkpointing: bool = False,
 ) -> nn.Module:
+    """
+    Build a DINOv3 feature extractor wrapper.
+
+    Args:
+        gradient_checkpointing: When True, apply activation/gradient checkpointing to the
+            DINOv3 ViT transformer blocks (memory saver; slower backward). This is useful
+            when training LoRA adapters with limited GPU memory.
+    """
+
+    def _enable_activation_checkpointing_on_blocks(m: nn.Module) -> bool:
+        """
+        Try to enable activation checkpointing by wrapping `m.blocks[i]`.
+        Returns True if at least one block was wrapped.
+        """
+        blocks = getattr(m, "blocks", None)
+        if blocks is None:
+            return False
+        if not isinstance(blocks, (nn.ModuleList, list)):
+            return False
+        if len(blocks) == 0:
+            return False
+
+        # Preferred: PyTorch checkpoint_wrapper (supports non-reentrant checkpointing and complex inputs).
+        try:
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (  # type: ignore
+                CheckpointImpl,
+                checkpoint_wrapper,
+            )
+
+            wrapped = 0
+            for i, b in enumerate(blocks):
+                # Avoid double-wrapping
+                if hasattr(b, "_checkpoint_wrapped_module"):
+                    continue
+                try:
+                    blocks[i] = checkpoint_wrapper(  # type: ignore[index]
+                        b,
+                        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                        preserve_rng_state=True,
+                    )
+                except TypeError:
+                    # Older signature fallback
+                    blocks[i] = checkpoint_wrapper(  # type: ignore[index]
+                        b,
+                        preserve_rng_state=True,
+                    )
+                wrapped += 1
+            return wrapped > 0
+        except Exception:
+            pass
+
+        # Fallback: torch.utils.checkpoint.checkpoint with a small wrapper to handle list inputs.
+        try:
+            import inspect
+            from torch.utils.checkpoint import checkpoint
+
+            supports_use_reentrant = "use_reentrant" in inspect.signature(checkpoint).parameters
+        except Exception:
+            return False
+
+        class _CheckpointBlock(nn.Module):
+            def __init__(self, inner: nn.Module) -> None:
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, x_or_x_list, rope_or_rope_list=None):
+                # Case A: tensor input (used by some DINO paths, e.g., intermediate layers)
+                if isinstance(x_or_x_list, Tensor):
+                    x = x_or_x_list
+                    rope = rope_or_rope_list
+
+                    def _fn(x_in: Tensor, sin: Optional[Tensor] = None, cos: Optional[Tensor] = None):
+                        if sin is None or cos is None:
+                            return self.inner(x_in, None)
+                        return self.inner(x_in, (sin, cos))
+
+                    if rope is None:
+                        if supports_use_reentrant:
+                            return checkpoint(_fn, x, None, None, use_reentrant=False, preserve_rng_state=True)
+                        return checkpoint(_fn, x, None, None, preserve_rng_state=True)
+
+                    sin, cos = rope
+                    if supports_use_reentrant:
+                        return checkpoint(_fn, x, sin, cos, use_reentrant=False, preserve_rng_state=True)
+                    return checkpoint(_fn, x, sin, cos, preserve_rng_state=True)
+
+                # Case B: list input (DINOv3 forward_features_list uses list-of-tensors)
+                x_list = x_or_x_list
+                rope_list = rope_or_rope_list
+                if rope_list is None:
+                    rope_list = [None for _ in x_list]
+                L = len(x_list)
+                rope_is_none = [r is None for r in rope_list]
+
+                def _fn(*flat: Tensor):
+                    xs = list(flat[:L])
+                    rope_t = flat[L:]
+                    idx = 0
+                    rl = []
+                    for is_none in rope_is_none:
+                        if is_none:
+                            rl.append(None)
+                        else:
+                            sin = rope_t[idx]
+                            cos = rope_t[idx + 1]
+                            idx += 2
+                            rl.append((sin, cos))
+                    out_list = self.inner(xs, rl)
+                    return tuple(out_list)
+
+                args = list(x_list)
+                rope_args: list[Tensor] = []
+                for r in rope_list:
+                    if r is None:
+                        continue
+                    rope_args.extend([r[0], r[1]])
+
+                if supports_use_reentrant:
+                    outs = checkpoint(_fn, *args, *rope_args, use_reentrant=False, preserve_rng_state=True)
+                else:
+                    outs = checkpoint(_fn, *args, *rope_args, preserve_rng_state=True)
+                return list(outs)
+
+        wrapped = 0
+        for i, b in enumerate(blocks):
+            if isinstance(b, _CheckpointBlock) or hasattr(b, "_checkpoint_wrapped_module"):
+                continue
+            blocks[i] = _CheckpointBlock(b)  # type: ignore[index]
+            wrapped += 1
+        return wrapped > 0
+
     # When weights_path is provided, force pretrained=False to avoid online fetch
     use_pretrained = False if weights_path else pretrained
     if backbone_name == "dinov3_vitl16":
@@ -418,6 +551,17 @@ def build_feature_extractor(
         )
     else:
         raise ValueError(f"Unsupported backbone: {backbone_name}")
+
+    if bool(gradient_checkpointing):
+        applied = _enable_activation_checkpointing_on_blocks(backbone)
+        # Some wrappers (e.g., PEFT) may expose the actual model under base_model
+        if (not applied) and hasattr(backbone, "base_model") and isinstance(getattr(backbone, "base_model"), nn.Module):
+            applied = _enable_activation_checkpointing_on_blocks(backbone.base_model)  # type: ignore[attr-defined]
+        if not applied:
+            warnings.warn(
+                "gradient_checkpointing was requested but could not be enabled on this backbone "
+                "(no `blocks` attribute found or checkpoint wrapper unavailable)."
+            )
     return DinoV3FeatureExtractor(backbone)
 
 

@@ -339,6 +339,7 @@ def train_single_split(
         weights_url=cfg["model"].get("weights_url", None),
         weights_path=cfg["model"].get("weights_path", None),
         freeze_backbone=bool(cfg["model"].get("freeze_backbone", True)),
+        gradient_checkpointing=bool(cfg["model"].get("gradient_checkpointing", False)),
         learning_rate=float(cfg["optimizer"]["lr"]),
         weight_decay=float(cfg["optimizer"]["weight_decay"]),
         scheduler_name=str(cfg.get("scheduler", {}).get("name", "")).lower() or None,

@@ -225,6 +225,8 @@ class BiomassRegressor(LightningModule):
         weights_url: Optional[str] = None,
         weights_path: Optional[str] = None,
         freeze_backbone: bool = True,
+        # Activation / gradient checkpointing for backbone blocks (memory saver; slower backward)
+        gradient_checkpointing: bool = False,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         uw_learning_rate: Optional[float] = None,
@@ -282,6 +284,7 @@ class BiomassRegressor(LightningModule):
             pretrained=pretrained,
             weights_url=weights_url,
             weights_path=weights_path,
+            gradient_checkpointing=bool(gradient_checkpointing),
         )
         # Optionally inject LoRA into the frozen backbone
         if peft_cfg and bool(peft_cfg.get("enabled", False)):
