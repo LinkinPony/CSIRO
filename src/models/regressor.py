@@ -1389,8 +1389,15 @@ class BiomassRegressor(LightningModule):
         optimizer_closure,
         **kwargs: Any,
     ) -> None:
-        # Run closure to compute backward
-        closure_out = optimizer_closure()
+        # IMPORTANT:
+        # `optimizer_closure()` is the Lightning-generated callable that runs the forward pass
+        # + `training_step` + backward. If we call it here, we MUST NOT pass it again into
+        # `optimizer.step(closure=...)` for standard optimizers like AdamW, otherwise the
+        # closure will run a second time (extra forward/backward, slower, and changes grads).
+        #
+        # We run the closure once up-front so we can safely skip stepping when no grads were
+        # produced (avoids AMP GradScaler assertions).
+        optimizer_closure()
         # Check if any parameter has gradients; if not, skip stepping
         has_grad = False
         for group in optimizer.param_groups:
@@ -1410,8 +1417,8 @@ class BiomassRegressor(LightningModule):
             optimizer_closure()
             optimizer.second_step(zero_grad=True)
         else:
-            # Proceed with default stepping
-            optimizer.step(closure=optimizer_closure)
+            # Proceed with default stepping (closure already executed above).
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
     def validation_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0):
