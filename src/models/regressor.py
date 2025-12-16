@@ -22,10 +22,21 @@ class ManifoldMixup:
     together with consistent mixing of regression and 5D/ratio targets.
     """
 
-    def __init__(self, *, enabled: bool, prob: float, alpha: float) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        prob: float,
+        alpha: float,
+        mix_cls_token: bool = True,
+    ) -> None:
         self.enabled: bool = bool(enabled)
         self.prob: float = float(prob)
         self.alpha: float = float(alpha)
+        # When True (default), manifold mixup is applied to the full feature vector,
+        # including the CLS token when present. When False (and use_cls_token=True),
+        # we can keep CLS intact and mix only the patch features.
+        self.mix_cls_token: bool = bool(mix_cls_token)
         # Previous-sample cache to support batch_size == 1 manifold mixup
         self._prev: Optional[Dict[str, Tensor]] = None
 
@@ -36,9 +47,12 @@ class ManifoldMixup:
         enabled = bool(cfg.get("enabled", False))
         prob = float(cfg.get("prob", 0.0))
         alpha = float(cfg.get("alpha", 1.0))
+        mix_cls_token = bool(cfg.get("mix_cls_token", True))
         if (not enabled) or prob <= 0.0:
             return None
-        return ManifoldMixup(enabled=enabled, prob=prob, alpha=alpha)
+        return ManifoldMixup(
+            enabled=enabled, prob=prob, alpha=alpha, mix_cls_token=mix_cls_token
+        )
 
     def apply(self, z: Tensor, batch: Dict[str, Tensor], *, force: bool = False) -> Tuple[Tensor, Dict[str, Tensor], bool]:
         """
@@ -951,38 +965,72 @@ class BiomassRegressor(LightningModule):
             #
             # IMPORTANT (manifold mixup):
             # - For global (non-patch) reg3, the model consumes a per-layer *global feature*
-            #   (either [CLS; mean(patch)] or mean(patch) only). Therefore we apply mixup
-            #   directly on that per-layer feature tensor so CLS is mixed consistently.
+            #   (either [CLS; mean(patch)] or mean(patch) only).
+            #   By default we apply mixup directly on that per-layer feature tensor (CLS mixed).
+            #   If manifold_mixup.mix_cls_token is False (and use_cls_token=True), we mix only
+            #   the patch-mean part and keep CLS unchanged.
             # - For patch-mode reg3, the model consumes patch tokens. Therefore we apply
             #   mixup on the patch tokens (per layer) only.
             cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
                 images, self.backbone_layer_indices
             )
             if not self.use_patch_reg3:
-                # Build per-layer global features (B, F) where F is C or 2C depending on use_cls_token.
+                # Build per-layer patch means (B, C).
                 patch_mean_list: List[Tensor] = [pt.mean(dim=1) for pt in pt_list]
-                feats_list: List[Tensor] = []
-                for cls_l, pm_l in zip(cls_list, patch_mean_list):
-                    feats_list.append(
-                        torch.cat([cls_l, pm_l], dim=-1) if self.use_cls_token else pm_l
-                    )
 
-                if (
+                apply_mm = bool(
                     use_mixup
                     and self._manifold_mixup is not None
                     and (stage == "train")
                     and (not is_ndvi_only)
-                ):
+                )
+
+                feats_list: List[Tensor] = []
+                if apply_mm and self._manifold_mixup is not None:
                     try:
-                        # Stack into (B, L, F) so manifold mixup operates on the batch dim
-                        # while keeping layer structure intact.
-                        feats_stack = torch.stack(feats_list, dim=1)
-                        feats_stack, batch, _ = self._manifold_mixup.apply(
-                            feats_stack, batch, force=True
-                        )
-                        feats_list = [feats_stack[:, i] for i in range(feats_stack.shape[1])]
+                        # If requested, keep CLS tokens intact and mix only patch features.
+                        if self.use_cls_token and (not bool(getattr(self._manifold_mixup, "mix_cls_token", True))):
+                            # (B, L, C): mix along batch dim, preserve layer structure.
+                            pm_stack = torch.stack(patch_mean_list, dim=1)
+                            pm_stack, batch, _ = self._manifold_mixup.apply(
+                                pm_stack, batch, force=True
+                            )
+                            patch_mean_list = [
+                                pm_stack[:, i] for i in range(pm_stack.shape[1])
+                            ]
+                            feats_list = [
+                                torch.cat([cls_l, pm_l], dim=-1)
+                                for cls_l, pm_l in zip(cls_list, patch_mean_list)
+                            ]
+                        else:
+                            for cls_l, pm_l in zip(cls_list, patch_mean_list):
+                                feats_list.append(
+                                    torch.cat([cls_l, pm_l], dim=-1)
+                                    if self.use_cls_token
+                                    else pm_l
+                                )
+                            # Stack into (B, L, F) so manifold mixup operates on the batch dim
+                            # while keeping layer structure intact.
+                            feats_stack = torch.stack(feats_list, dim=1)
+                            feats_stack, batch, _ = self._manifold_mixup.apply(
+                                feats_stack, batch, force=True
+                            )
+                            feats_list = [
+                                feats_stack[:, i]
+                                for i in range(feats_stack.shape[1])
+                            ]
                     except Exception:
-                        pass
+                        feats_list = []
+
+                # No mixup (or fallback): build per-layer global features (B, F) where
+                # F is C or 2C depending on use_cls_token.
+                if not feats_list:
+                    for cls_l, pm_l in zip(cls_list, patch_mean_list):
+                        feats_list.append(
+                            torch.cat([cls_l, pm_l], dim=-1)
+                            if self.use_cls_token
+                            else pm_l
+                        )
 
                 pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(
                     images=None, feats_list=feats_list
@@ -1030,23 +1078,42 @@ class BiomassRegressor(LightningModule):
                 # used by the bottleneck:
                 #   - use_cls_token=True:  [CLS ; mean(patch)]  (B, 2C)
                 #   - use_cls_token=False: mean(patch)          (B, C)
-                if self.use_cls_token:
-                    features = self.feature_extractor(images)
-                else:
-                    _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
-                    features = pt_tokens.mean(dim=1)
-                if (
+                apply_mm = bool(
                     use_mixup
                     and self._manifold_mixup is not None
                     and (stage == "train")
                     and (not is_ndvi_only)
+                )
+
+                if (
+                    self.use_cls_token
+                    and apply_mm
+                    and self._manifold_mixup is not None
+                    and (not bool(getattr(self._manifold_mixup, "mix_cls_token", True)))
                 ):
+                    # Keep CLS intact; mix only patch features (mean(patch)).
+                    cls_tok, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                    patch_mean = pt_tokens.mean(dim=1)  # (B, C)
                     try:
-                        features, batch, _ = self._manifold_mixup.apply(
-                            features, batch, force=True
+                        patch_mean, batch, _ = self._manifold_mixup.apply(
+                            patch_mean, batch, force=True
                         )
                     except Exception:
                         pass
+                    features = torch.cat([cls_tok, patch_mean], dim=-1)  # (B, 2C)
+                else:
+                    if self.use_cls_token:
+                        features = self.feature_extractor(images)
+                    else:
+                        _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                        features = pt_tokens.mean(dim=1)
+                    if apply_mm and self._manifold_mixup is not None:
+                        try:
+                            features, batch, _ = self._manifold_mixup.apply(
+                                features, batch, force=True
+                            )
+                        except Exception:
+                            pass
                 z = self.shared_bottleneck(features)
                 pred_reg3 = self._forward_reg3_logits(z)
         if is_ndvi_only:
