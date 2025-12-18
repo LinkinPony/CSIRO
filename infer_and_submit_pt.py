@@ -30,6 +30,11 @@ VIT7B_MP_SPLIT_IDX = 20
 # Use fp16 weights for the backbone/head in model-parallel mode to fit on 2x16GB GPUs.
 VIT7B_MP_DTYPE = "fp16"  # one of: "fp16", "fp32"
 # ===================================
+
+# ===== Inference runtime settings (not read from YAML) =====
+# Inference batch size is intentionally decoupled from training config.
+# Default to 1 for safety (e.g., ViT7B model-parallel on 2x16GB).
+INFER_BATCH_SIZE = 1
 # ==========================================================
 # INFERENCE SCRIPT (UPDATED REQUIREMENTS)
 # - Allowed to import this project's source code from `src/` and configuration from `configs/`.
@@ -87,6 +92,7 @@ if _PROJECT_DIR_ABS not in sys.path:
     sys.path.insert(0, _PROJECT_DIR_ABS)
 
 from src.models.head_builder import build_head_layer, MultiLayerHeadExport  # noqa: E402
+from src.models.spatial_fpn import FPNHeadConfig, FPNScalarHead  # noqa: E402
 from src.models.peft_integration import _import_peft  # noqa: E402
 from src.data.augmentations import build_eval_transform  # noqa: E402
 
@@ -1557,6 +1563,95 @@ def predict_main_and_ratio_patch_mode(
     return rels, preds_main, preds_ratio
 
 
+def predict_main_and_ratio_fpn(
+    backbone: nn.Module,
+    head: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: int,
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+    head_num_main: int,
+    head_num_ratio: int,
+    *,
+    use_layerwise_heads: bool,
+    layer_indices: Optional[List[int]] = None,
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+    """
+    FPN-head inference (Phase A):
+      - Obtain patch tokens (single-layer or multi-layer) from the DINO backbone.
+      - Call the exported FPN head on patch tokens + image_hw to obtain:
+          * reg3 logits (normalized domain)
+          * ratio logits (optional)
+      - Return predictions in the same format as other predictors.
+    """
+    mp_devs = _mp_get_devices_from_backbone(backbone) if isinstance(backbone, nn.Module) else None
+    device0 = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device1 = mp_devs[1] if mp_devs is not None else device0
+    device = device1
+
+    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    feature_extractor = DinoV3FeatureExtractor(backbone)
+    feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
+    head = head.eval().to(device1)
+    head_dtype = _module_param_dtype(head, default=torch.float32)
+
+    rels: List[str] = []
+    preds_main_list: List[torch.Tensor] = []
+    preds_ratio_list: List[torch.Tensor] = []
+
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device0, non_blocking=True)
+            H = int(images.shape[-2])
+            W = int(images.shape[-1])
+
+            if use_layerwise_heads and layer_indices is not None and len(layer_indices) > 0:
+                _cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
+                pt_list = [pt.to(device1, non_blocking=True, dtype=head_dtype) for pt in pt_list]
+                out = head(pt_list, image_hw=(H, W))  # type: ignore[call-arg]
+            else:
+                _cls, pt = feature_extractor.forward_cls_and_tokens(images)
+                pt = pt.to(device1, non_blocking=True, dtype=head_dtype)
+                out = head(pt, image_hw=(H, W))  # type: ignore[call-arg]
+
+            # Expected dict output from FPNScalarHead
+            if not isinstance(out, dict):
+                raise RuntimeError("FPN head forward must return a dict")
+            reg3 = out.get("reg3", None)
+            ratio = out.get("ratio", None)
+            if reg3 is None:
+                raise RuntimeError("FPN head did not return 'reg3'")
+            preds_main_list.append(reg3.detach().cpu().float())
+            if head_num_ratio > 0 and ratio is not None:
+                preds_ratio_list.append(ratio.detach().cpu().float())
+
+            rels.extend(list(rel_paths))
+
+    preds_main = (
+        torch.cat(preds_main_list, dim=0)
+        if preds_main_list
+        else torch.empty((0, head_num_main), dtype=torch.float32)
+    )
+    preds_ratio: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_list:
+        preds_ratio = torch.cat(preds_ratio_list, dim=0)
+    else:
+        preds_ratio = None
+    return rels, preds_main, preds_ratio
+
+
 def predict_main_and_ratio_global_multilayer(
     backbone: nn.Module,
     head: nn.Module,
@@ -1746,12 +1841,17 @@ def infer_components_5d_for_model(
     This function is the core building block for flexible ensembles: callers can invoke it
     multiple times (with different backbones) and ensemble the returned 5D components.
     """
-    # --- Data settings (from this model's config) ---
+    # --- Data settings (transforms/targets come from this model's config) ---
     image_size = _parse_image_size(cfg["data"]["image_size"])
     mean = list(cfg["data"]["normalization"]["mean"])
     std = list(cfg["data"]["normalization"]["std"])
     target_bases = list(cfg["data"]["target_order"])
-    batch_size = int(cfg["data"].get("batch_size", 32))
+    # Inference batch size is configured at the top of this script (not via YAML).
+    try:
+        batch_size = int(INFER_BATCH_SIZE)
+    except Exception:
+        batch_size = 1
+    batch_size = max(1, batch_size)
     num_workers = int(cfg["data"].get("num_workers", 4))
 
     # Dataset area (m^2) to convert g/m^2 to grams
@@ -1926,6 +2026,7 @@ def infer_components_5d_for_model(
             print(f"[WARN] PEFT injection skipped for {head_pt}: {_e}")
 
         # Build head module according to head meta
+        head_type_meta = str(meta.get("head_type", first_meta.get("head_type", "mlp"))).strip().lower()
         use_patch_reg3_head = bool(meta.get("use_patch_reg3", False))
         use_cls_token_head = bool(meta.get("use_cls_token", use_cls_token_default))
         use_layerwise_heads_head = bool(meta.get("use_layerwise_heads", use_layerwise_heads_default))
@@ -1933,7 +2034,29 @@ def infer_components_5d_for_model(
         use_separate_bottlenecks_head = bool(meta.get("use_separate_bottlenecks", use_separate_bottlenecks_default))
         head_is_ratio = bool(head_num_ratio > 0 and head_total == (head_num_main + head_num_ratio))
 
-        if use_layerwise_heads_head and use_separate_bottlenecks_head:
+        if head_type_meta == "fpn":
+            fpn_dim_meta = int(meta.get("fpn_dim", first_meta.get("fpn_dim", int(cfg["model"]["head"].get("fpn_dim", 256)))))
+            fpn_levels_meta = int(meta.get("fpn_num_levels", first_meta.get("fpn_num_levels", int(cfg["model"]["head"].get("fpn_num_levels", 3)))))
+            fpn_patch_size_meta = int(meta.get("fpn_patch_size", first_meta.get("fpn_patch_size", int(cfg["model"]["head"].get("fpn_patch_size", 16)))))
+            enable_ndvi_meta = bool(meta.get("enable_ndvi", False))
+            num_layers_eff = max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1
+            head_module = FPNScalarHead(
+                FPNHeadConfig(
+                    embedding_dim=head_embedding_dim,
+                    fpn_dim=fpn_dim_meta,
+                    num_levels=fpn_levels_meta,
+                    num_layers=num_layers_eff,
+                    use_separate_bottlenecks=use_separate_bottlenecks_head,
+                    head_hidden_dims=head_hidden_dims,
+                    head_activation=head_activation,
+                    dropout=head_dropout,
+                    num_outputs_main=head_num_main,
+                    num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
+                    enable_ndvi=enable_ndvi_meta,
+                    patch_size=fpn_patch_size_meta,
+                )
+            )
+        elif use_layerwise_heads_head and use_separate_bottlenecks_head:
             num_layers_eff = max(1, len(backbone_layer_indices_head))
             head_module = MultiLayerHeadExport(
                 embedding_dim=head_embedding_dim,
@@ -1975,7 +2098,23 @@ def infer_components_5d_for_model(
                     pass
 
         # --- Run inference for this head ---
-        if use_patch_reg3_head:
+        if head_type_meta == "fpn":
+            rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_fpn(
+                backbone=backbone,
+                head=head_module,
+                dataset_root=dataset_root,
+                image_paths=image_paths,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                head_num_main=head_num_main,
+                head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                use_layerwise_heads=use_layerwise_heads_head,
+                layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+            )
+        elif use_patch_reg3_head:
             rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_patch_mode(
                 backbone=backbone,
                 head=head_module,
@@ -2054,7 +2193,15 @@ def infer_components_5d_for_model(
                 reg3_std = torch.tensor(zscore["reg3"]["std"], dtype=torch.float32).clamp_min(1e-8)
             except Exception:
                 reg3_mean, reg3_std = None, None
-        if reg3_mean is not None and reg3_std is not None:
+        zscore_enabled = reg3_mean is not None and reg3_std is not None
+
+        # Optional Softplus on main outputs (matches training behavior):
+        # Enabled only when predicting in linear g/m^2 space without z-score or log1p.
+        use_output_softplus_cfg = bool(cfg.get("model", {}).get("head", {}).get("use_output_softplus", True))
+        if use_output_softplus_cfg and (not log_scale_meta) and (not zscore_enabled):
+            preds_main = F.softplus(preds_main)
+
+        if zscore_enabled:
             preds_main = preds_main * reg3_std[:head_num_main] + reg3_mean[:head_num_main]  # type: ignore[index]
         if log_scale_meta:
             preds_main = torch.expm1(preds_main).clamp_min(0.0)
@@ -2137,7 +2284,7 @@ def main():
     # Load configuration from project
     cfg = load_config(_PROJECT_DIR_ABS)
 
-    # Data settings from config (single source of truth)
+    # Data settings from config (single source of truth for transforms/targets)
     image_size = _parse_image_size(cfg["data"]["image_size"])  # (H, W), e.g., (640, 640) or (640, 1280)
     mean = list(cfg["data"]["normalization"]["mean"])  # e.g., [0.485, 0.456, 0.406]
     std = list(cfg["data"]["normalization"]["std"])    # e.g., [0.229, 0.224, 0.225]
@@ -2160,7 +2307,12 @@ def main():
         area_m2 = max(1.0, width_m * length_m if (width_m > 0.0 and length_m > 0.0) else 1.0)
     if not (area_m2 > 0.0):
         area_m2 = 1.0
-    batch_size = int(cfg["data"].get("batch_size", 32))
+    # Inference batch size is configured at the top of this script (not via YAML).
+    try:
+        batch_size = int(INFER_BATCH_SIZE)
+    except Exception:
+        batch_size = 1
+    batch_size = max(1, batch_size)
     num_workers = int(cfg["data"].get("num_workers", 4))
 
     # Read test.csv
@@ -2262,11 +2414,10 @@ def main():
                     pass
 
             # Optional per-model inference overrides (do not affect training).
+            # NOTE: batch_size is controlled by INFER_BATCH_SIZE at the top of this script.
             try:
                 if "data" not in cfg_model or not isinstance(cfg_model["data"], dict):
                     cfg_model["data"] = {}
-                if "batch_size" in m:
-                    cfg_model["data"]["batch_size"] = int(m.get("batch_size"))
                 if "num_workers" in m:
                     cfg_model["data"]["num_workers"] = int(m.get("num_workers"))
             except Exception:
@@ -2585,6 +2736,7 @@ def main():
             print(f"[WARN] PEFT injection skipped for {head_pt}: {_e}")
 
         # Build head module according to its own meta (packed main + optional ratio outputs)
+        head_type_meta = str(meta.get("head_type", first_meta.get("head_type", "mlp"))).strip().lower()
         # Determine whether this specific head was trained with patch-based main regression.
         # IMPORTANT: some older heads (e.g., pure ratio MLPs trained on global CLS+mean(patch))
         # do not store `use_patch_reg3` in their meta. For such heads we must *not* inherit
@@ -2609,7 +2761,29 @@ def main():
         # per-layer outputs in its final linear layer. When separate bottlenecks are
         # also enabled, we instead export an explicit MultiLayerHeadExport that mirrors
         # the training-time per-layer structure.
-        if use_layerwise_heads_head and use_separate_bottlenecks_head:
+        if head_type_meta == "fpn":
+            fpn_dim_meta = int(meta.get("fpn_dim", first_meta.get("fpn_dim", int(cfg["model"]["head"].get("fpn_dim", 256)))))
+            fpn_levels_meta = int(meta.get("fpn_num_levels", first_meta.get("fpn_num_levels", int(cfg["model"]["head"].get("fpn_num_levels", 3)))))
+            fpn_patch_size_meta = int(meta.get("fpn_patch_size", first_meta.get("fpn_patch_size", int(cfg["model"]["head"].get("fpn_patch_size", 16)))))
+            enable_ndvi_meta = bool(meta.get("enable_ndvi", False))
+            num_layers_eff = max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1
+            head_module = FPNScalarHead(
+                FPNHeadConfig(
+                    embedding_dim=head_embedding_dim,
+                    fpn_dim=fpn_dim_meta,
+                    num_levels=fpn_levels_meta,
+                    num_layers=num_layers_eff,
+                    use_separate_bottlenecks=use_separate_bottlenecks_head,
+                    head_hidden_dims=head_hidden_dims,
+                    head_activation=head_activation,
+                    dropout=head_dropout,
+                    num_outputs_main=head_num_main,
+                    num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
+                    enable_ndvi=enable_ndvi_meta,
+                    patch_size=fpn_patch_size_meta,
+                )
+            )
+        elif use_layerwise_heads_head and use_separate_bottlenecks_head:
             num_layers_eff = max(1, len(backbone_layer_indices_head))
             head_module = MultiLayerHeadExport(
                 embedding_dim=head_embedding_dim,
@@ -2657,7 +2831,23 @@ def main():
                 except Exception:
                     pass
 
-        if use_patch_reg3_head:
+        if head_type_meta == "fpn":
+            rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_fpn(
+                backbone=backbone,
+                head=head_module,
+                dataset_root=dataset_root,
+                image_paths=unique_image_paths,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                head_num_main=head_num_main,
+                head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                use_layerwise_heads=use_layerwise_heads_head,
+                layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+            )
+        elif use_patch_reg3_head:
             # Patch-based main regression: compute per-patch predictions and average.
             # When layer-wise heads are enabled, use multiple backbone layers with
             # per-layer predictions averaged across layers; otherwise fall back to
@@ -2746,6 +2936,13 @@ def main():
             except Exception:
                 reg3_mean, reg3_std = None, None
         zscore_enabled = reg3_mean is not None and reg3_std is not None
+
+        # Optional Softplus on main outputs (matches training behavior):
+        # Enabled only when predicting in linear g/m^2 space without z-score or log1p.
+        use_output_softplus_cfg = bool(cfg.get("model", {}).get("head", {}).get("use_output_softplus", True))
+        if use_output_softplus_cfg and (not log_scale_meta) and (not zscore_enabled):
+            preds_main = F.softplus(preds_main)
+
         if zscore_enabled:
             preds_main = preds_main * reg3_std[:head_num_main] + reg3_mean[:head_num_main]  # type: ignore[index]
         if log_scale_meta:

@@ -46,12 +46,45 @@ class DinoV3FeatureExtractor(nn.Module):
             parameter.requires_grad = False
         self.backbone.eval()
 
-    def _forward_features_dict(self, images: Tensor):
-        # Ensure AMP half inputs match backbone (float32) to avoid dtype mismatch in conv2d
+    def _infer_backbone_input_dtype(self, fallback: torch.dtype) -> torch.dtype:
+        """
+        Infer the dtype that the *image tensor* should be cast to before entering the
+        DINOv3 backbone.
+
+        Why not just use `next(self.backbone.parameters()).dtype`?
+        - When PEFT/LoRA is enabled we may end up with mixed parameter dtypes
+          (e.g., frozen base weights cast to fp16 for VRAM savings while trainable
+          LoRA params remain fp32). In that case, the first parameter dtype can be
+          misleading and cause conv2d dtype mismatch.
+
+        We therefore prefer the patch-embed conv weight dtype when available.
+        """
+        backbone = self.backbone
+        # Support PEFT-wrapped backbones: the real model may live under `base_model`.
+        if hasattr(backbone, "base_model") and isinstance(getattr(backbone, "base_model"), nn.Module):
+            backbone = getattr(backbone, "base_model")  # type: ignore[assignment]
+
         try:
-            backbone_dtype = next(self.backbone.parameters()).dtype
-        except StopIteration:
-            backbone_dtype = images.dtype
+            patch_embed = getattr(backbone, "patch_embed", None)
+            proj = getattr(patch_embed, "proj", None)
+            w = getattr(proj, "weight", None)
+            if isinstance(w, torch.Tensor) and w.is_floating_point():
+                return w.dtype
+        except Exception:
+            pass
+
+        # Fallback: first floating-point parameter dtype
+        try:
+            for p in backbone.parameters():
+                if isinstance(p, torch.Tensor) and p.is_floating_point():
+                    return p.dtype
+        except Exception:
+            pass
+        return fallback
+
+    def _forward_features_dict(self, images: Tensor):
+        # Ensure inputs match backbone dtype (avoid conv2d dtype mismatch).
+        backbone_dtype = self._infer_backbone_input_dtype(images.dtype)
         if images.dtype != backbone_dtype:
             images = images.to(dtype=backbone_dtype)
         # Support both raw DINOv3 and PEFT-wrapped backbones
@@ -74,11 +107,8 @@ class DinoV3FeatureExtractor(nn.Module):
         Call DINOv3-style get_intermediate_layers on the underlying backbone,
         handling PEFT-wrapped models where the method may live on base_model.
         """
-        # Ensure dtype consistency with backbone parameters
-        try:
-            backbone_dtype = next(self.backbone.parameters()).dtype
-        except StopIteration:
-            backbone_dtype = images.dtype
+        # Ensure dtype consistency with backbone (avoid conv2d dtype mismatch)
+        backbone_dtype = self._infer_backbone_input_dtype(images.dtype)
         if images.dtype != backbone_dtype:
             images = images.to(dtype=backbone_dtype)
 
@@ -93,6 +123,27 @@ class DinoV3FeatureExtractor(nn.Module):
                 "Backbone does not implement get_intermediate_layers; "
                 "multi-layer feature extraction is unsupported for this backbone."
             )
+
+        # Validate indices early to avoid silent fallback downstream.
+        # Prefer `blocks` length when available (common in ViT backbones).
+        try:
+            depth_model = backbone
+            if hasattr(depth_model, "base_model") and isinstance(getattr(depth_model, "base_model"), nn.Module):
+                depth_model = getattr(depth_model, "base_model")  # type: ignore[assignment]
+            blocks = getattr(depth_model, "blocks", None)
+            if isinstance(blocks, (nn.ModuleList, list)) and len(blocks) > 0:
+                depth = len(blocks)
+                bad = [int(i) for i in layer_indices if int(i) < 0 or int(i) >= depth]
+                if bad:
+                    raise ValueError(
+                        f"Invalid backbone layer indices: {bad}. "
+                        f"Backbone depth={depth} so valid indices are [0, {depth - 1}]."
+                    )
+        except ValueError:
+            raise
+        except Exception:
+            # Best-effort only; if we cannot infer depth, defer to the backbone implementation.
+            pass
 
         # DINOv3 accepts either an int (last n layers) or a sequence of indices.
         # Here we always pass a normalized list of indices defined by the caller.

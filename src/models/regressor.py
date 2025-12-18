@@ -11,6 +11,7 @@ from loguru import logger
 from .backbone import build_feature_extractor
 from .peft_integration import inject_lora_into_feature_extractor, get_lora_param_list
 from .head_builder import build_head_layer, SwiGLU
+from .spatial_fpn import FPNHeadConfig, FPNScalarHead
 from .layer_utils import average_layerwise_predictions, normalize_layer_indices
 from src.training.cutmix import CutMixBatchAugment
 from src.training.sam import SAM
@@ -215,6 +216,12 @@ class BiomassRegressor(LightningModule):
         self,
         backbone_name: str,
         embedding_dim: int,
+        # Head architecture selector
+        head_type: str = "mlp",
+        # FPN (Phase A) settings
+        fpn_dim: int = 256,
+        fpn_num_levels: int = 3,
+        fpn_patch_size: int = 16,
         num_outputs: int = 1,
         dropout: float = 0.0,
         head_hidden_dims: Optional[List[int]] = None,
@@ -239,6 +246,10 @@ class BiomassRegressor(LightningModule):
         weights_url: Optional[str] = None,
         weights_path: Optional[str] = None,
         freeze_backbone: bool = True,
+        # Cast *frozen* backbone weights to a lower-precision dtype (VRAM saver).
+        # NOTE: this is different from Lightning AMP `precision: 16-mixed`, which does
+        # not change parameter storage dtype by default.
+        backbone_weights_dtype: str = "fp32",
         # Activation / gradient checkpointing for backbone blocks (memory saver; slower backward)
         gradient_checkpointing: bool = False,
         learning_rate: float = 1e-3,
@@ -291,6 +302,13 @@ class BiomassRegressor(LightningModule):
         if opt_name in ("sam", "sam_adamw", "adamw_sam"):
             use_sam = True
         optimizer_name = opt_name
+        # Normalize head_type early for consistent behavior and export meta.
+        head_type_norm = str(head_type or "mlp").strip().lower()
+        if head_type_norm in ("fpn", "fpn_scalar", "spatial_fpn"):
+            head_type_norm = "fpn"
+        elif head_type_norm in ("mlp", "linear", "head", ""):
+            head_type_norm = "mlp"
+        self._head_type: str = head_type_norm
         self.save_hyperparameters()
 
         feature_extractor = build_feature_extractor(
@@ -318,82 +336,50 @@ class BiomassRegressor(LightningModule):
             for parameter in feature_extractor.backbone.parameters():
                 parameter.requires_grad = True
             feature_extractor.backbone.train()
+
+        # Optionally cast *frozen* backbone params to fp16/bf16 to save VRAM.
+        # Keep trainable params (LoRA adapters when enabled) in fp32 for optimizer stability.
+        dtype_key = str(backbone_weights_dtype or "fp32").strip().lower()
+        dtype_map = {
+            "fp32": torch.float32,
+            "float32": torch.float32,
+            "32": torch.float32,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "16": torch.float16,
+            "half": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }
+        cast_dtype = dtype_map.get(dtype_key, torch.float32)
+        if cast_dtype != torch.float32:
+            try:
+                for p in feature_extractor.backbone.parameters():
+                    if (not p.requires_grad) and p.is_floating_point():
+                        p.data = p.data.to(dtype=cast_dtype)
+            except Exception:
+                # Best-effort; if casting fails, keep fp32.
+                pass
         self.feature_extractor = feature_extractor
 
-        # Shared bottleneck: MLP defined by hidden_dims; last hidden dim is bottleneck size.
-        # Supports a legacy activation-based MLP and a SwiGLU variant.
-        hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
-        act_name = (head_activation or "").lower()
-        # For legacy heads, the backbone feature is CLS concat mean(patch) → 2 * embedding_dim.
-        # When use_patch_reg3 is enabled, the main regression path and packed head operate
-        # directly on patch-token dimensionality (embedding_dim), and global features are
-        # reduced to this size before entering the bottleneck.
-        use_patch = bool(use_patch_reg3)
+        # --------------------
+        # Head construction
+        # --------------------
+        # Keep existing hparams names for checkpoint compatibility.
         self.use_cls_token: bool = bool(use_cls_token)
-        use_cls = self.use_cls_token
-
-        def _build_bottleneck() -> nn.Sequential:
-            layers: List[nn.Module] = []
-            if use_patch:
-                in_dim = embedding_dim
-            else:
-                in_dim = embedding_dim * 2 if use_cls else embedding_dim
-            if dropout and dropout > 0:
-                layers.append(nn.Dropout(dropout))
-
-            if act_name == "swiglu":
-                # SwiGLU bottleneck: for each hidden_dim we use Linear(in_dim, 2 * hidden_dim)
-                # followed by a SwiGLU gate, which halves the dimension back to hidden_dim.
-                for hd in hidden_dims:
-                    layers.append(nn.Linear(in_dim, hd * 2))
-                    layers.append(SwiGLU())
-                    if dropout and dropout > 0:
-                        layers.append(nn.Dropout(dropout))
-                    in_dim = hd
-            else:
-                # Legacy MLP: Linear + pointwise activation (ReLU/GELU/SiLU).
-                def _act():
-                    name = act_name
-                    if name == "relu":
-                        return nn.ReLU(inplace=True)
-                    if name == "gelu":
-                        return nn.GELU()
-                    if name in ("silu", "swish"):
-                        return nn.SiLU(inplace=True)
-                    return nn.ReLU(inplace=True)
-
-                for hd in hidden_dims:
-                    layers.append(nn.Linear(in_dim, hd))
-                    layers.append(_act())
-                    if dropout and dropout > 0:
-                        layers.append(nn.Dropout(dropout))
-                    in_dim = hd
-
-            return nn.Sequential(*layers)
-
-        # Default shared bottleneck (used when not using per-layer bottlenecks, and
-        # also as a fallback when layer-wise bottlenecks are not constructed).
-        self.shared_bottleneck = _build_bottleneck()
-
-        # Task heads
-        bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
-        # Main reg3 heads: one or more independent 1-d regressors (e.g., Dry_Total_g only)
         self.num_outputs: int = int(num_outputs)
         if self.num_outputs < 1:
             raise ValueError("num_outputs must be >= 1 for reg3 head")
-        self.reg3_heads = nn.ModuleList(
-            [nn.Linear(bottleneck_dim, 1) for _ in range(self.num_outputs)]
-        )
 
-        # Whether to use per-patch regression (scheme A: only main task uses patch path).
-        # When enabled, the main reg3 prediction is obtained by:
-        #   1) Extracting CLS and patch tokens from the backbone,
-        #   2) Concatenating CLS with each patch token -> (B, N, 2C),
-        #   3) Applying shared_bottleneck + reg3_heads per patch,
-        #   4) Averaging predictions over patches to obtain a per-image output.
-        # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue
-        # to use the global CLS + mean(patch) bottleneck.
-        self.use_patch_reg3: bool = bool(use_patch_reg3)
+        hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
+        act_name = (head_activation or "").lower()
+
+        # Multi-layer backbone configuration is defined below; we need it to build the FPN head.
+
+        # For backward compatibility, keep the flag but interpret it as:
+        # - mlp head: same meaning as before
+        # - fpn head: always consumes patch tokens (effectively True)
+        self.use_patch_reg3: bool = bool(use_patch_reg3) if self._head_type == "mlp" else True
 
         # --- Multi-layer backbone configuration ---
         self.use_layerwise_heads: bool = bool(use_layerwise_heads)
@@ -411,13 +397,75 @@ class BiomassRegressor(LightningModule):
 
         # Optional per-layer bottlenecks for multi-layer heads
         self.use_separate_bottlenecks: bool = bool(use_separate_bottlenecks)
-        if self.use_layerwise_heads and self.use_separate_bottlenecks:
-            # One bottleneck MLP per selected backbone layer.
-            self.layer_bottlenecks = nn.ModuleList(
-                [_build_bottleneck() for _ in range(self.num_layers)]
-            )
+        # NOTE: for FPN head we reuse this flag as \"separate per-layer projections\".
+        if self._head_type == "mlp":
+            # Legacy: build MLP bottleneck(s)
+            def _build_bottleneck() -> nn.Sequential:
+                layers: List[nn.Module] = []
+                use_patch = bool(self.use_patch_reg3)
+                if use_patch:
+                    in_dim = embedding_dim
+                else:
+                    in_dim = embedding_dim * 2 if self.use_cls_token else embedding_dim
+                if dropout and dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+
+                if act_name == "swiglu":
+                    for hd in hidden_dims:
+                        layers.append(nn.Linear(in_dim, hd * 2))
+                        layers.append(SwiGLU())
+                        if dropout and dropout > 0:
+                            layers.append(nn.Dropout(dropout))
+                        in_dim = hd
+                else:
+                    def _act():
+                        name = act_name
+                        if name == "relu":
+                            return nn.ReLU(inplace=True)
+                        if name == "gelu":
+                            return nn.GELU()
+                        if name in ("silu", "swish"):
+                            return nn.SiLU(inplace=True)
+                        return nn.ReLU(inplace=True)
+
+                    for hd in hidden_dims:
+                        layers.append(nn.Linear(in_dim, hd))
+                        layers.append(_act())
+                        if dropout and dropout > 0:
+                            layers.append(nn.Dropout(dropout))
+                        in_dim = hd
+
+                return nn.Sequential(*layers)
+
+            self.shared_bottleneck = _build_bottleneck()
+            bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
+            self.reg3_heads = nn.ModuleList([nn.Linear(bottleneck_dim, 1) for _ in range(self.num_outputs)])
+
+            if self.use_layerwise_heads and self.use_separate_bottlenecks:
+                self.layer_bottlenecks = nn.ModuleList([_build_bottleneck() for _ in range(self.num_layers)])
+            else:
+                self.layer_bottlenecks = None  # type: ignore[assignment]
         else:
-            # Either multi-layer heads are disabled or we keep using the shared bottleneck.
+            # FPN head (Phase A)
+            # Build a single FPN head that optionally consumes multiple layers of patch tokens.
+            fpn_cfg = FPNHeadConfig(
+                embedding_dim=int(embedding_dim),
+                fpn_dim=int(fpn_dim),
+                num_levels=int(max(1, fpn_num_levels)),
+                num_layers=int(max(1, self.num_layers if self.use_layerwise_heads else 1)),
+                use_separate_bottlenecks=bool(self.use_separate_bottlenecks),
+                head_hidden_dims=list(hidden_dims),
+                head_activation=str(head_activation),
+                dropout=float(dropout or 0.0),
+                num_outputs_main=int(self.num_outputs),
+                num_outputs_ratio=3 if bool(enable_ratio_head) else 0,
+                enable_ndvi=bool(enable_ndvi) and bool(mtl_enabled),
+                patch_size=int(fpn_patch_size),
+            )
+            self.fpn_head = FPNScalarHead(fpn_cfg)
+            # Placeholders for legacy attributes referenced elsewhere (export, etc.)
+            self.shared_bottleneck = None  # type: ignore[assignment]
+            self.reg3_heads = None  # type: ignore[assignment]
             self.layer_bottlenecks = None  # type: ignore[assignment]
 
         self.mtl_enabled: bool = bool(mtl_enabled)
@@ -436,8 +484,18 @@ class BiomassRegressor(LightningModule):
         self._ndvi_dense_prob: float = float(max(0.0, min(1.0, base_prob)))
 
         # Instantiate only enabled heads
-        self.height_head = nn.Linear(bottleneck_dim, 1) if self.enable_height else None  # type: ignore[assignment]
-        self.ndvi_head = nn.Linear(bottleneck_dim, 1) if self.enable_ndvi else None  # type: ignore[assignment]
+        # For FPN head:
+        # - NDVI is produced by the FPN head itself; keep legacy ndvi_head as None.
+        # - Height (if enabled) is predicted from the FPN global representation z.
+        if self._head_type == "mlp":
+            bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
+            self.height_head = nn.Linear(bottleneck_dim, 1) if self.enable_height else None  # type: ignore[assignment]
+            self.ndvi_head = nn.Linear(bottleneck_dim, 1) if self.enable_ndvi else None  # type: ignore[assignment]
+        else:
+            # Ensure downstream optional heads (species/state) have a defined input dim.
+            bottleneck_dim = int(getattr(self.fpn_head, "scalar_dim", embedding_dim))  # type: ignore[attr-defined]
+            self.height_head = nn.Linear(bottleneck_dim, 1) if self.enable_height else None  # type: ignore[assignment]
+            self.ndvi_head = None  # type: ignore[assignment]
         if self.enable_species:
             if num_species_classes is None or int(num_species_classes) <= 1:
                 raise ValueError("num_species_classes must be provided (>1) when species task is enabled")
@@ -465,9 +523,13 @@ class BiomassRegressor(LightningModule):
         self.loss_5d_weight: float = float(max(0.0, loss_5d_weight))
         self.ratio_components: List[str] = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"]
         self.num_ratio_outputs: int = len(self.ratio_components)
-        if self.enable_ratio_head:
-            self.ratio_head = nn.Linear(bottleneck_dim, self.num_ratio_outputs)
+        if self._head_type == "mlp":
+            if self.enable_ratio_head:
+                self.ratio_head = nn.Linear(bottleneck_dim, self.num_ratio_outputs)
+            else:
+                self.ratio_head = None  # type: ignore[assignment]
         else:
+            # FPN head produces ratio logits internally (Phase A); keep for compatibility.
             self.ratio_head = None  # type: ignore[assignment]
 
         # 5D biomass weights (Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g)
@@ -496,7 +558,24 @@ class BiomassRegressor(LightningModule):
         self._reg3_std: Optional[Tensor] = torch.tensor(reg3_zscore_std, dtype=torch.float32) if reg3_zscore_std is not None else None
         self._ndvi_mean: Optional[float] = float(ndvi_zscore_mean) if ndvi_zscore_mean is not None else None
         self._ndvi_std: Optional[float] = float(ndvi_zscore_std) if ndvi_zscore_std is not None else None
-        self._use_reg3_zscore: bool = (self._reg3_mean is not None and self._reg3_std is not None)
+        # Enable reg3 z-score only when stats are present and match expected dimensionality.
+        self._use_reg3_zscore: bool = False
+        if self._reg3_mean is not None and self._reg3_std is not None:
+            try:
+                if int(self._reg3_mean.numel()) == int(self.num_outputs) and int(self._reg3_std.numel()) == int(self.num_outputs):
+                    self._use_reg3_zscore = True
+                else:
+                    logger.warning(
+                        "Invalid reg3 z-score stats: expected num_outputs={} but got mean_len={}, std_len={}. "
+                        "Disabling reg3 z-score normalization.",
+                        int(self.num_outputs),
+                        int(self._reg3_mean.numel()),
+                        int(self._reg3_std.numel()),
+                    )
+                    self._reg3_mean = None
+                    self._reg3_std = None
+            except Exception:
+                self._use_reg3_zscore = False
         # Optional 5D biomass z-score (g/m^2, possibly log-transformed)
         self._biomass_5d_mean: Optional[Tensor] = (
             torch.tensor(biomass_5d_zscore_mean, dtype=torch.float32)
@@ -550,22 +629,21 @@ class BiomassRegressor(LightningModule):
         self._manifold_mixup = ManifoldMixup.from_cfg(manifold_mixup_cfg)
 
         # --- Layer-wise heads per backbone layer (optional) ---
-        # These heads share the same shared_bottleneck but have independent final linear layers.
-        if self.use_layerwise_heads:
+        # For FPN head Phase A we do NOT keep per-layer scalar heads; multi-layer tokens are
+        # fused inside the FPN head itself. Keep these attributes for backward compatibility.
+        if self._head_type == "mlp" and self.use_layerwise_heads:
             L = self.num_layers
-            # Main reg3 heads: [L][num_outputs] scalar heads
+            bottleneck_dim = hidden_dims[-1] if hidden_dims else embedding_dim
             self.layer_reg3_heads = nn.ModuleList(
                 nn.ModuleList([nn.Linear(bottleneck_dim, 1) for _ in range(self.num_outputs)])
                 for _ in range(L)
             )
-            # Ratio heads (if enabled): one per layer
             if self.enable_ratio_head:
                 self.layer_ratio_heads = nn.ModuleList(
                     nn.Linear(bottleneck_dim, self.num_ratio_outputs) for _ in range(L)
                 )
             else:
                 self.layer_ratio_heads = None  # type: ignore[assignment]
-            # Auxiliary tasks
             self.layer_height_heads = (
                 nn.ModuleList(nn.Linear(bottleneck_dim, 1) for _ in range(L))
                 if self.enable_height
@@ -804,12 +882,41 @@ class BiomassRegressor(LightningModule):
 
     def forward(self, images: Tensor) -> Tensor:
         # Return main regression prediction in original grams (g).
-        # When use_patch_reg3 is enabled, this corresponds to the per-patch prediction
-        # averaged over all patches; otherwise it is the legacy CLS+mean(patch) head.
-        if self.use_layerwise_heads:
-            pred_reg3_logits, _, _ = self._compute_reg3_and_z_multilayer(images)
+        # When using the FPN head, main reg3 is computed from spatial pyramid features.
+        if getattr(self, "_head_type", "mlp") == "fpn":
+            if self.use_layerwise_heads and len(self.backbone_layer_indices) > 0:
+                try:
+                    _, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(  # type: ignore[misc]
+                        images, self.backbone_layer_indices
+                    )
+                except Exception as e:
+                    backbone_name = getattr(getattr(self, "hparams", None), "backbone_name", None)
+                    raise RuntimeError(
+                        "Failed to extract multi-layer patch tokens for FPN head in forward(). "
+                        f"Check model.backbone_layers.indices={self.backbone_layer_indices} "
+                        f"are valid for backbone={backbone_name!r}. Original error: {e}"
+                    ) from e
+                if not pt_list:
+                    raise RuntimeError(
+                        "Multi-layer token extraction returned an empty pt_list for FPN head in forward(). "
+                        f"indices={self.backbone_layer_indices}"
+                    )
+                pt_in = pt_list
+            else:
+                _, pt = self.feature_extractor.forward_cls_and_tokens(images)
+                pt_in = pt
+            out_dict = self.fpn_head(pt_in, image_hw=(int(images.shape[-2]), int(images.shape[-1])))  # type: ignore[attr-defined]
+            pred_reg3_logits = out_dict["reg3"]  # type: ignore[assignment]
+            if pred_reg3_logits is None:
+                raise RuntimeError("FPN head did not return reg3 logits")
         else:
-            pred_reg3_logits, _ = self._compute_reg3_from_images(images)
+            # Legacy behavior:
+            # When use_patch_reg3 is enabled, this corresponds to the per-patch prediction
+            # averaged over all patches; otherwise it is the legacy CLS+mean(patch) head.
+            if self.use_layerwise_heads:
+                pred_reg3_logits, _, _ = self._compute_reg3_and_z_multilayer(images)
+            else:
+                pred_reg3_logits, _ = self._compute_reg3_from_images(images)
         out = pred_reg3_logits
         if self.out_softplus is not None:
             out = self.out_softplus(out)
@@ -960,7 +1067,70 @@ class BiomassRegressor(LightningModule):
         pred_reg3: Tensor
         z: Tensor
         z_layers: Optional[List[Tensor]] = None
-        if self.use_layerwise_heads:
+        # Optional predictions produced by some head types (e.g., FPN).
+        ratio_logits_pred: Optional[Tensor] = None
+        ndvi_pred: Optional[Tensor] = None
+        head_type = str(getattr(self, "_head_type", "mlp")).lower()
+
+        if head_type == "fpn":
+            # Phase-A FPN path: always consume patch tokens (single-layer or multi-layer),
+            # optionally apply manifold mixup on patch tokens, then predict reg3/ratio/ndvi.
+            image_hw = (int(images.shape[-2]), int(images.shape[-1]))
+            pt_in: Any
+            if self.use_layerwise_heads and len(self.backbone_layer_indices) > 0:
+                try:
+                    _cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
+                        images, self.backbone_layer_indices
+                    )
+                except Exception as e:
+                    backbone_name = getattr(getattr(self, "hparams", None), "backbone_name", None)
+                    raise RuntimeError(
+                        "Failed to extract multi-layer patch tokens for FPN head. "
+                        f"Check model.backbone_layers.indices={self.backbone_layer_indices} "
+                        f"are valid for backbone={backbone_name!r}. Original error: {e}"
+                    ) from e
+                if not pt_list:
+                    raise RuntimeError(
+                        "Multi-layer token extraction returned an empty pt_list for FPN head. "
+                        f"indices={self.backbone_layer_indices}"
+                    )
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                    and pt_list
+                ):
+                    try:
+                        pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
+                        pt_stack, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
+                        pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
+                    except Exception:
+                        pass
+                pt_in = pt_list
+            else:
+                _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                ):
+                    try:
+                        pt_tokens, batch, _ = self._manifold_mixup.apply(pt_tokens, batch, force=True)
+                    except Exception:
+                        pass
+                pt_in = pt_tokens
+
+            out_fpn = self.fpn_head(pt_in, image_hw=image_hw)  # type: ignore[attr-defined]
+            pred_reg3 = out_fpn.get("reg3", None)  # type: ignore[assignment]
+            z = out_fpn.get("z", None)  # type: ignore[assignment]
+            ratio_logits_pred = out_fpn.get("ratio", None)
+            ndvi_pred = out_fpn.get("ndvi", None)
+            if pred_reg3 is None or z is None:
+                raise RuntimeError("FPN head did not return required outputs (reg3/z)")
+
+        elif self.use_layerwise_heads:
             # Multi-layer path: obtain per-layer CLS and patch tokens from the backbone.
             #
             # IMPORTANT (manifold mixup):
@@ -1118,20 +1288,31 @@ class BiomassRegressor(LightningModule):
                 pred_reg3 = self._forward_reg3_logits(z)
         if is_ndvi_only:
             # NDVI-only batch (no reg3 supervision). Optimize NDVI scalar head only.
-            if not self.enable_ndvi or (self.ndvi_head is None and (not self.use_layerwise_heads or self.layer_ndvi_heads is None)):
+            if not self.enable_ndvi:
                 # If NDVI task is disabled, skip by returning zero loss
                 zero = (z.sum() * 0.0)
                 self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
                 self.log(f"{stage}_loss", zero, on_step=False, on_epoch=True, prog_bar=True)
                 return {"loss": zero}
             y_ndvi_only: Tensor = batch["y_ndvi"]  # (B,1)
-            if self.use_layerwise_heads and self.layer_ndvi_heads is not None and z_layers is not None:
-                preds_layers_ndvi: List[Tensor] = []
-                for idx, head in enumerate(self.layer_ndvi_heads):
-                    preds_layers_ndvi.append(head(z_layers[idx]))
-                pred_ndvi_only = average_layerwise_predictions(preds_layers_ndvi)
+            if head_type == "fpn":
+                if ndvi_pred is None:
+                    zero = (z.sum() * 0.0)
+                    self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
+                    self.log(f"{stage}_loss", zero, on_step=False, on_epoch=True, prog_bar=True)
+                    return {"loss": zero}
+                pred_ndvi_only = ndvi_pred
             else:
-                pred_ndvi_only = self.ndvi_head(z)  # type: ignore[operator]
+                if self.ndvi_head is None and (not self.use_layerwise_heads or self.layer_ndvi_heads is None):
+                    zero = (z.sum() * 0.0)
+                    self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
+                    self.log(f"{stage}_loss", zero, on_step=False, on_epoch=True, prog_bar=True)
+                    return {"loss": zero}
+                if self.use_layerwise_heads and self.layer_ndvi_heads is not None and z_layers is not None:
+                    preds_layers_ndvi = [head(z_layers[idx]) for idx, head in enumerate(self.layer_ndvi_heads)]
+                    pred_ndvi_only = average_layerwise_predictions(preds_layers_ndvi)
+                else:
+                    pred_ndvi_only = self.ndvi_head(z)  # type: ignore[operator]
             loss_ndvi_only = F.mse_loss(pred_ndvi_only, y_ndvi_only)
             self.log(f"{stage}_loss_ndvi", loss_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse_ndvi", loss_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
@@ -1181,27 +1362,36 @@ class BiomassRegressor(LightningModule):
             ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
             if y_ratio is not None and ratio_mask is not None:
                 # Predict logits for (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
-                if self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
+                if head_type == "fpn":
+                    ratio_logits = ratio_logits_pred
+                elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
                     logits_per_layer: List[Tensor] = []
                     for idx, head in enumerate(self.layer_ratio_heads):
                         logits_per_layer.append(head(z_layers[idx]))
                     ratio_logits = average_layerwise_predictions(logits_per_layer)
                 else:
                     ratio_logits = self.ratio_head(z)  # type: ignore[operator]
-                # Predicted probabilities
-                p_pred = F.softmax(ratio_logits, dim=-1)
-                # Ensure target is a proper distribution
-                p_true = y_ratio.clamp_min(0.0)
-                denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                p_true = p_true / denom
-                # Per-sample MSE over the 3 ratio components, then masked average
-                diff_ratio = p_pred - p_true
-                mse_per_sample = (diff_ratio * diff_ratio).sum(dim=-1, keepdim=True)  # (B,1)
-                m = ratio_mask.to(device=mse_per_sample.device, dtype=mse_per_sample.dtype)
-                num = (mse_per_sample * m).sum()
-                den = m.sum().clamp_min(1.0)
-                loss_ratio_mse = (num / den)
-                self.log(f"{stage}_loss_ratio_mse", loss_ratio_mse, on_step=False, on_epoch=True, prog_bar=False)
+                if ratio_logits is not None:
+                    # Predicted probabilities
+                    p_pred = F.softmax(ratio_logits, dim=-1)
+                    # Ensure target is a proper distribution
+                    p_true = y_ratio.clamp_min(0.0)
+                    denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    p_true = p_true / denom
+                    # Per-sample MSE over the 3 ratio components, then masked average
+                    diff_ratio = p_pred - p_true
+                    mse_per_sample = (diff_ratio * diff_ratio).sum(dim=-1, keepdim=True)  # (B,1)
+                    m = ratio_mask.to(device=mse_per_sample.device, dtype=mse_per_sample.dtype)
+                    num = (mse_per_sample * m).sum()
+                    den = m.sum().clamp_min(1.0)
+                    loss_ratio_mse = (num / den)
+                    self.log(
+                        f"{stage}_loss_ratio_mse",
+                        loss_ratio_mse,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                    )
 
         # --- 5D weighted MSE loss over physical components ---
         loss_5d: Optional[Tensor] = None
@@ -1214,16 +1404,25 @@ class BiomassRegressor(LightningModule):
             # Convert main reg3 prediction back to g/m^2 (Dry_Total_g)
             pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
             # Ratio predictions (probabilities over 3 components)
-            if self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
+            if head_type == "fpn":
+                ratio_logits = ratio_logits_pred
+            elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
                 logits_per_layer_5d: List[Tensor] = []
                 for idx, head in enumerate(self.layer_ratio_heads):
                     logits_per_layer_5d.append(head(z_layers[idx]))
                 ratio_logits = average_layerwise_predictions(logits_per_layer_5d)
             else:
                 ratio_logits = self.ratio_head(z)  # type: ignore[operator]
-            p_pred = F.softmax(ratio_logits, dim=-1)  # (B,3)
+            if ratio_logits is None:
+                # Cannot compute 5D decomposition without ratio logits
+                ratio_logits = None  # type: ignore[assignment]
+            else:
+                p_pred = F.softmax(ratio_logits, dim=-1)  # (B,3)
             # Component g/m^2
-            comp_gm2 = p_pred * pred_total_gm2  # (B,3)
+            if ratio_logits is None:
+                comp_gm2 = torch.zeros((pred_total_gm2.size(0), 3), device=pred_total_gm2.device, dtype=pred_total_gm2.dtype)
+            else:
+                comp_gm2 = p_pred * pred_total_gm2  # (B,3)
             clover_pred = comp_gm2[:, 0]
             dead_pred = comp_gm2[:, 1]
             green_pred = comp_gm2[:, 2]
@@ -1334,7 +1533,13 @@ class BiomassRegressor(LightningModule):
         pred_ndvi = None
         logits_species = None
         logits_state = None
-        if self.use_layerwise_heads and z_layers is not None:
+        if head_type == "fpn":
+            # FPN head may provide NDVI directly.
+            pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
+            pred_ndvi = ndvi_pred if self.enable_ndvi else None
+            logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
+            logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
+        elif self.use_layerwise_heads and z_layers is not None:
             if self.enable_height and self.layer_height_heads is not None:
                 height_preds_layers: List[Tensor] = []
                 for idx, head in enumerate(self.layer_height_heads):
@@ -1384,18 +1589,24 @@ class BiomassRegressor(LightningModule):
             else:
                 m_nd = torch.ones_like(y_ndvi, dtype=y_ndvi.dtype, device=y_ndvi.device)  # type: ignore[arg-type]
 
-            diff_ndvi = pred_ndvi - y_ndvi  # type: ignore[operator]
-            diff2_ndvi = (diff_ndvi * diff_ndvi) * m_nd
-            mask_sum_ndvi = m_nd.sum().clamp_min(0.0)
-
-            if mask_sum_ndvi > 0:
-                loss_ndvi = diff2_ndvi.sum() / mask_sum_ndvi
-                mae_ndvi = (diff_ndvi.abs() * m_nd).sum() / mask_sum_ndvi
-            else:
-                # No NDVI supervision in this batch (e.g., Irish-only). Use zero loss.
-                zero_nd = diff2_ndvi.sum() * 0.0
+            if pred_ndvi is None:
+                # No NDVI head under this configuration; treat as zero-loss.
+                zero_nd = (z.sum() * 0.0)
                 loss_ndvi = zero_nd
                 mae_ndvi = zero_nd
+            else:
+                diff_ndvi = pred_ndvi - y_ndvi  # type: ignore[operator]
+                diff2_ndvi = (diff_ndvi * diff_ndvi) * m_nd
+                mask_sum_ndvi = m_nd.sum().clamp_min(0.0)
+
+                if mask_sum_ndvi > 0:
+                    loss_ndvi = diff2_ndvi.sum() / mask_sum_ndvi
+                    mae_ndvi = (diff_ndvi.abs() * m_nd).sum() / mask_sum_ndvi
+                else:
+                    # No NDVI supervision in this batch (e.g., Irish-only). Use zero loss.
+                    zero_nd = diff2_ndvi.sum() * 0.0
+                    loss_ndvi = zero_nd
+                    mae_ndvi = zero_nd
             self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)

@@ -297,6 +297,10 @@ def train_single_split(
     model = BiomassRegressor(
         backbone_name=str(cfg["model"]["backbone"]),
         embedding_dim=int(cfg["model"]["embedding_dim"]),
+        head_type=str(cfg["model"]["head"].get("type", "mlp")),
+        fpn_dim=int(cfg["model"]["head"].get("fpn_dim", 256)),
+        fpn_num_levels=int(cfg["model"]["head"].get("fpn_num_levels", 3)),
+        fpn_patch_size=int(cfg["model"]["head"].get("fpn_patch_size", 16)),
         num_outputs=len(cfg["data"]["target_order"]),
         dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
         head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),
@@ -339,6 +343,7 @@ def train_single_split(
         weights_url=cfg["model"].get("weights_url", None),
         weights_path=cfg["model"].get("weights_path", None),
         freeze_backbone=bool(cfg["model"].get("freeze_backbone", True)),
+        backbone_weights_dtype=str(cfg["model"].get("backbone_weights_dtype", "fp32")),
         gradient_checkpointing=bool(cfg["model"].get("gradient_checkpointing", False)),
         learning_rate=float(cfg["optimizer"]["lr"]),
         weight_decay=float(cfg["optimizer"]["weight_decay"]),
