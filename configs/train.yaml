@@ -1,5 +1,5 @@
 seed: 42
-version: fpn-fp32-no-ndvi-epoch30
+version: fpn-256-rev
 data:
   root: data
   train_csv: train.csv
@@ -75,7 +75,12 @@ data:
       scale: [0.02, 0.1]
       ratio: [0.3, 3.3]
       value: random
-    # Feature-level manifold mixup on the shared bottleneck representation z
+    # Feature-level manifold mixup.
+    #
+    # - MLP/global heads: applied on the shared bottleneck representation z
+    # - FPN head        : applied on DINO patch tokens (B,N,C) (or stacked (B,L,N,C))
+    # - DPT head        : applied on DINO patch tokens; when model.head.dpt_readout=project,
+    #                    CLS+patch tokens are mixed together **regardless** of mix_cls_token.
     manifold_mixup:
       enabled: true
       prob: 1.0
@@ -85,6 +90,9 @@ data:
       #
       # When false (and model.head.use_cls_token=true), only patch features are mixed
       # and CLS stays unchanged.
+      #
+      # NOTE (DPT head): when model.head.type=dpt and model.head.dpt_readout=project,
+      # CLS is always mixed with patch tokens to keep the project-readout consistent.
       mix_cls_token: false
     cutmix:
       enabled: false
@@ -133,12 +141,25 @@ model:
   embedding_dim: 1280
   log_scale_targets: false
   head:
-    # Head architecture: mlp (legacy) or fpn (Phase A spatial head)
+    # Head architecture:
+    # - mlp (legacy global scalar head)
+    # - fpn (Phase A spatial pyramid head)
+    # - dpt (Dense Prediction Transformers-style head -> GAP -> MLP -> Linear)
     type: fpn
     # FPN settings (Phase A): spatial pyramid built from ViT patch tokens
     fpn_dim: 256
     fpn_num_levels: 3
     fpn_patch_size: 16
+    # When true (default), assign deeper backbone layers (larger indices) to *higher-resolution*
+    # FPN levels (less downsampling). Concretely: the group containing the largest layer indices
+    # becomes level 0 (no downsample), and the smallest-index group becomes the most downsampled level.
+    fpn_reverse_level_order: true
+    # DPT settings (dense prediction head):
+    # - readout supports only: ignore | project
+    # - project readout consumes CLS + patch tokens and therefore forces CLS+patch manifold mixup.
+    dpt_features: 256
+    dpt_patch_size: 16
+    dpt_readout: ignore
     hidden_dims: [1280]
     activation: relu
     dropout: 0.2
@@ -168,15 +189,23 @@ model:
     # - dinov3_vitl16     : 24 blocks -> valid indices [0, 23]
     # - dinov3_vith16plus : 32 blocks -> valid indices [0, 31]
     # - dinov3_vit7b16    : 40 blocks -> valid indices [0, 39]
-    # Example: use the last 4 blocks for dinov3_vith16plus.
-    # Last 8 blocks for dinov3_vith16plus (depth=32): indices [24..31]
-    indices: [24, 25, 26, 27, 28, 29, 30, 31]
+    # Provide either:
+    # - indices: explicit list (highest priority), OR
+    # - indices_by_backbone: map keyed by backbone name (avoids manual edits when switching backbones)
+    #
+    # Recommended DPT-style 4-layer hooks:
+    indices_by_backbone:
+      dinov3_vitl16: [5, 11, 17, 23]
+      dinov3_vith16plus: [24,25,26,27,28,29, 30, 31]
+      dinov3_vit7b16: [9, 19, 29, 39]
+    # Optional explicit override (set to a list to take precedence over indices_by_backbone)
+    indices: null
 
 mtl:
   enabled: true
   tasks:
     height: false
-    ndvi: false
+    ndvi: true
     ndvi_dense: false
     species: false
     state: false

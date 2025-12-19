@@ -280,7 +280,24 @@ def train_single_split(
         else {}
     )
     use_layerwise_heads = bool(backbone_layers_cfg.get("enabled", False))
+
+    # Layer indices can be provided either as:
+    #  - backbone_layers.indices (explicit list)
+    #  - backbone_layers.indices_by_backbone.<backbone_name> (map, avoids manual edits when switching backbones)
     backbone_layer_indices = backbone_layers_cfg.get("indices", None)
+    if (not backbone_layer_indices) and isinstance(backbone_layers_cfg.get("indices_by_backbone", None), dict):
+        try:
+            bb_name = str(cfg.get("model", {}).get("backbone", "")).strip()
+        except Exception:
+            bb_name = ""
+        indices_map = dict(backbone_layers_cfg.get("indices_by_backbone", {}))
+        if bb_name and bb_name in indices_map:
+            backbone_layer_indices = indices_map.get(bb_name, None)
+        else:
+            # Optional fallback: allow keys without the "dinov3_" prefix.
+            short = bb_name.replace("dinov3_", "") if bb_name else ""
+            if short and short in indices_map:
+                backbone_layer_indices = indices_map.get(short, None)
     # When true (default), use an independent bottleneck MLP for each selected layer.
     # When false, all layers share a single bottleneck (legacy behavior).
     use_separate_bottlenecks = bool(
@@ -301,6 +318,17 @@ def train_single_split(
         fpn_dim=int(cfg["model"]["head"].get("fpn_dim", 256)),
         fpn_num_levels=int(cfg["model"]["head"].get("fpn_num_levels", 3)),
         fpn_patch_size=int(cfg["model"]["head"].get("fpn_patch_size", 16)),
+        fpn_reverse_level_order=bool(
+            cfg["model"]["head"].get("fpn_reverse_level_order", True)
+        ),
+        dpt_features=int(cfg["model"]["head"].get("dpt_features", 256)),
+        dpt_patch_size=int(
+            cfg["model"]["head"].get(
+                "dpt_patch_size",
+                cfg["model"]["head"].get("fpn_patch_size", 16),
+            )
+        ),
+        dpt_readout=str(cfg["model"]["head"].get("dpt_readout", "ignore")),
         num_outputs=len(cfg["data"]["target_order"]),
         dropout=float(cfg["model"]["head"].get("dropout", 0.0)),
         head_hidden_dims=list(cfg["model"]["head"].get("hidden_dims", [512, 256])),

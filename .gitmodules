@@ -28,3 +28,6 @@
 [submodule "third_party/F-SAM"]
 	path = third_party/F-SAM
 	url = git@github.com:nblt/F-SAM.git
+[submodule "third_party/DPT"]
+	path = third_party/DPT
+	url = git@github.com:isl-org/DPT.git

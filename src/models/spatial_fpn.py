@@ -144,6 +144,16 @@ class FPNHeadConfig:
     num_outputs_ratio: int
     enable_ndvi: bool
     patch_size: int = 16
+    # When True (default), assign deeper backbone layers (larger indices) to *higher-resolution*
+    # FPN levels (less downsampling). Concretely, after grouping per-layer maps into K groups,
+    # we reverse the group order so that:
+    #   - deepest group -> level 0 (no downsample)
+    #   - shallowest group -> level K-1 (max downsample)
+    #
+    # When False, the legacy mapping is used:
+    #   - shallowest group -> level 0
+    #   - deepest group -> level K-1
+    reverse_level_order: bool = True
     # When True (default), require that (H//patch_size)*(W//patch_size) == N exactly.
     # This avoids silent grid mis-inference when patch_size or image_hw are wrong.
     strict_patch_grid: bool = True
@@ -171,6 +181,8 @@ class FPNScalarHead(nn.Module):
         self.use_separate_bottlenecks = bool(cfg.use_separate_bottlenecks)
         self.patch_size = int(max(1, cfg.patch_size))
         self.strict_patch_grid = bool(getattr(cfg, "strict_patch_grid", True))
+        # See FPNHeadConfig.reverse_level_order for semantics.
+        self.reverse_level_order = bool(getattr(cfg, "reverse_level_order", True))
 
         # Per-layer projection (separate_bottlenecks semantics).
         if self.use_separate_bottlenecks:
@@ -289,6 +301,10 @@ class FPNScalarHead(nn.Module):
             if not xs:
                 xs = [proj_maps[-1]]
             group_maps.append(torch.stack(xs, dim=0).mean(dim=0))
+
+        # Optional: reverse group order so deeper layers map to higher-resolution levels.
+        if self.reverse_level_order and len(group_maps) > 1:
+            group_maps = list(reversed(group_maps))
 
         # Downsample each group map to create C2/C3/... like inputs.
         # Level 0 keeps full resolution; level i downsamples by 2**i.
