@@ -14,6 +14,85 @@ class PredictionMixin:
     steps, including optional manifold mixup on backbone tokens/features.
     """
 
+    @staticmethod
+    def _tensor_meta(t: Tensor) -> str:
+        return f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}"
+
+    @staticmethod
+    def _list_tensor_shapes(xs: Optional[List[Tensor]]) -> str:
+        if xs is None:
+            return "None"
+        try:
+            return "[" + ", ".join(str(tuple(x.shape)) for x in xs) + "]"
+        except Exception:
+            return "<unavailable>"
+
+    @staticmethod
+    def _batch_target_shapes(batch: Dict[str, Tensor]) -> str:
+        keys = (
+            "y_reg3",
+            "reg3_mask",
+            "y_height",
+            "y_ndvi",
+            "ndvi_mask",
+            "y_biomass_5d_g",
+            "biomass_5d_mask",
+            "y_ratio",
+            "ratio_mask",
+        )
+        parts: List[str] = []
+        for k in keys:
+            v = batch.get(k, None)
+            if isinstance(v, torch.Tensor):
+                parts.append(f"{k}={tuple(v.shape)}")
+        return "{" + ", ".join(parts) + "}"
+
+    def _manifold_mixup_cfg_str(self) -> str:
+        mm = getattr(self, "_manifold_mixup", None)
+        if mm is None:
+            return "<none>"
+        return (
+            f"enabled={getattr(mm, 'enabled', None)}, "
+            f"prob={getattr(mm, 'prob', None)}, "
+            f"alpha={getattr(mm, 'alpha', None)}, "
+            f"mix_cls_token={getattr(mm, 'mix_cls_token', None)}"
+        )
+
+    def _raise_manifold_mixup_error(
+        self,
+        *,
+        context: str,
+        err: Exception,
+        batch: Dict[str, Tensor],
+        x: Optional[Tensor] = None,
+        pt_list: Optional[List[Tensor]] = None,
+        cls_list: Optional[List[Tensor]] = None,
+    ) -> None:
+        head_type = str(getattr(self, "_head_type", "mlp")).lower()
+        try:
+            layer_indices: object = list(getattr(self, "backbone_layer_indices", []))
+        except Exception:
+            layer_indices = "<unavailable>"
+        flags = (
+            f"use_layerwise_heads={bool(getattr(self, 'use_layerwise_heads', False))}, "
+            f"use_patch_reg3={bool(getattr(self, 'use_patch_reg3', False))}, "
+            f"use_cls_token={bool(getattr(self, 'use_cls_token', False))}, "
+            f"backbone_layer_indices={layer_indices}"
+        )
+        msg = (
+            "Manifold mixup failed. "
+            f"context={context!r}, head_type={head_type!r}, "
+            f"flags=({flags}), mixup_cfg=({self._manifold_mixup_cfg_str()}). "
+        )
+        if x is not None:
+            msg += f"x({self._tensor_meta(x)}). "
+        if pt_list is not None:
+            msg += f"pt_list_shapes={self._list_tensor_shapes(pt_list)}. "
+        if cls_list is not None:
+            msg += f"cls_list_shapes={self._list_tensor_shapes(cls_list)}. "
+        msg += f"batch_targets={self._batch_target_shapes(batch)}. original_error={err!r}"
+        raise RuntimeError(msg) from err
+
     def _predict_reg3_and_z(
         self,
         *,
@@ -71,10 +150,17 @@ class PredictionMixin:
                 ):
                     try:
                         pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
-                        pt_stack, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
+                        pt_stack, batch, _ = self._manifold_mixup.apply(
+                            pt_stack, batch, force=True
+                        )
                         pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="fpn/multilayer/patch_tokens",
+                            err=e,
+                            batch=batch,
+                            pt_list=pt_list,
+                        )
                 pt_in = pt_list
             else:
                 _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
@@ -85,9 +171,16 @@ class PredictionMixin:
                     and (not is_ndvi_only)
                 ):
                     try:
-                        pt_tokens, batch, _ = self._manifold_mixup.apply(pt_tokens, batch, force=True)
-                    except Exception:
-                        pass
+                        pt_tokens, batch, _ = self._manifold_mixup.apply(
+                            pt_tokens, batch, force=True
+                        )
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="fpn/singlelayer/patch_tokens",
+                            err=e,
+                            batch=batch,
+                            x=pt_tokens,
+                        )
                 pt_in = pt_tokens
 
             out_fpn = self.fpn_head(pt_in, image_hw=image_hw)  # type: ignore[attr-defined]
@@ -97,6 +190,79 @@ class PredictionMixin:
             ndvi_pred = out_fpn.get("ndvi", None)
             if pred_reg3 is None or z is None:
                 raise RuntimeError("FPN head did not return required outputs (reg3/z)")
+
+        elif head_type == "vitdet":
+            # ViTDet-style simple feature pyramid head:
+            # consume patch tokens (single-layer or multi-layer), optionally apply manifold mixup,
+            # then predict reg3/ratio/ndvi.
+            image_hw = (int(images.shape[-2]), int(images.shape[-1]))
+            pt_in: Any
+            if self.use_layerwise_heads and len(self.backbone_layer_indices) > 0:
+                try:
+                    _cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
+                        images, self.backbone_layer_indices
+                    )
+                except Exception as e:
+                    backbone_name = getattr(getattr(self, "hparams", None), "backbone_name", None)
+                    raise RuntimeError(
+                        "Failed to extract multi-layer patch tokens for ViTDet head. "
+                        f"Check model.backbone_layers.indices={self.backbone_layer_indices} "
+                        f"are valid for backbone={backbone_name!r}. Original error: {e}"
+                    ) from e
+                if not pt_list:
+                    raise RuntimeError(
+                        "Multi-layer token extraction returned an empty pt_list for ViTDet head. "
+                        f"indices={self.backbone_layer_indices}"
+                    )
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                    and pt_list
+                ):
+                    try:
+                        pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
+                        pt_stack, batch, _ = self._manifold_mixup.apply(
+                            pt_stack, batch, force=True
+                        )
+                        pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="vitdet/multilayer/patch_tokens",
+                            err=e,
+                            batch=batch,
+                            pt_list=pt_list,
+                        )
+                pt_in = pt_list
+            else:
+                _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                ):
+                    try:
+                        pt_tokens, batch, _ = self._manifold_mixup.apply(
+                            pt_tokens, batch, force=True
+                        )
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="vitdet/singlelayer/patch_tokens",
+                            err=e,
+                            batch=batch,
+                            x=pt_tokens,
+                        )
+                pt_in = pt_tokens
+
+            out_vitdet = self.vitdet_head(pt_in, image_hw=image_hw)  # type: ignore[attr-defined]
+            pred_reg3 = out_vitdet.get("reg3", None)  # type: ignore[assignment]
+            z = out_vitdet.get("z", None)  # type: ignore[assignment]
+            ratio_logits_pred = out_vitdet.get("ratio", None)
+            ndvi_pred = out_vitdet.get("ndvi", None)
+            if pred_reg3 is None or z is None:
+                raise RuntimeError("ViTDet head did not return required outputs (reg3/z)")
 
         elif head_type == "dpt":
             # DPT-style dense prediction head: consume multi-layer CLS+patch tokens (recommended),
@@ -144,15 +310,25 @@ class PredictionMixin:
                                 ],
                                 dim=1,
                             )  # (B, L, N+1, C)
-                            tok_stack, batch, _ = self._manifold_mixup.apply(tok_stack, batch, force=True)
+                            tok_stack, batch, _ = self._manifold_mixup.apply(
+                                tok_stack, batch, force=True
+                            )
                             cls_list = [tok_stack[:, i, 0] for i in range(tok_stack.shape[1])]
                             pt_list = [tok_stack[:, i, 1:] for i in range(tok_stack.shape[1])]
                         else:
                             pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
-                            pt_stack, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
+                            pt_stack, batch, _ = self._manifold_mixup.apply(
+                                pt_stack, batch, force=True
+                            )
                             pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context=f"dpt/multilayer/tokens (readout={dpt_readout_mode})",
+                            err=e,
+                            batch=batch,
+                            pt_list=pt_list,
+                            cls_list=cls_list,
+                        )
                 out_dpt = self.dpt_head(cls_list, pt_list, image_hw=image_hw)  # type: ignore[call-arg]
             else:
                 cls_tok, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
@@ -164,14 +340,27 @@ class PredictionMixin:
                 ):
                     try:
                         if dpt_readout_mode == "project":
-                            tok = torch.cat([cls_tok.unsqueeze(1), pt_tokens], dim=1)  # (B, N+1, C)
-                            tok, batch, _ = self._manifold_mixup.apply(tok, batch, force=True)
+                            tok = torch.cat(
+                                [cls_tok.unsqueeze(1), pt_tokens], dim=1
+                            )  # (B, N+1, C)
+                            tok, batch, _ = self._manifold_mixup.apply(
+                                tok, batch, force=True
+                            )
                             cls_tok = tok[:, 0]
                             pt_tokens = tok[:, 1:]
                         else:
-                            pt_tokens, batch, _ = self._manifold_mixup.apply(pt_tokens, batch, force=True)
-                    except Exception:
-                        pass
+                            pt_tokens, batch, _ = self._manifold_mixup.apply(
+                                pt_tokens, batch, force=True
+                            )
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context=f"dpt/singlelayer/tokens (readout={dpt_readout_mode})",
+                            err=e,
+                            batch=batch,
+                            x=pt_tokens,
+                            pt_list=[pt_tokens],
+                            cls_list=[cls_tok],
+                        )
                 out_dpt = self.dpt_head(cls_tok, pt_tokens, image_hw=image_hw)  # type: ignore[call-arg]
 
             pred_reg3 = out_dpt.get("reg3", None)  # type: ignore[assignment]
@@ -201,13 +390,17 @@ class PredictionMixin:
                 if apply_mm and self._manifold_mixup is not None:
                     try:
                         # If requested, keep CLS tokens intact and mix only patch features.
-                        if self.use_cls_token and (not bool(getattr(self._manifold_mixup, "mix_cls_token", True))):
+                        if self.use_cls_token and (
+                            not bool(getattr(self._manifold_mixup, "mix_cls_token", True))
+                        ):
                             # (B, L, C): mix along batch dim, preserve layer structure.
                             pm_stack = torch.stack(patch_mean_list, dim=1)
                             pm_stack, batch, _ = self._manifold_mixup.apply(
                                 pm_stack, batch, force=True
                             )
-                            patch_mean_list = [pm_stack[:, i] for i in range(pm_stack.shape[1])]
+                            patch_mean_list = [
+                                pm_stack[:, i] for i in range(pm_stack.shape[1])
+                            ]
                             feats_list = [
                                 torch.cat([cls_l, pm_l], dim=-1)
                                 for cls_l, pm_l in zip(cls_list, patch_mean_list)
@@ -223,9 +416,17 @@ class PredictionMixin:
                             feats_stack, batch, _ = self._manifold_mixup.apply(
                                 feats_stack, batch, force=True
                             )
-                            feats_list = [feats_stack[:, i] for i in range(feats_stack.shape[1])]
-                    except Exception:
-                        feats_list = []
+                            feats_list = [
+                                feats_stack[:, i] for i in range(feats_stack.shape[1])
+                            ]
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="mlp/multilayer/global_features",
+                            err=e,
+                            batch=batch,
+                            cls_list=cls_list,
+                            pt_list=pt_list,
+                        )
 
                 if not feats_list:
                     for cls_l, pm_l in zip(cls_list, patch_mean_list):
@@ -244,10 +445,18 @@ class PredictionMixin:
                 ):
                     try:
                         pt_stack = torch.stack(pt_list, dim=1)
-                        pt_stack, batch, _ = self._manifold_mixup.apply(pt_stack, batch, force=True)
+                        pt_stack, batch, _ = self._manifold_mixup.apply(
+                            pt_stack, batch, force=True
+                        )
                         pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="mlp/multilayer/patch_tokens",
+                            err=e,
+                            batch=batch,
+                            pt_list=pt_list,
+                            cls_list=cls_list,
+                        )
                 pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(images=None, cls_list=cls_list, pt_list=pt_list)
 
         else:
@@ -260,9 +469,16 @@ class PredictionMixin:
                     and (not is_ndvi_only)
                 ):
                     try:
-                        pt_tokens, batch, _ = self._manifold_mixup.apply(pt_tokens, batch, force=True)
-                    except Exception:
-                        pass
+                        pt_tokens, batch, _ = self._manifold_mixup.apply(
+                            pt_tokens, batch, force=True
+                        )
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="mlp/singlelayer/patch_tokens",
+                            err=e,
+                            batch=batch,
+                            x=pt_tokens,
+                        )
                 pred_reg3, z = self._compute_reg3_from_images(images=None, pt_tokens=pt_tokens)
             else:
                 apply_mm = bool(
@@ -281,9 +497,16 @@ class PredictionMixin:
                     cls_tok, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
                     patch_mean = pt_tokens.mean(dim=1)
                     try:
-                        patch_mean, batch, _ = self._manifold_mixup.apply(patch_mean, batch, force=True)
-                    except Exception:
-                        pass
+                        patch_mean, batch, _ = self._manifold_mixup.apply(
+                            patch_mean, batch, force=True
+                        )
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="mlp/singlelayer/patch_mean (mix_cls_token=false)",
+                            err=e,
+                            batch=batch,
+                            x=patch_mean,
+                        )
                     features = torch.cat([cls_tok, patch_mean], dim=-1)
                 else:
                     if self.use_cls_token:
@@ -293,9 +516,16 @@ class PredictionMixin:
                         features = pt_tokens.mean(dim=1)
                     if apply_mm and self._manifold_mixup is not None:
                         try:
-                            features, batch, _ = self._manifold_mixup.apply(features, batch, force=True)
-                        except Exception:
-                            pass
+                            features, batch, _ = self._manifold_mixup.apply(
+                                features, batch, force=True
+                            )
+                        except Exception as e:
+                            self._raise_manifold_mixup_error(
+                                context="mlp/singlelayer/global_features",
+                                err=e,
+                                batch=batch,
+                                x=features,
+                            )
                 z = self.shared_bottleneck(features)
                 pred_reg3 = self._forward_reg3_logits(z)
 

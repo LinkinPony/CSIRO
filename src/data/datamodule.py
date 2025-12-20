@@ -75,7 +75,9 @@ class PastureImageDataset(Dataset):
             image = self.transform(image)
         # main regression targets (one or more components depending on config.target_order)
         y_reg3_g = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
-        reg3_mask = torch.ones_like(y_reg3_g, dtype=torch.float32)
+        # Support missing reg3 targets (NaN/inf) via mask + safe numeric fill.
+        reg3_mask = torch.isfinite(y_reg3_g).to(dtype=torch.float32)
+        y_reg3_g = torch.nan_to_num(y_reg3_g, nan=0.0, posinf=0.0, neginf=0.0)
         # Convert grams to grams per square meter if a valid area is provided
         y_reg3_g_m2 = y_reg3_g / float(self.area_m2) if self.area_m2 > 0.0 else y_reg3_g
         
@@ -90,6 +92,9 @@ class PastureImageDataset(Dataset):
             y_reg3 = (y_reg3_norm - self._reg3_mean) / safe_std
         else:
             y_reg3 = y_reg3_norm
+        # Ensure masked-out dimensions cannot carry NaN/inf into losses/mixup.
+        y_reg3 = torch.nan_to_num(y_reg3, nan=0.0, posinf=0.0, neginf=0.0)
+        y_reg3 = torch.where(reg3_mask > 0.0, y_reg3, torch.zeros_like(y_reg3))
         # --- Canonical biomass components in grams (CSIRO only) ---
         # Order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
         try:
@@ -105,31 +110,56 @@ class PastureImageDataset(Dataset):
             dtype=torch.float32,
         )
         biomass_5d_mask = torch.isfinite(y_5d_g).to(dtype=torch.float32)
+        # Replace missing values with zeros; masks carry supervision.
+        y_5d_g = torch.nan_to_num(y_5d_g, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Ratio targets: proportions of (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) over Dry_Total_g.
-        # Only valid for CSIRO samples where all components are present and Dry_Total_g > 0.
+        # Only valid for CSIRO samples where *all* components are present and Dry_Total_g > 0.
         y_ratio = torch.zeros(3, dtype=torch.float32)
         ratio_mask = torch.zeros(1, dtype=torch.float32)
-        if torch.isfinite(y_5d_g[-1]) and y_5d_g[-1] > 0:
-            total = y_5d_g[-1]
-            clover = y_5d_g[0] if torch.isfinite(y_5d_g[0]) else 0.0
-            dead = y_5d_g[1] if torch.isfinite(y_5d_g[1]) else 0.0
-            green = y_5d_g[2] if torch.isfinite(y_5d_g[2]) else 0.0
-            y_ratio[0] = clover / total
-            y_ratio[1] = dead / total
-            y_ratio[2] = green / total
+        try:
+            has_ratio = bool(
+                (biomass_5d_mask[0] > 0.0).item()
+                and (biomass_5d_mask[1] > 0.0).item()
+                and (biomass_5d_mask[2] > 0.0).item()
+                and (biomass_5d_mask[4] > 0.0).item()
+                and (y_5d_g[4] > 0.0).item()
+            )
+        except Exception:
+            has_ratio = False
+        if has_ratio:
+            total = y_5d_g[4].clamp(min=1e-6)
+            y_ratio[0] = y_5d_g[0] / total
+            y_ratio[1] = y_5d_g[1] / total
+            y_ratio[2] = y_5d_g[2] / total
             ratio_mask[...] = 1.0
+        y_ratio = torch.nan_to_num(y_ratio, nan=0.0, posinf=0.0, neginf=0.0)
+        y_ratio = torch.where(ratio_mask > 0.0, y_ratio, torch.zeros_like(y_ratio))
 
         # auxiliary regression target: height
-        y_height = torch.tensor([float(row.get("Height_Ave_cm", 0.0))], dtype=torch.float32)
+        try:
+            h_val = float(row.get("Height_Ave_cm", 0.0))
+        except Exception:
+            h_val = 0.0
+        if not (h_val == h_val):
+            h_val = 0.0
+        y_height = torch.tensor([h_val], dtype=torch.float32)
         # auxiliary regression target: Pre_GSHH_NDVI
-        y_ndvi_raw = torch.tensor([float(row.get("Pre_GSHH_NDVI", 0.0))], dtype=torch.float32)
+        try:
+            ndvi_val = float(row.get("Pre_GSHH_NDVI", 0.0))
+        except Exception:
+            ndvi_val = 0.0
+        ndvi_mask = torch.tensor([1.0 if (ndvi_val == ndvi_val) else 0.0], dtype=torch.float32)
+        if not (ndvi_val == ndvi_val):
+            ndvi_val = 0.0
+        y_ndvi_raw = torch.tensor([ndvi_val], dtype=torch.float32)
         if self._ndvi_mean is not None and self._ndvi_std is not None:
             ndvi_std = max(1e-8, float(self._ndvi_std))
             y_ndvi = (y_ndvi_raw - float(self._ndvi_mean)) / ndvi_std
         else:
             y_ndvi = y_ndvi_raw
-        ndvi_mask = torch.ones((1,), dtype=torch.float32)
+        y_ndvi = torch.nan_to_num(y_ndvi, nan=0.0, posinf=0.0, neginf=0.0)
+        y_ndvi = torch.where(ndvi_mask > 0.0, y_ndvi, torch.zeros_like(y_ndvi))
         # auxiliary classification target: species index
         species = str(row.get("Species", ""))
         if self.species_to_idx and species in self.species_to_idx:

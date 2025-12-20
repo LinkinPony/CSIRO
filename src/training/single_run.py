@@ -315,6 +315,14 @@ def train_single_split(
         backbone_name=str(cfg["model"]["backbone"]),
         embedding_dim=int(cfg["model"]["embedding_dim"]),
         head_type=str(cfg["model"]["head"].get("type", "mlp")),
+        vitdet_dim=int(cfg["model"]["head"].get("vitdet_dim", 256)),
+        vitdet_patch_size=int(
+            cfg["model"]["head"].get(
+                "vitdet_patch_size",
+                cfg["model"]["head"].get("fpn_patch_size", 16),
+            )
+        ),
+        vitdet_scale_factors=list(cfg["model"]["head"].get("vitdet_scale_factors", [2.0, 1.0, 0.5])),
         fpn_dim=int(cfg["model"]["head"].get("fpn_dim", 256)),
         fpn_num_levels=int(cfg["model"]["head"].get("fpn_num_levels", 3)),
         fpn_patch_size=int(cfg["model"]["head"].get("fpn_patch_size", 16)),

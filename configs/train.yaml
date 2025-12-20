@@ -1,5 +1,5 @@
 seed: 42
-version: fpn-256-rev-full-res
+version: vitdet-1280-last-layer
 data:
   root: data
   train_csv: train.csv
@@ -9,8 +9,8 @@ data:
     csiro:
       width_m: 0.7
       length_m: 0.3
-  image_size: [2000, 1000]
-  batch_size: 4
+  image_size: [960, 480]
+  batch_size: 16
   val_batch_size: 1
   num_workers: 20
   prefetch_factor: 4
@@ -145,7 +145,15 @@ model:
     # - mlp (legacy global scalar head)
     # - fpn (Phase A spatial pyramid head)
     # - dpt (Dense Prediction Transformers-style head -> GAP -> MLP -> Linear)
-    type: fpn
+    # - vitdet (ViTDet SimpleFeaturePyramid-style head from *single-layer* patch tokens;
+    #           when model.backbone_layers.enabled=true, builds one independent head per selected layer
+    #           and averages the final outputs)
+    type: vitdet
+    # ViTDet settings (SimpleFeaturePyramid-style):
+    vitdet_dim: 1280
+    vitdet_patch_size: 16
+    # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
+    vitdet_scale_factors: [2.0, 1.0, 0.5]
     # FPN settings (Phase A): spatial pyramid built from ViT patch tokens
     fpn_dim: 256
     fpn_num_levels: 3
@@ -196,7 +204,7 @@ model:
     # Recommended DPT-style 4-layer hooks:
     indices_by_backbone:
       dinov3_vitl16: [5, 11, 17, 23]
-      dinov3_vith16plus: [24,25,26,27,28,29, 30, 31]
+      dinov3_vith16plus: [31]
       dinov3_vit7b16: [9, 19, 29, 39]
     # Optional explicit override (set to a list to take precedence over indices_by_backbone)
     indices: null
@@ -274,7 +282,7 @@ trainer:
   limit_val_batches: 1
   log_every_n_steps: 1
   resume_from: null
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 1
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   swa:

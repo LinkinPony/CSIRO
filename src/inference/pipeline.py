@@ -42,6 +42,7 @@ from src.inference.predict import (
     predict_from_features,
     predict_main_and_ratio_dpt,
     predict_main_and_ratio_fpn,
+    predict_main_and_ratio_vitdet,
     predict_main_and_ratio_global_multilayer,
     predict_main_and_ratio_patch_mode,
 )
@@ -51,6 +52,7 @@ from src.models.dpt_scalar_head import DPTHeadConfig, DPTScalarHead
 from src.models.head_builder import MultiLayerHeadExport, build_head_layer
 from src.models.peft_integration import _import_peft
 from src.models.spatial_fpn import FPNHeadConfig, FPNScalarHead
+from src.models.vitdet_head import ViTDetHeadConfig, ViTDetMultiLayerScalarHead, ViTDetScalarHead
 
 
 def load_config(project_dir: str) -> Dict:
@@ -477,6 +479,43 @@ def infer_components_5d_for_model(
                     reverse_level_order=fpn_reverse_level_order_meta,
                 )
             )
+        elif head_type_meta == "vitdet":
+            vitdet_dim_meta = int(meta.get("vitdet_dim", first_meta.get("vitdet_dim", int(cfg["model"]["head"].get("vitdet_dim", 256)))))
+            vitdet_patch_size_meta = int(
+                meta.get(
+                    "vitdet_patch_size",
+                    first_meta.get(
+                        "vitdet_patch_size",
+                        int(cfg["model"]["head"].get("vitdet_patch_size", cfg["model"]["head"].get("fpn_patch_size", 16))),
+                    ),
+                )
+            )
+            # Default scale_factors: [2.0, 1.0, 0.5] (repo default; less memory than ViTDet's 4.0)
+            sf_default = list(cfg["model"]["head"].get("vitdet_scale_factors", [2.0, 1.0, 0.5]))
+            vitdet_scale_factors_meta = list(
+                meta.get(
+                    "vitdet_scale_factors",
+                    first_meta.get("vitdet_scale_factors", sf_default),
+                )
+            )
+            enable_ndvi_meta = bool(meta.get("enable_ndvi", False))
+            num_layers_eff = max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1
+            vitdet_cfg = ViTDetHeadConfig(
+                embedding_dim=head_embedding_dim,
+                vitdet_dim=vitdet_dim_meta,
+                scale_factors=vitdet_scale_factors_meta,
+                patch_size=vitdet_patch_size_meta,
+                num_outputs_main=head_num_main,
+                num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
+                enable_ndvi=enable_ndvi_meta,
+                head_hidden_dims=head_hidden_dims,
+                head_activation=head_activation,
+                dropout=head_dropout,
+            )
+            if use_layerwise_heads_head:
+                head_module = ViTDetMultiLayerScalarHead(vitdet_cfg, num_layers=num_layers_eff)  # type: ignore[assignment]
+            else:
+                head_module = ViTDetScalarHead(vitdet_cfg)  # type: ignore[assignment]
         elif head_type_meta == "dpt":
             dpt_features_meta = int(meta.get("dpt_features", first_meta.get("dpt_features", int(cfg["model"]["head"].get("dpt_features", 256)))))
             dpt_patch_size_meta = int(meta.get("dpt_patch_size", first_meta.get("dpt_patch_size", int(cfg["model"]["head"].get("dpt_patch_size", cfg["model"]["head"].get("fpn_patch_size", 16))))))
@@ -536,6 +575,22 @@ def infer_components_5d_for_model(
         # --- Run inference for this head ---
         if head_type_meta == "fpn":
             rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_fpn(
+                backbone=backbone,
+                head=head_module,
+                dataset_root=dataset_root,
+                image_paths=image_paths,
+                image_size=image_size,
+                mean=mean,
+                std=std,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                head_num_main=head_num_main,
+                head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                use_layerwise_heads=use_layerwise_heads_head,
+                layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+            )
+        elif head_type_meta == "vitdet":
+            rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_vitdet(
                 backbone=backbone,
                 head=head_module,
                 dataset_root=dataset_root,

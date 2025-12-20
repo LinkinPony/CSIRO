@@ -500,6 +500,89 @@ def predict_main_and_ratio_fpn(
     return rels, preds_main, preds_ratio
 
 
+def predict_main_and_ratio_vitdet(
+    backbone: nn.Module,
+    head: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: Tuple[int, int],
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+    head_num_main: int,
+    head_num_ratio: int,
+    *,
+    use_layerwise_heads: bool,
+    layer_indices: Optional[List[int]] = None,
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+    """
+    ViTDet-head inference (SimpleFeaturePyramid-style scalar head).
+    """
+    mp_devs = mp_get_devices_from_backbone(backbone) if isinstance(backbone, nn.Module) else None
+    device0 = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device1 = mp_devs[1] if mp_devs is not None else device0
+    device = device1
+
+    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    feature_extractor = DinoV3FeatureExtractor(backbone)
+    feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
+    head = head.eval().to(device1)
+    head_dtype = module_param_dtype(head, default=torch.float32)
+
+    rels: List[str] = []
+    preds_main_list: List[torch.Tensor] = []
+    preds_ratio_list: List[torch.Tensor] = []
+
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device0, non_blocking=True)
+            H = int(images.shape[-2])
+            W = int(images.shape[-1])
+
+            if use_layerwise_heads and layer_indices is not None and len(layer_indices) > 0:
+                _cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
+                pt_list = [pt.to(device1, non_blocking=True, dtype=head_dtype) for pt in pt_list]
+                out = head(pt_list, image_hw=(H, W))  # type: ignore[call-arg]
+            else:
+                _cls, pt = feature_extractor.forward_cls_and_tokens(images)
+                pt = pt.to(device1, non_blocking=True, dtype=head_dtype)
+                out = head(pt, image_hw=(H, W))  # type: ignore[call-arg]
+
+            if not isinstance(out, dict):
+                raise RuntimeError("ViTDet head forward must return a dict")
+            reg3 = out.get("reg3", None)
+            ratio = out.get("ratio", None)
+            if reg3 is None:
+                raise RuntimeError("ViTDet head did not return 'reg3'")
+            preds_main_list.append(reg3.detach().cpu().float())
+            if head_num_ratio > 0 and ratio is not None:
+                preds_ratio_list.append(ratio.detach().cpu().float())
+
+            rels.extend(list(rel_paths))
+
+    preds_main = (
+        torch.cat(preds_main_list, dim=0)
+        if preds_main_list
+        else torch.empty((0, head_num_main), dtype=torch.float32)
+    )
+    preds_ratio: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_list:
+        preds_ratio = torch.cat(preds_ratio_list, dim=0)
+    else:
+        preds_ratio = None
+    return rels, preds_main, preds_ratio
+
+
 def predict_main_and_ratio_dpt(
     backbone: nn.Module,
     head: nn.Module,

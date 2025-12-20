@@ -255,6 +255,33 @@ class RegressorForwardMixin:
             pred_reg3_logits = out_dict["reg3"]  # type: ignore[assignment]
             if pred_reg3_logits is None:
                 raise RuntimeError("FPN head did not return reg3 logits")
+        elif head_type == "vitdet":
+            image_hw = (int(images.shape[-2]), int(images.shape[-1]))
+            if self.use_layerwise_heads and len(self.backbone_layer_indices) > 0:
+                try:
+                    _, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(  # type: ignore[misc]
+                        images, self.backbone_layer_indices
+                    )
+                except Exception as e:
+                    backbone_name = getattr(getattr(self, "hparams", None), "backbone_name", None)
+                    raise RuntimeError(
+                        "Failed to extract multi-layer patch tokens for ViTDet head in forward(). "
+                        f"Check model.backbone_layers.indices={self.backbone_layer_indices} "
+                        f"are valid for backbone={backbone_name!r}. Original error: {e}"
+                    ) from e
+                if not pt_list:
+                    raise RuntimeError(
+                        "Multi-layer token extraction returned an empty pt_list for ViTDet head in forward(). "
+                        f"indices={self.backbone_layer_indices}"
+                    )
+                pt_in: Any = pt_list
+            else:
+                _, pt = self.feature_extractor.forward_cls_and_tokens(images)
+                pt_in = pt
+            out_dict = self.vitdet_head(pt_in, image_hw=image_hw)  # type: ignore[attr-defined]
+            pred_reg3_logits = out_dict.get("reg3", None)  # type: ignore[assignment]
+            if pred_reg3_logits is None:
+                raise RuntimeError("ViTDet head did not return reg3 logits")
         elif head_type == "dpt":
             image_hw = (int(images.shape[-2]), int(images.shape[-1]))
             if self.use_layerwise_heads and len(self.backbone_layer_indices) > 0:

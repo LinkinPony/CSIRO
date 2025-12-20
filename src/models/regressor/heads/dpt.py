@@ -24,6 +24,7 @@ def init_dpt_head(
     """
     # Ensure mutually-exclusive head modules exist.
     model.fpn_head = None  # type: ignore[assignment]
+    model.vitdet_head = None  # type: ignore[assignment]
 
     # Placeholders for legacy attributes referenced elsewhere (export, etc.)
     model.shared_bottleneck = None  # type: ignore[assignment]

@@ -30,7 +30,7 @@ class LossesMixin:
             return {"loss": zero}
 
         y_ndvi_only: Tensor = batch["y_ndvi"]  # (B,1)
-        if head_type in ("fpn", "dpt"):
+        if head_type in ("fpn", "dpt", "vitdet"):
             if ndvi_pred_from_head is None:
                 zero = (z.sum() * 0.0)
                 self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
@@ -74,10 +74,11 @@ class LossesMixin:
         Full supervised batch (reg3 + optional ratio/5D + optional aux tasks).
         """
         # y_reg3 provided by dataset is already in normalized domain (z-score on g/m^2 when enabled)
-        y_reg3: Tensor = batch["y_reg3"]  # (B, num_outputs)
+        y_reg3_raw: Tensor = batch["y_reg3"]  # (B, num_outputs)
+        y_reg3: Tensor = torch.nan_to_num(y_reg3_raw, nan=0.0, posinf=0.0, neginf=0.0)
         reg3_mask: Optional[Tensor] = batch.get("reg3_mask", None)
         y_height: Tensor = batch["y_height"]  # (B,1)
-        y_ndvi: Tensor = batch["y_ndvi"]  # (B,1)
+        y_ndvi: Tensor = torch.nan_to_num(batch["y_ndvi"], nan=0.0, posinf=0.0, neginf=0.0)  # (B,1)
         y_species: Tensor = batch["y_species"]  # (B,)
         y_state: Tensor = batch["y_state"]  # (B,)
 
@@ -89,15 +90,19 @@ class LossesMixin:
             mask = reg3_mask.to(device=y_reg3.device, dtype=y_reg3.dtype)
         else:
             mask = torch.ones_like(y_reg3, dtype=y_reg3.dtype, device=y_reg3.device)
+        # Robustness: NaN/inf targets should never leak into the loss via `NaN * 0 == NaN`.
+        finite_reg3 = torch.isfinite(y_reg3_raw).to(device=y_reg3.device, dtype=mask.dtype)
+        mask = mask * finite_reg3
         diff_reg3 = pred_reg3 - y_reg3
-        diff2_reg3 = (diff_reg3 * diff_reg3) * mask
+        diff_reg3 = torch.where(mask > 0.0, diff_reg3, torch.zeros_like(diff_reg3))
+        diff2_reg3 = diff_reg3 * diff_reg3
         mask_sum_reg3 = mask.sum().clamp_min(1.0)
         loss_reg3_mse = diff2_reg3.sum() / mask_sum_reg3
 
         # Always log base reg3 metrics
         self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
-        mae_reg3 = (diff_reg3.abs() * mask).sum() / mask_sum_reg3
+        mae_reg3 = diff_reg3.abs().sum() / mask_sum_reg3
         self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
         with torch.no_grad():
             per_dim_den = mask.sum(dim=0).clamp_min(1.0)
@@ -111,7 +116,7 @@ class LossesMixin:
             y_ratio: Optional[Tensor] = batch.get("y_ratio", None)  # (B,3)
             ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
             if y_ratio is not None and ratio_mask is not None:
-                if head_type in ("fpn", "dpt"):
+                if head_type in ("fpn", "dpt", "vitdet"):
                     ratio_logits = ratio_logits_pred
                 elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
                     logits_per_layer: List[Tensor] = []
@@ -122,13 +127,25 @@ class LossesMixin:
                     ratio_logits = self.ratio_head(z)  # type: ignore[operator]
                 if ratio_logits is not None:
                     p_pred = F.softmax(ratio_logits, dim=-1)
-                    p_true = y_ratio.clamp_min(0.0)
+                    y_ratio_raw = y_ratio
+                    y_ratio_safe = torch.nan_to_num(
+                        y_ratio_raw, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    m = ratio_mask.to(device=p_pred.device, dtype=p_pred.dtype)
+                    if m.dim() == 1:
+                        m = m.view(-1, 1)
+                    finite_ratio = torch.isfinite(y_ratio_raw).all(dim=-1, keepdim=True).to(
+                        device=m.device, dtype=m.dtype
+                    )
+                    m = m * finite_ratio
+
+                    p_true = y_ratio_safe.clamp_min(0.0)
                     denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                     p_true = p_true / denom
                     diff_ratio = p_pred - p_true
                     mse_per_sample = (diff_ratio * diff_ratio).sum(dim=-1, keepdim=True)  # (B,1)
-                    m = ratio_mask.to(device=mse_per_sample.device, dtype=mse_per_sample.dtype)
-                    num = (mse_per_sample * m).sum()
+                    mse_per_sample = torch.where(m > 0.0, mse_per_sample, torch.zeros_like(mse_per_sample))
+                    num = mse_per_sample.sum()
                     den = m.sum().clamp_min(1.0)
                     loss_ratio_mse = (num / den)
                     self.log(
@@ -147,7 +164,7 @@ class LossesMixin:
         metrics_targets_5d: Optional[Tensor] = None
         if self.enable_5d_loss and y_5d_g is not None and mask_5d is not None and self.enable_ratio_head:
             pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
-            if head_type in ("fpn", "dpt"):
+            if head_type in ("fpn", "dpt", "vitdet"):
                 ratio_logits = ratio_logits_pred
             elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
                 logits_per_layer_5d: List[Tensor] = []
@@ -175,9 +192,11 @@ class LossesMixin:
             pred_5d_gm2 = torch.stack([clover_pred, dead_pred, green_pred, gdm_pred, total_pred], dim=-1)
 
             metrics_preds_5d = pred_5d_gm2 * float(self._area_m2)
-            metrics_targets_5d = y_5d_g.to(device=metrics_preds_5d.device, dtype=metrics_preds_5d.dtype)
+            y_5d_g_raw = y_5d_g
+            y_5d_g_safe = torch.nan_to_num(y_5d_g_raw, nan=0.0, posinf=0.0, neginf=0.0)
+            metrics_targets_5d = y_5d_g_safe.to(device=metrics_preds_5d.device, dtype=metrics_preds_5d.dtype)
 
-            y_5d_gm2 = y_5d_g.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype) / float(self._area_m2)
+            y_5d_gm2 = y_5d_g_safe.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype) / float(self._area_m2)
 
             pred_5d_input = pred_5d_gm2
             target_5d_input = y_5d_gm2
@@ -199,13 +218,18 @@ class LossesMixin:
 
             w = self.biomass_5d_weights.to(device=pred_5d.device, dtype=pred_5d.dtype)  # (5,)
             m5 = mask_5d.to(device=pred_5d.device, dtype=pred_5d.dtype)
-            diff_5d = (pred_5d - target_5d) * m5
+            finite_5d = torch.isfinite(y_5d_g_raw.to(device=pred_5d.device, dtype=pred_5d.dtype))
+            m5 = m5 * finite_5d.to(dtype=m5.dtype)
+            target_5d = torch.nan_to_num(target_5d, nan=0.0, posinf=0.0, neginf=0.0)
+            diff_5d = pred_5d - target_5d
+            diff_5d = torch.where(m5 > 0.0, diff_5d, torch.zeros_like(diff_5d))
             diff2_5d = diff_5d * diff_5d
-            per_dim_den = m5.sum(dim=0).clamp_min(1.0)
+            per_dim_den_raw = m5.sum(dim=0)
+            per_dim_den = per_dim_den_raw.clamp_min(1.0)
             mse_per_dim = diff2_5d.sum(dim=0) / per_dim_den  # (5,)
-            valid_weight = w * (per_dim_den > 0).to(dtype=w.dtype)
+            valid_weight = w * (per_dim_den_raw > 0).to(dtype=w.dtype)
             total_w = valid_weight.sum().clamp_min(1e-8)
-            loss_5d = (w * mse_per_dim).sum() / total_w
+            loss_5d = (valid_weight * mse_per_dim).sum() / total_w
 
             names_5d = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
             for i, name in enumerate(names_5d):
@@ -265,7 +289,7 @@ class LossesMixin:
         pred_ndvi = None
         logits_species = None
         logits_state = None
-        if head_type in ("fpn", "dpt"):
+        if head_type in ("fpn", "dpt", "vitdet"):
             pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
             pred_ndvi = ndvi_pred_from_head if self.enable_ndvi else None
             logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
@@ -324,14 +348,18 @@ class LossesMixin:
                 loss_ndvi = zero_nd
                 mae_ndvi = zero_nd
             else:
+                # Robustness: avoid NaN propagation when ndvi_mask=0 and y_ndvi is NaN/inf.
+                finite_nd = torch.isfinite(y_ndvi).to(device=m_nd.device, dtype=m_nd.dtype)  # type: ignore[arg-type]
+                m_nd = m_nd * finite_nd  # type: ignore[operator]
                 diff_ndvi = pred_ndvi - y_ndvi  # type: ignore[operator]
-                diff2_ndvi = (diff_ndvi * diff_ndvi) * m_nd
+                diff_ndvi = torch.where(m_nd > 0.0, diff_ndvi, torch.zeros_like(diff_ndvi))  # type: ignore[arg-type]
+                diff2_ndvi = diff_ndvi * diff_ndvi
                 mask_sum_ndvi = m_nd.sum().clamp_min(0.0)
                 if mask_sum_ndvi > 0:
                     loss_ndvi = diff2_ndvi.sum() / mask_sum_ndvi
-                    mae_ndvi = (diff_ndvi.abs() * m_nd).sum() / mask_sum_ndvi
+                    mae_ndvi = diff_ndvi.abs().sum() / mask_sum_ndvi
                 else:
-                    zero_nd = diff2_ndvi.sum() * 0.0
+                    zero_nd = (z.sum() * 0.0)
                     loss_ndvi = zero_nd
                     mae_ndvi = zero_nd
             self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
@@ -357,8 +385,8 @@ class LossesMixin:
 
         total_loss = self._uw_sum(named_losses)
 
-        mae = F.l1_loss(pred_reg3, y_reg3)
-        mse = F.mse_loss(pred_reg3, y_reg3)
+        mae = mae_reg3
+        mse = loss_reg3_mse
         self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"{stage}_mae", mae, on_step=False, on_epoch=True, prog_bar=False)
         self.log(f"{stage}_mse", mse, on_step=False, on_epoch=True, prog_bar=False)

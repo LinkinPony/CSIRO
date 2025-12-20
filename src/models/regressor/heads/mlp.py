@@ -73,6 +73,7 @@ def init_mlp_head(
     # Ensure mutually-exclusive head modules exist.
     model.fpn_head = None  # type: ignore[assignment]
     model.dpt_head = None  # type: ignore[assignment]
+    model.vitdet_head = None  # type: ignore[assignment]
 
     bottleneck = _build_mlp_bottleneck(
         embedding_dim=int(embedding_dim),

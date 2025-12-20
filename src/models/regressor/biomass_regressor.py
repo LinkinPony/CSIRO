@@ -33,6 +33,10 @@ class BiomassRegressor(
         embedding_dim: int,
         # Head architecture selector
         head_type: str = "mlp",
+        # ViTDet (SimpleFeaturePyramid-style) settings
+        vitdet_dim: int = 256,
+        vitdet_patch_size: int = 16,
+        vitdet_scale_factors: Optional[List[float]] = None,
         # FPN (Phase A) settings
         fpn_dim: int = 256,
         fpn_num_levels: int = 3,
@@ -130,6 +134,8 @@ class BiomassRegressor(
             head_type_norm = "fpn"
         elif head_type_norm in ("dpt", "dpt_scalar", "dpt_head", "dense_dpt", "dpt_dense"):
             head_type_norm = "dpt"
+        elif head_type_norm in ("vitdet", "vitdet_head", "vitdet_scalar", "simple_feature_pyramid"):
+            head_type_norm = "vitdet"
         elif head_type_norm in ("mlp", "linear", "head", ""):
             head_type_norm = "mlp"
         else:
@@ -383,6 +389,9 @@ class BiomassRegressor(
             dpt_features=int(dpt_features),
             dpt_patch_size=int(dpt_patch_size),
             dpt_readout=str(dpt_readout),
+            vitdet_dim=int(vitdet_dim),
+            vitdet_patch_size=int(vitdet_patch_size),
+            vitdet_scale_factors=list(vitdet_scale_factors or [2.0, 1.0, 0.5]),
         )
 
 
