@@ -59,6 +59,14 @@ class BiomassRegressor(
         use_cls_token: bool = True,
         # Optional patch-based main regression path (per-patch prediction then average)
         use_patch_reg3: bool = False,
+        # Ratio head coupling mode (preferred). When provided, it overrides the legacy
+        # boolean flags below. Supported values: "shared" | "separate_mlp" | "separate_spatial".
+        ratio_head_mode: Optional[str] = None,
+        # If True, use an independent ratio MLP branch (no shared scalar MLP trunk with reg3).
+        separate_ratio_head: bool = False,
+        # If True, duplicate the entire spatial head for ratio (pyramid/conv + MLP),
+        # so ratio does not share any head parameters with reg3.
+        separate_ratio_spatial_head: bool = False,
         log_scale_targets: bool = False,
         # Normalization and scaling
         area_m2: float = 1.0,
@@ -210,6 +218,22 @@ class BiomassRegressor(
         # - mlp head: same meaning as before
         # - fpn head: always consumes patch tokens (effectively True)
         self.use_patch_reg3: bool = bool(use_patch_reg3) if self._head_type == "mlp" else True
+        # Ratio head coupling mode (resolved from enum or legacy flags).
+        try:
+            from .heads.ratio_mode import resolve_ratio_head_mode, flags_from_ratio_head_mode
+
+            self.ratio_head_mode: str = resolve_ratio_head_mode(
+                ratio_head_mode,
+                separate_ratio_head=separate_ratio_head,
+                separate_ratio_spatial_head=separate_ratio_spatial_head,
+            )
+            sep_mlp, sep_spatial = flags_from_ratio_head_mode(self.ratio_head_mode)
+        except Exception:
+            # Safe fallback: keep historical behavior (shared).
+            self.ratio_head_mode = "shared"
+            sep_mlp, sep_spatial = False, False
+        self.separate_ratio_head: bool = bool(sep_mlp)
+        self.separate_ratio_spatial_head: bool = bool(sep_spatial)
 
         # --- Multi-layer backbone configuration ---
         self.use_layerwise_heads: bool = bool(use_layerwise_heads)

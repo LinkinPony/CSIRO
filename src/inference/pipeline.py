@@ -455,6 +455,23 @@ def infer_components_5d_for_model(
         use_separate_bottlenecks_head = bool(meta.get("use_separate_bottlenecks", use_separate_bottlenecks_default))
         head_is_ratio = bool(head_num_ratio > 0 and head_total == (head_num_main + head_num_ratio))
 
+        # Ratio head coupling mode (enum). Prefer `ratio_head_mode` when present, but
+        # fall back to legacy boolean flags for older exported heads.
+        try:
+            from src.models.regressor.heads.ratio_mode import resolve_ratio_head_mode, flags_from_ratio_head_mode
+
+            ratio_head_mode_eff = resolve_ratio_head_mode(
+                meta.get("ratio_head_mode", first_meta.get("ratio_head_mode", None)),
+                separate_ratio_head=meta.get("separate_ratio_head", first_meta.get("separate_ratio_head", None)),
+                separate_ratio_spatial_head=meta.get(
+                    "separate_ratio_spatial_head", first_meta.get("separate_ratio_spatial_head", None)
+                ),
+            )
+            separate_ratio_head_eff, separate_ratio_spatial_eff = flags_from_ratio_head_mode(ratio_head_mode_eff)
+        except Exception:
+            ratio_head_mode_eff = "shared"
+            separate_ratio_head_eff, separate_ratio_spatial_eff = False, False
+
         if head_type_meta == "fpn":
             fpn_dim_meta = int(meta.get("fpn_dim", first_meta.get("fpn_dim", int(cfg["model"]["head"].get("fpn_dim", 256)))))
             fpn_levels_meta = int(meta.get("fpn_num_levels", first_meta.get("fpn_num_levels", int(cfg["model"]["head"].get("fpn_num_levels", 3)))))
@@ -475,6 +492,8 @@ def infer_components_5d_for_model(
                     num_outputs_main=head_num_main,
                     num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
                     enable_ndvi=enable_ndvi_meta,
+                    separate_ratio_head=bool(separate_ratio_head_eff),
+                    separate_ratio_spatial_head=bool(separate_ratio_spatial_eff),
                     patch_size=fpn_patch_size_meta,
                     reverse_level_order=fpn_reverse_level_order_meta,
                 )
@@ -508,6 +527,8 @@ def infer_components_5d_for_model(
                 num_outputs_main=head_num_main,
                 num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
                 enable_ndvi=enable_ndvi_meta,
+                separate_ratio_head=bool(separate_ratio_head_eff),
+                separate_ratio_spatial_head=bool(separate_ratio_spatial_eff),
                 head_hidden_dims=head_hidden_dims,
                 head_activation=head_activation,
                 dropout=head_dropout,
@@ -532,6 +553,8 @@ def infer_components_5d_for_model(
                     num_outputs_main=head_num_main,
                     num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
                     enable_ndvi=enable_ndvi_meta,
+                    separate_ratio_head=bool(separate_ratio_head_eff),
+                    separate_ratio_spatial_head=bool(separate_ratio_spatial_eff),
                     head_hidden_dims=head_hidden_dims,
                     head_activation=head_activation,
                     dropout=head_dropout,

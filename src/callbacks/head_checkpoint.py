@@ -104,6 +104,9 @@ class HeadCheckpoint(Callback):
                         "head_hidden_dims": list(head_hidden_dims),
                         "head_activation": head_activation,
                         "head_dropout": float(dropout),
+                        "ratio_head_mode": str(getattr(pl_module, "ratio_head_mode", "shared")),
+                        "separate_ratio_head": bool(getattr(pl_module, "separate_ratio_head", False)),
+                        "separate_ratio_spatial_head": bool(getattr(pl_module, "separate_ratio_spatial_head", False)),
                         # Export without terminal Softplus; inference handles main outputs.
                         "use_output_softplus": False,
                         "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,
@@ -194,6 +197,9 @@ class HeadCheckpoint(Callback):
                         "head_hidden_dims": list(head_hidden_dims),
                         "head_activation": str(head_activation),
                         "head_dropout": float(dropout),
+                        "ratio_head_mode": str(getattr(pl_module, "ratio_head_mode", "shared")),
+                        "separate_ratio_head": bool(getattr(pl_module, "separate_ratio_head", False)),
+                        "separate_ratio_spatial_head": bool(getattr(pl_module, "separate_ratio_spatial_head", False)),
                         # Export without terminal Softplus; inference handles main outputs.
                         "use_output_softplus": False,
                         "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,
@@ -277,6 +283,9 @@ class HeadCheckpoint(Callback):
                         "head_hidden_dims": list(head_hidden_dims),
                         "head_activation": str(head_activation),
                         "head_dropout": float(dropout),
+                        "ratio_head_mode": str(getattr(pl_module, "ratio_head_mode", "shared")),
+                        "separate_ratio_head": bool(getattr(pl_module, "separate_ratio_head", False)),
+                        "separate_ratio_spatial_head": bool(getattr(pl_module, "separate_ratio_spatial_head", False)),
                         # Export without terminal Softplus; inference handles main outputs.
                         "use_output_softplus": False,
                         "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,

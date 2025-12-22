@@ -34,6 +34,92 @@ def _merge_augment_cfg(
     return base
 
 
+class _GroupedConcatBatchSampler:
+    """
+    Batch sampler for `ConcatDataset` that yields batches containing samples from
+    a *single* underlying sub-dataset.
+
+    Motivation:
+      - When manifold mixup is enabled, mixing patch tokens across datasets can
+        be unstable and/or invalid (different image sizes -> different token grids).
+      - Grouping by dataset ensures in-batch manifold mixup never crosses datasets.
+
+    Notes:
+      - We shuffle *within* each dataset and then shuffle the resulting list of
+        batches to interleave datasets across steps while keeping batches homogeneous.
+      - We try to avoid a final batch of size 1 (best-effort) by borrowing one
+        sample from the previous batch of the same dataset when possible.
+    """
+
+    def __init__(self, ds: ConcatDataset, *, batch_size: int, shuffle: bool) -> None:
+        if not isinstance(ds, ConcatDataset):
+            raise TypeError("_GroupedConcatBatchSampler expects a ConcatDataset")
+        bsz = int(batch_size)
+        if bsz <= 0:
+            raise ValueError("batch_size must be > 0")
+        self.ds = ds
+        self.batch_size = bsz
+        self.shuffle = bool(shuffle)
+
+    def __len__(self) -> int:
+        total = 0
+        for sub in getattr(self.ds, "datasets", []):
+            try:
+                n = int(len(sub))
+            except Exception:
+                n = 0
+            if n <= 0:
+                continue
+            full = n // self.batch_size
+            rem = n % self.batch_size
+            total += full + (1 if rem > 0 else 0)
+        return int(total)
+
+    def __iter__(self):
+        # Build per-dataset index lists (global indices in ConcatDataset).
+        all_batches: List[List[int]] = []
+        offset = 0
+        for sub in getattr(self.ds, "datasets", []):
+            n = int(len(sub))
+            if n <= 0:
+                continue
+            # Local indices [0..n), then add offset to become ConcatDataset indices.
+            if self.shuffle and n > 1:
+                perm = torch.randperm(n).tolist()
+            else:
+                perm = list(range(n))
+            idxs = [offset + i for i in perm]
+
+            # Chunk into batches.
+            batches: List[List[int]] = []
+            for i in range(0, n, self.batch_size):
+                chunk = idxs[i : i + self.batch_size]
+                if chunk:
+                    batches.append(chunk)
+
+            # Best-effort: avoid a last batch of size 1 by borrowing from previous.
+            if (
+                len(batches) >= 2
+                and len(batches[-1]) == 1
+                and len(batches[-2]) >= 3  # ensures previous does not become size-1
+            ):
+                last = batches[-1]
+                prev = batches[-2]
+                last.insert(0, prev.pop())
+
+            all_batches.extend(batches)
+            offset += n
+
+        # Shuffle batch order to interleave datasets while keeping each batch homogeneous.
+        if self.shuffle and len(all_batches) > 1:
+            order = torch.randperm(len(all_batches)).tolist()
+            for j in order:
+                yield all_batches[j]
+        else:
+            for b in all_batches:
+                yield b
+
+
 class PastureImageDataset(Dataset):
     def __init__(
         self,
@@ -75,9 +161,7 @@ class PastureImageDataset(Dataset):
             image = self.transform(image)
         # main regression targets (one or more components depending on config.target_order)
         y_reg3_g = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
-        # Support missing reg3 targets (NaN/inf) via mask + safe numeric fill.
-        reg3_mask = torch.isfinite(y_reg3_g).to(dtype=torch.float32)
-        y_reg3_g = torch.nan_to_num(y_reg3_g, nan=0.0, posinf=0.0, neginf=0.0)
+        reg3_mask = torch.ones_like(y_reg3_g, dtype=torch.float32)
         # Convert grams to grams per square meter if a valid area is provided
         y_reg3_g_m2 = y_reg3_g / float(self.area_m2) if self.area_m2 > 0.0 else y_reg3_g
         
@@ -92,9 +176,6 @@ class PastureImageDataset(Dataset):
             y_reg3 = (y_reg3_norm - self._reg3_mean) / safe_std
         else:
             y_reg3 = y_reg3_norm
-        # Ensure masked-out dimensions cannot carry NaN/inf into losses/mixup.
-        y_reg3 = torch.nan_to_num(y_reg3, nan=0.0, posinf=0.0, neginf=0.0)
-        y_reg3 = torch.where(reg3_mask > 0.0, y_reg3, torch.zeros_like(y_reg3))
         # --- Canonical biomass components in grams (CSIRO only) ---
         # Order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
         try:
@@ -110,56 +191,31 @@ class PastureImageDataset(Dataset):
             dtype=torch.float32,
         )
         biomass_5d_mask = torch.isfinite(y_5d_g).to(dtype=torch.float32)
-        # Replace missing values with zeros; masks carry supervision.
-        y_5d_g = torch.nan_to_num(y_5d_g, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Ratio targets: proportions of (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) over Dry_Total_g.
-        # Only valid for CSIRO samples where *all* components are present and Dry_Total_g > 0.
+        # Only valid for CSIRO samples where all components are present and Dry_Total_g > 0.
         y_ratio = torch.zeros(3, dtype=torch.float32)
         ratio_mask = torch.zeros(1, dtype=torch.float32)
-        try:
-            has_ratio = bool(
-                (biomass_5d_mask[0] > 0.0).item()
-                and (biomass_5d_mask[1] > 0.0).item()
-                and (biomass_5d_mask[2] > 0.0).item()
-                and (biomass_5d_mask[4] > 0.0).item()
-                and (y_5d_g[4] > 0.0).item()
-            )
-        except Exception:
-            has_ratio = False
-        if has_ratio:
-            total = y_5d_g[4].clamp(min=1e-6)
-            y_ratio[0] = y_5d_g[0] / total
-            y_ratio[1] = y_5d_g[1] / total
-            y_ratio[2] = y_5d_g[2] / total
+        if torch.isfinite(y_5d_g[-1]) and y_5d_g[-1] > 0:
+            total = y_5d_g[-1]
+            clover = y_5d_g[0] if torch.isfinite(y_5d_g[0]) else 0.0
+            dead = y_5d_g[1] if torch.isfinite(y_5d_g[1]) else 0.0
+            green = y_5d_g[2] if torch.isfinite(y_5d_g[2]) else 0.0
+            y_ratio[0] = clover / total
+            y_ratio[1] = dead / total
+            y_ratio[2] = green / total
             ratio_mask[...] = 1.0
-        y_ratio = torch.nan_to_num(y_ratio, nan=0.0, posinf=0.0, neginf=0.0)
-        y_ratio = torch.where(ratio_mask > 0.0, y_ratio, torch.zeros_like(y_ratio))
 
         # auxiliary regression target: height
-        try:
-            h_val = float(row.get("Height_Ave_cm", 0.0))
-        except Exception:
-            h_val = 0.0
-        if not (h_val == h_val):
-            h_val = 0.0
-        y_height = torch.tensor([h_val], dtype=torch.float32)
+        y_height = torch.tensor([float(row.get("Height_Ave_cm", 0.0))], dtype=torch.float32)
         # auxiliary regression target: Pre_GSHH_NDVI
-        try:
-            ndvi_val = float(row.get("Pre_GSHH_NDVI", 0.0))
-        except Exception:
-            ndvi_val = 0.0
-        ndvi_mask = torch.tensor([1.0 if (ndvi_val == ndvi_val) else 0.0], dtype=torch.float32)
-        if not (ndvi_val == ndvi_val):
-            ndvi_val = 0.0
-        y_ndvi_raw = torch.tensor([ndvi_val], dtype=torch.float32)
+        y_ndvi_raw = torch.tensor([float(row.get("Pre_GSHH_NDVI", 0.0))], dtype=torch.float32)
         if self._ndvi_mean is not None and self._ndvi_std is not None:
             ndvi_std = max(1e-8, float(self._ndvi_std))
             y_ndvi = (y_ndvi_raw - float(self._ndvi_mean)) / ndvi_std
         else:
             y_ndvi = y_ndvi_raw
-        y_ndvi = torch.nan_to_num(y_ndvi, nan=0.0, posinf=0.0, neginf=0.0)
-        y_ndvi = torch.where(ndvi_mask > 0.0, y_ndvi, torch.zeros_like(y_ndvi))
+        ndvi_mask = torch.ones((1,), dtype=torch.float32)
         # auxiliary classification target: species index
         species = str(row.get("Species", ""))
         if self.species_to_idx and species in self.species_to_idx:
@@ -230,9 +286,10 @@ class PastureDataModule(LightningDataModule):
         irish_root: Optional[str] = None,
         irish_csv: Optional[str] = None,
         irish_image_dir: str = "images",
+        irish_supervise_ratio: bool = False,
         irish_image_size: Optional[Union[int, Tuple[int, int]]] = None,
-        # Optional random seed for internal train/val split reproducibility
-        random_seed: Optional[int] = None,
+        # Seed for reproducible internal train/val split when predefined splits are not supplied
+        random_seed: int = 42,
     ) -> None:
         super().__init__()
         self.data_root = data_root
@@ -248,9 +305,13 @@ class PastureDataModule(LightningDataModule):
         self.sample_area_m2 = float(sample_area_m2) if sample_area_m2 is not None else 1.0
         self._zscore_output_path: Optional[str] = str(zscore_output_path) if zscore_output_path else None
         self._log_scale_targets: bool = bool(log_scale_targets)
-        # Optional RNG seed for reproducible random splitting when predefined splits are not provided
-        self._random_seed: Optional[int] = (int(random_seed) if random_seed is not None else None)
         merged_aug = _merge_augment_cfg(augment_cfg=augment_cfg, train_scale=train_scale, hflip_prob=hflip_prob)
+        # Whether manifold mixup is enabled (used to decide batch composition when mixing datasets).
+        try:
+            mm = dict(merged_aug.get("manifold_mixup", {}) or {})
+            self._manifold_mixup_enabled = bool(mm.get("enabled", False)) and float(mm.get("prob", 0.0)) > 0.0
+        except Exception:
+            self._manifold_mixup_enabled = False
         self.train_tf, self.val_tf = build_aug_transforms(
             image_size=image_size, mean=mean, std=std, augment_cfg=merged_aug
         )
@@ -279,7 +340,12 @@ class PastureDataModule(LightningDataModule):
         self.irish_root: Optional[str] = str(irish_root) if irish_root else None
         self.irish_csv: Optional[str] = str(irish_csv) if irish_csv else None
         self.irish_image_dir: str = str(irish_image_dir or "images")
+        self.irish_supervise_ratio: bool = bool(irish_supervise_ratio)
         self.irish_image_size: Optional[Union[int, Tuple[int, int]]] = irish_image_size
+        try:
+            self.random_seed: int = int(random_seed)
+        except Exception:
+            self.random_seed = 42
         self.irish_train_tf: Optional[T.Compose] = None
         if self.irish_enabled and self.irish_root and self.irish_csv:
             # Reuse the same augment cfg as CSIRO, but allow a different image_size
@@ -322,12 +388,6 @@ class PastureDataModule(LightningDataModule):
         ndvi_series = df.groupby("image_id")["Pre_GSHH_NDVI"].first()
         species_series = df.groupby("image_id")["Species"].first()
         state_series = df.groupby("image_id")["State"].first()
-        # Optional Sampling_Date aggregation (used for grouped k-fold by date+state)
-        if "Sampling_Date" in df.columns:
-            sampling_date_series = df.groupby("image_id")["Sampling_Date"].first()
-        else:
-            sampling_date_series = None
-
         merged = pivot.join(image_path_series, how="inner")
         merged = (
             merged.join(height_series, how="left")
@@ -335,8 +395,6 @@ class PastureDataModule(LightningDataModule):
             .join(species_series, how="left")
             .join(state_series, how="left")
         )
-        if sampling_date_series is not None:
-            merged = merged.join(sampling_date_series, how="left")
         # Ensure all supervised primary targets are present
         merged = merged.dropna(subset=self.target_order)
         merged = merged.reset_index(drop=False)
@@ -360,16 +418,9 @@ class PastureDataModule(LightningDataModule):
             "Pre_GSHH_NDVI",
             "Species",
             "State",
+            "image_path",
+            "image_id",
         ]
-        # Insert Sampling_Date if present
-        if "Sampling_Date" in merged.columns:
-            cols.append("Sampling_Date")
-        cols.extend(
-            [
-                "image_path",
-                "image_id",
-            ]
-        )
         merged = merged[cols]
         return merged
 
@@ -383,11 +434,7 @@ class PastureDataModule(LightningDataModule):
             return
 
         merged = self._read_and_pivot()
-        # Use provided random seed if available; otherwise use an unseeded RNG
-        if self._random_seed is not None:
-            rng = np.random.default_rng(seed=int(self._random_seed))
-        else:
-            rng = np.random.default_rng()
+        rng = np.random.default_rng(seed=int(self.random_seed))
         indices = np.arange(len(merged))
         rng.shuffle(indices)
         n_val = max(1, int(len(indices) * self.val_split))
@@ -431,6 +478,7 @@ class PastureDataModule(LightningDataModule):
                     csv_path=irish_csv_path,
                     root_dir=self.irish_root,
                     image_subdir=self.irish_image_dir,
+                    supervise_ratio=self.irish_supervise_ratio,
                     target_order=self.target_order,
                     reg3_mean=self._reg3_mean,
                     reg3_std=self._reg3_std,
@@ -447,15 +495,32 @@ class PastureDataModule(LightningDataModule):
         else:
             main_ds = ConcatDataset(main_datasets)
 
-        main_loader = DataLoader(
-            main_ds,
-            batch_size=self.batch_size,
-            shuffle=self.shuffle,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            prefetch_factor=self.prefetch_factor,
-            persistent_workers=bool(self.num_workers > 0),
-        )
+        # When manifold mixup is enabled and multiple datasets are concatenated, keep each batch
+        # homogeneous (single dataset) so in-batch mixup never crosses datasets.
+        if isinstance(main_ds, ConcatDataset) and bool(self._manifold_mixup_enabled):
+            batch_sampler = _GroupedConcatBatchSampler(
+                main_ds,
+                batch_size=int(self.batch_size),
+                shuffle=bool(self.shuffle),
+            )
+            main_loader = DataLoader(
+                main_ds,
+                batch_sampler=batch_sampler,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                prefetch_factor=self.prefetch_factor,
+                persistent_workers=bool(self.num_workers > 0),
+            )
+        else:
+            main_loader = DataLoader(
+                main_ds,
+                batch_size=self.batch_size,
+                shuffle=self.shuffle,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                prefetch_factor=self.prefetch_factor,
+                persistent_workers=bool(self.num_workers > 0),
+            )
         if self.ndvi_dense_enabled and self._ndvi_cfg is not None:
             ndvi_loader = build_ndvi_scalar_dataloader(
                 self._ndvi_cfg,

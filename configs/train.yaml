@@ -1,5 +1,5 @@
 seed: 42
-version: vitdet-320-v2-small-aug
+version: vitdet-128-v3
 data:
   root: data
   train_csv: train.csv
@@ -83,8 +83,8 @@ data:
     #                    CLS+patch tokens are mixed together **regardless** of mix_cls_token.
     manifold_mixup:
       enabled: true
-      prob: 0.4
-      alpha: 0.5
+      prob: 1.0
+      alpha: 1.0
       # When true (default), manifold mixup is applied to the full feature vector,
       # including the CLS token when model.head.use_cls_token=true.
       #
@@ -99,7 +99,7 @@ data:
       alpha: 0.5
       # minmax: [0.3, 0.7]  # optional clamp for bbox size; comment to disable
       use_prev_for_bsz1: true
-    no_augment_prob: 0.1
+    no_augment_prob: 0.2
   normalization:
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
@@ -150,7 +150,7 @@ model:
     #           and averages the final outputs)
     type: vitdet
     # ViTDet settings (SimpleFeaturePyramid-style):
-    vitdet_dim: 320
+    vitdet_dim: 128
     vitdet_patch_size: 16
     # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
     vitdet_scale_factors: [4.0, 2.0, 1.0, 0.5]
@@ -187,6 +187,15 @@ model:
     # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
     # the global CLS + mean(patch) bottleneck.
     use_patch_reg3: true
+    # Biomass ratio head coupling mode.
+    #
+    # Options:
+    # - shared          : ratio shares the same spatial head + scalar MLP trunk as reg3 (default).
+    # - separate_mlp     : ratio uses an independent scalar MLP branch (pyramid/conv still shared).
+    # - separate_spatial : ratio uses a fully independent spatial head (pyramid/conv + MLP duplicated).
+    #
+    # NOTE: All modes still share the same DINOv3 backbone (+ LoRA adapters).
+    ratio_head_mode: shared
   backbone_layers:
     enabled: true
     # When true, each selected backbone layer uses its own bottleneck MLP.
@@ -204,7 +213,7 @@ model:
     # Recommended DPT-style 4-layer hooks:
     indices_by_backbone:
       dinov3_vitl16: [5, 11, 17, 23]
-      dinov3_vith16plus: [25,31]
+      dinov3_vith16plus: [24,25,26,27,28,29,30,31]
       dinov3_vit7b16: [9, 19, 29, 39]
     # Optional explicit override (set to a list to take precedence over indices_by_backbone)
     indices: null
@@ -229,8 +238,8 @@ peft:
   enabled: true
   method: lora
   use_dora: true
-  r: 4
-  lora_alpha: 4
+  r: 8
+  lora_alpha: 8
   lora_dropout: 0.05
   init: true
   last_k_blocks: 0
@@ -247,7 +256,7 @@ loss:
   # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
   use_5d_weighted_mse: true
   # Per-component weights for the 5D MSE term.
-  mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
+  mse_5d_weights_per_target: [0.33, 0.33, 0.33, 0.0, 0.0]
 
 optimizer:
   name: adamw
@@ -263,7 +272,7 @@ optimizer:
 
 scheduler:
   name: cosine
-  warmup_epochs: 5
+  warmup_epochs: 3
   warmup_start_factor: 0.1
 
 kfold:
@@ -272,7 +281,7 @@ kfold:
   even_split: true
 
 trainer:
-  max_epochs: 30
+  max_epochs: 15
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -320,6 +329,9 @@ ndvi_dense:
 
 irish_glass_clover:
   enabled: false
+  # When true, use Irish Glass Clover samples to supervise the biomass ratio head
+  # (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) derived from dry_total_g_cm2 / dry_clover_g_cm2.
+  supervise_ratio: true
   # Root directory containing data.csv and images/ for the Irish Glass Clover dataset
   root: data/irish_glass_clover
   csv: data.csv

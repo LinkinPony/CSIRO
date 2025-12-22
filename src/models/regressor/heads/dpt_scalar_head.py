@@ -130,6 +130,13 @@ class DPTHeadConfig:
     num_outputs_main: int
     num_outputs_ratio: int
     enable_ndvi: bool
+    # When True, predict ratio logits from an independent MLP branch fed by the
+    # pooled features (no shared scalar MLP trunk with reg3).
+    separate_ratio_head: bool = False
+    # When True, predict ratio logits from a completely separate spatial head:
+    # duplicate the dense prediction / fusion stack (and its pooled-feature MLP),
+    # so ratio does not share any head parameters with reg3.
+    separate_ratio_spatial_head: bool = False
     # When True (default), require (H//patch_size)*(W//patch_size) == N exactly.
     strict_patch_grid: bool = True
     # Scalar head (GAP -> MLP -> Linear)
@@ -158,6 +165,9 @@ class DPTScalarHead(nn.Module):
         self.num_outputs_main = int(max(1, cfg.num_outputs_main))
         self.num_outputs_ratio = int(max(0, cfg.num_outputs_ratio))
         self.enable_ndvi = bool(cfg.enable_ndvi)
+        self.separate_ratio_spatial_head = bool(getattr(cfg, "separate_ratio_spatial_head", False))
+        # separate spatial implies separate MLP
+        self.separate_ratio_head = bool(getattr(cfg, "separate_ratio_head", False)) or self.separate_ratio_spatial_head
         self.strict_patch_grid = bool(getattr(cfg, "strict_patch_grid", True))
 
         readout = str(cfg.readout or "ignore").strip().lower()
@@ -173,6 +183,14 @@ class DPTScalarHead(nn.Module):
         else:
             self.readout_proj = None  # type: ignore[assignment]
 
+        # Optional separate spatial branch for ratio: duplicate readout modules.
+        if self.separate_ratio_spatial_head and self.num_outputs_ratio > 0 and self.readout == "project":
+            self.ratio_readout_proj = nn.ModuleList(
+                [ProjectReadout(self.embedding_dim) for _ in range(self.num_layers)]
+            )
+        else:
+            self.ratio_readout_proj = None  # type: ignore[assignment]
+
         # Per-layer token->map projection (C -> features).
         self.layer_proj = nn.ModuleList(
             [
@@ -180,6 +198,17 @@ class DPTScalarHead(nn.Module):
                 for _ in range(self.num_layers)
             ]
         )
+
+        # Optional separate spatial branch for ratio: duplicate token->map projections.
+        if self.separate_ratio_spatial_head and self.num_outputs_ratio > 0:
+            self.ratio_layer_proj = nn.ModuleList(
+                [
+                    nn.Conv2d(self.embedding_dim, self.features, kernel_size=1, bias=True)
+                    for _ in range(self.num_layers)
+                ]
+            )
+        else:
+            self.ratio_layer_proj = None  # type: ignore[assignment]
 
         # ConvTranspose reassembly (DPT-style):
         #  - layer_1: upsample x4 -> H/4
@@ -215,6 +244,37 @@ class DPTScalarHead(nn.Module):
             else:
                 self.reassemble.append(nn.Identity())
 
+        # Optional separate spatial branch for ratio: duplicate reassembly modules.
+        if self.separate_ratio_spatial_head and self.num_outputs_ratio > 0:
+            self.ratio_reassemble = nn.ModuleList()
+            for i in range(self.num_layers):
+                if i == 0:
+                    self.ratio_reassemble.append(
+                        nn.ConvTranspose2d(
+                            self.features, self.features, kernel_size=4, stride=4
+                        )
+                    )
+                elif i == 1:
+                    self.ratio_reassemble.append(
+                        nn.ConvTranspose2d(
+                            self.features, self.features, kernel_size=2, stride=2
+                        )
+                    )
+                elif i == (self.num_layers - 1):
+                    self.ratio_reassemble.append(
+                        nn.Conv2d(
+                            self.features,
+                            self.features,
+                            kernel_size=3,
+                            stride=2,
+                            padding=1,
+                        )
+                    )
+                else:
+                    self.ratio_reassemble.append(nn.Identity())
+        else:
+            self.ratio_reassemble = None  # type: ignore[assignment]
+
         # Scratch convs (DPT "layer*_rn"): unify channels (already `features`) and add locality.
         self.scratch = nn.ModuleList(
             [
@@ -229,6 +289,24 @@ class DPTScalarHead(nn.Module):
                 for _ in range(self.num_layers)
             ]
         )
+
+        # Optional separate spatial branch for ratio: duplicate scratch convs.
+        if self.separate_ratio_spatial_head and self.num_outputs_ratio > 0:
+            self.ratio_scratch = nn.ModuleList(
+                [
+                    nn.Conv2d(
+                        self.features,
+                        self.features,
+                        kernel_size=3,
+                        stride=1,
+                        padding=1,
+                        bias=False,
+                    )
+                    for _ in range(self.num_layers)
+                ]
+            )
+        else:
+            self.ratio_scratch = None  # type: ignore[assignment]
 
         # RefineNet-style fusion blocks (top-down).
         act = nn.ReLU(inplace=False)
@@ -245,6 +323,26 @@ class DPTScalarHead(nn.Module):
             self.features, activation=act, bn=False, align_corners=True
         )
 
+        # Optional separate spatial branch for ratio: duplicate refinement blocks.
+        if self.separate_ratio_spatial_head and self.num_outputs_ratio > 0:
+            self.ratio_refinenet4 = FeatureFusionBlockCustom(
+                self.features, activation=act, bn=False, align_corners=True
+            )
+            self.ratio_refinenet3 = FeatureFusionBlockCustom(
+                self.features, activation=act, bn=False, align_corners=True
+            )
+            self.ratio_refinenet2 = FeatureFusionBlockCustom(
+                self.features, activation=act, bn=False, align_corners=True
+            )
+            self.ratio_refinenet1 = FeatureFusionBlockCustom(
+                self.features, activation=act, bn=False, align_corners=True
+            )
+        else:
+            self.ratio_refinenet4 = None  # type: ignore[assignment]
+            self.ratio_refinenet3 = None  # type: ignore[assignment]
+            self.ratio_refinenet2 = None  # type: ignore[assignment]
+            self.ratio_refinenet1 = None  # type: ignore[assignment]
+
         # DPT-style "last upsample once" feature path.
         # IMPORTANT: we reduce channels BEFORE upsampling to keep memory reasonable at large resolutions.
         self._pool_ch: int = 32
@@ -256,33 +354,57 @@ class DPTScalarHead(nn.Module):
         )
         self.up_act = nn.ReLU(inplace=True)
 
-        # Scalar bottleneck MLP (GAP -> MLP -> Linear).
+        # Optional separate spatial branch for ratio: duplicate upsample path.
+        if self.separate_ratio_spatial_head and self.num_outputs_ratio > 0:
+            self.ratio_up_proj = nn.Conv2d(
+                self.features, self._pool_ch, kernel_size=3, stride=1, padding=1
+            )
+            self.ratio_up_refine = nn.Conv2d(
+                self._pool_ch, self._pool_ch, kernel_size=3, stride=1, padding=1
+            )
+            self.ratio_up_act = nn.ReLU(inplace=True)
+        else:
+            self.ratio_up_proj = None  # type: ignore[assignment]
+            self.ratio_up_refine = None  # type: ignore[assignment]
+            self.ratio_up_act = None  # type: ignore[assignment]
+
+        # Scalar bottleneck MLP(s) (GAP -> MLP -> Linear).
         # We concatenate pooled fused features at H/2 with pooled upsampled features at H.
         in_dim = int(self.features + self._pool_ch)
         hidden_dims = list(getattr(cfg, "head_hidden_dims", None) or [])
         drop = float(getattr(cfg, "dropout", 0.0) or 0.0)
         act_name = str(getattr(cfg, "head_activation", "relu"))
 
-        layers: List[nn.Module] = []
-        cur = in_dim
-        if drop > 0:
-            layers.append(nn.Dropout(drop))
-        for hd in hidden_dims:
-            hd_i = int(hd)
-            layers.append(nn.Linear(cur, hd_i))
-            layers.append(_build_activation(act_name))
+        def _build_scalar_mlp() -> tuple[nn.Module, int]:
+            layers: List[nn.Module] = []
+            cur = in_dim
             if drop > 0:
                 layers.append(nn.Dropout(drop))
-            cur = hd_i
-        self.scalar_mlp = nn.Sequential(*layers) if layers else nn.Identity()
-        self.scalar_dim = cur if layers else in_dim
+            for hd in hidden_dims:
+                hd_i = int(hd)
+                layers.append(nn.Linear(cur, hd_i))
+                layers.append(_build_activation(act_name))
+                if drop > 0:
+                    layers.append(nn.Dropout(drop))
+                cur = hd_i
+            mlp = nn.Sequential(*layers) if layers else nn.Identity()
+            dim = cur if layers else in_dim
+            return mlp, dim
 
-        self.reg3_head = nn.Linear(self.scalar_dim, self.num_outputs_main)
-        self.ratio_head = (
-            nn.Linear(self.scalar_dim, self.num_outputs_ratio)
-            if self.num_outputs_ratio > 0
-            else None
-        )
+        self.scalar_mlp, self.scalar_dim = _build_scalar_mlp()
+
+        # Optional independent ratio MLP branch.
+        # - separate_ratio_head: ratio gets its own MLP, but shares pooled features `g`
+        # - separate_ratio_spatial_head: ratio gets its own dense-prediction stack -> pooled features `g_ratio`,
+        #   and its own MLP
+        if self.separate_ratio_head and self.num_outputs_ratio > 0:
+            self.ratio_mlp, ratio_dim = _build_scalar_mlp()
+        else:
+            self.ratio_mlp = None
+            ratio_dim = int(self.scalar_dim)
+
+        self.reg3_head = nn.Linear(int(self.scalar_dim), self.num_outputs_main)
+        self.ratio_head = nn.Linear(int(ratio_dim), self.num_outputs_ratio) if self.num_outputs_ratio > 0 else None
         self.ndvi_head = nn.Linear(self.scalar_dim, 1) if self.enable_ndvi else None
 
     def _tokens_to_map(self, pt: Tensor, *, image_hw: Tuple[int, int]) -> Tensor:
@@ -386,8 +508,73 @@ class DPTScalarHead(nn.Module):
         g = torch.cat([g_fused, g_up], dim=-1)
         z = self.scalar_mlp(g) if not isinstance(self.scalar_mlp, nn.Identity) else g
 
+        # Ratio branch (mode-dependent)
+        if self.separate_ratio_spatial_head and self.ratio_head is not None:
+            if (
+                self.ratio_layer_proj is None
+                or self.ratio_reassemble is None
+                or self.ratio_scratch is None
+                or self.ratio_refinenet4 is None
+                or self.ratio_refinenet3 is None
+                or self.ratio_refinenet2 is None
+                or self.ratio_refinenet1 is None
+                or self.ratio_up_proj is None
+                or self.ratio_up_refine is None
+                or self.ratio_up_act is None
+            ):
+                raise RuntimeError("Missing ratio spatial modules for separate_ratio_spatial_head")
+
+            maps_r: List[Tensor] = []
+            for li, pt in enumerate(pt_list):
+                cls = cls_list[li]
+                pt_r = pt
+                if self.readout == "project":
+                    if cls is None:
+                        raise RuntimeError("DPT ratio head readout='project' requires cls_tokens")
+                    if self.ratio_readout_proj is None:
+                        raise RuntimeError("Missing ratio_readout_proj for separate_ratio_spatial_head")
+                    pt_r = self.ratio_readout_proj[li](pt_r, cls)  # type: ignore[index]
+
+                x_r = self._tokens_to_map(pt_r, image_hw=image_hw)
+                # Best-effort dtype alignment if autocast is off.
+                try:
+                    w_dtype = next(self.parameters()).dtype
+                except Exception:
+                    w_dtype = x_r.dtype
+                if (not torch.is_autocast_enabled()) and x_r.dtype != w_dtype:
+                    x_r = x_r.to(dtype=w_dtype)
+
+                x_r = self.ratio_layer_proj[li](x_r)  # type: ignore[index]
+                x_r = self.ratio_reassemble[li](x_r)  # type: ignore[index]
+                x_r = self.ratio_scratch[li](x_r)  # type: ignore[index]
+                maps_r.append(x_r)
+
+            if len(maps_r) < 1:
+                raise RuntimeError("DPT ratio head got empty maps list")
+
+            path4_r = self.ratio_refinenet4(maps_r[-1], None)  # type: ignore[operator]
+            path3_r = self.ratio_refinenet3(path4_r, maps_r[-2] if len(maps_r) >= 2 else None)  # type: ignore[operator]
+            path2_r = self.ratio_refinenet2(path3_r, maps_r[-3] if len(maps_r) >= 3 else None)  # type: ignore[operator]
+            path1_r = self.ratio_refinenet1(path2_r, maps_r[-4] if len(maps_r) >= 4 else None)  # type: ignore[operator]
+
+            g_fused_r = F.adaptive_avg_pool2d(path1_r, output_size=1).flatten(1)
+            y_r = self.ratio_up_proj(path1_r)  # type: ignore[operator]
+            y_r = F.interpolate(y_r, scale_factor=2.0, mode="bilinear", align_corners=True)
+            y_r = self.ratio_up_act(self.ratio_up_refine(y_r))  # type: ignore[operator]
+            g_up_r = F.adaptive_avg_pool2d(y_r, output_size=1).flatten(1)
+            g_ratio = torch.cat([g_fused_r, g_up_r], dim=-1)
+
+            if self.ratio_mlp is not None:
+                z_ratio = self.ratio_mlp(g_ratio) if not isinstance(self.ratio_mlp, nn.Identity) else g_ratio
+            else:
+                z_ratio = g_ratio
+        elif self.ratio_mlp is not None:
+            z_ratio = self.ratio_mlp(g) if not isinstance(self.ratio_mlp, nn.Identity) else g
+        else:
+            z_ratio = z
+
         reg3 = self.reg3_head(z)
-        ratio = self.ratio_head(z) if self.ratio_head is not None else None
+        ratio = self.ratio_head(z_ratio) if self.ratio_head is not None else None
         ndvi = self.ndvi_head(z) if self.ndvi_head is not None else None
         return {"z": z, "reg3": reg3, "ratio": ratio, "ndvi": ndvi}
 

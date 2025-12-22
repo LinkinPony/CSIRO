@@ -143,6 +143,13 @@ class FPNHeadConfig:
     num_outputs_main: int
     num_outputs_ratio: int
     enable_ndvi: bool
+    # When True, predict ratio logits from an independent MLP branch fed by the
+    # pooled pyramid features (no shared scalar MLP trunk with reg3).
+    separate_ratio_head: bool = False
+    # When True, predict ratio logits from a completely separate spatial head:
+    # duplicate the pyramid/conv stack (and its pooled-feature MLP), so ratio does not
+    # share any head parameters with reg3.
+    separate_ratio_spatial_head: bool = False
     patch_size: int = 16
     # When True (default), assign deeper backbone layers (larger indices) to *higher-resolution*
     # FPN levels (less downsampling). Concretely, after grouping per-layer maps into K groups,
@@ -183,6 +190,11 @@ class FPNScalarHead(nn.Module):
         self.strict_patch_grid = bool(getattr(cfg, "strict_patch_grid", True))
         # See FPNHeadConfig.reverse_level_order for semantics.
         self.reverse_level_order = bool(getattr(cfg, "reverse_level_order", True))
+        self.separate_ratio_head = bool(getattr(cfg, "separate_ratio_head", False))
+        self.separate_ratio_spatial_head = bool(getattr(cfg, "separate_ratio_spatial_head", False))
+        # separate spatial implies separate MLP branch as well
+        if self.separate_ratio_spatial_head:
+            self.separate_ratio_head = True
 
         # Per-layer projection (separate_bottlenecks semantics).
         if self.use_separate_bottlenecks:
@@ -206,30 +218,68 @@ class FPNScalarHead(nn.Module):
             ]
         )
 
-        # Scalar bottleneck MLP on concatenated pooled pyramid features.
+        # Optional separate spatial branch for ratio: duplicate the full pyramid/conv stack.
+        if self.separate_ratio_spatial_head and int(cfg.num_outputs_ratio) > 0:
+            if self.use_separate_bottlenecks:
+                self.ratio_layer_proj = nn.ModuleList(
+                    [
+                        nn.Conv2d(self.embedding_dim, self.fpn_dim, kernel_size=1, bias=False)
+                        for _ in range(self.num_layers)
+                    ]
+                )
+            else:
+                self.ratio_shared_proj = nn.Conv2d(self.embedding_dim, self.fpn_dim, kernel_size=1, bias=False)
+            self.ratio_lateral = nn.ModuleList(
+                [nn.Conv2d(self.fpn_dim, self.fpn_dim, kernel_size=1, bias=True) for _ in range(self.num_levels)]
+            )
+            self.ratio_smooth = nn.ModuleList(
+                [
+                    nn.Conv2d(self.fpn_dim, self.fpn_dim, kernel_size=3, padding=1, bias=True)
+                    for _ in range(self.num_levels)
+                ]
+            )
+        else:
+            self.ratio_layer_proj = None  # type: ignore[assignment]
+            self.ratio_shared_proj = None  # type: ignore[assignment]
+            self.ratio_lateral = None  # type: ignore[assignment]
+            self.ratio_smooth = None  # type: ignore[assignment]
+
+        # Scalar bottleneck MLP(s) on concatenated pooled pyramid features.
         in_dim = self.fpn_dim * self.num_levels
         hidden_dims = list(cfg.head_hidden_dims or [])
         drop = float(cfg.dropout or 0.0)
 
-        layers: List[nn.Module] = []
-        cur = in_dim
-        if drop > 0:
-            layers.append(nn.Dropout(drop))
-        for hd in hidden_dims:
-            hd_i = int(hd)
-            layers.append(nn.Linear(cur, hd_i))
-            layers.append(_build_activation(cfg.head_activation))
+        def _build_scalar_mlp() -> tuple[nn.Module, int]:
+            layers: List[nn.Module] = []
+            cur = in_dim
             if drop > 0:
                 layers.append(nn.Dropout(drop))
-            cur = hd_i
-        self.scalar_mlp = nn.Sequential(*layers) if layers else nn.Identity()
-        self.scalar_dim = cur if layers else in_dim
+            for hd in hidden_dims:
+                hd_i = int(hd)
+                layers.append(nn.Linear(cur, hd_i))
+                layers.append(_build_activation(cfg.head_activation))
+                if drop > 0:
+                    layers.append(nn.Dropout(drop))
+                cur = hd_i
+            mlp = nn.Sequential(*layers) if layers else nn.Identity()
+            dim = cur if layers else in_dim
+            return mlp, dim
 
-        self.reg3_head = nn.Linear(self.scalar_dim, int(cfg.num_outputs_main))
+        self.scalar_mlp, self.scalar_dim = _build_scalar_mlp()
+
+        # Optional independent ratio MLP branch.
+        # - separate_ratio_head: ratio gets its own MLP, but shares pooled features `g`
+        # - separate_ratio_spatial_head: ratio gets its own pyramid/conv -> pooled features `g_ratio`,
+        #   and its own MLP
+        if self.separate_ratio_head and int(cfg.num_outputs_ratio) > 0:
+            self.ratio_mlp, ratio_dim = _build_scalar_mlp()
+        else:
+            self.ratio_mlp = None
+            ratio_dim = int(self.scalar_dim)
+
+        self.reg3_head = nn.Linear(int(self.scalar_dim), int(cfg.num_outputs_main))
         self.ratio_head = (
-            nn.Linear(self.scalar_dim, int(cfg.num_outputs_ratio))
-            if int(cfg.num_outputs_ratio) > 0
-            else None
+            nn.Linear(int(ratio_dim), int(cfg.num_outputs_ratio)) if int(cfg.num_outputs_ratio) > 0 else None
         )
         self.ndvi_head = nn.Linear(self.scalar_dim, 1) if bool(cfg.enable_ndvi) else None
 
@@ -237,6 +287,13 @@ class FPNScalarHead(nn.Module):
         if self.use_separate_bottlenecks:
             return self.layer_proj[layer_idx](x)
         return self.shared_proj(x)  # type: ignore[attr-defined]
+
+    def _project_layer_ratio(self, x: Tensor, layer_idx: int) -> Tensor:
+        if not self.separate_ratio_spatial_head:
+            raise RuntimeError("_project_layer_ratio called but separate_ratio_spatial_head is False")
+        if self.use_separate_bottlenecks:
+            return self.ratio_layer_proj[layer_idx](x)  # type: ignore[index]
+        return self.ratio_shared_proj(x)  # type: ignore[operator]
 
     def _tokens_to_map(self, pt: Tensor, *, image_hw: Tuple[int, int]) -> Tensor:
         if pt.dim() != 3:
@@ -334,6 +391,74 @@ class FPNScalarHead(nn.Module):
 
         return p_levels
 
+    def _build_pyramid_ratio(
+        self,
+        pt_list: Sequence[Tensor],
+        *,
+        image_hw: Tuple[int, int],
+    ) -> List[Tensor]:
+        """
+        Same as `_build_pyramid`, but uses the ratio spatial branch modules.
+        Only valid when `separate_ratio_spatial_head=True`.
+        """
+        if not self.separate_ratio_spatial_head:
+            raise RuntimeError("_build_pyramid_ratio called but separate_ratio_spatial_head is False")
+        if len(pt_list) == 0:
+            raise ValueError("pt_list must contain at least one tensor")
+        if len(pt_list) != int(self.num_layers):
+            raise RuntimeError(
+                "FPN ratio head received an unexpected number of patch-token layers. "
+                f"Expected num_layers={int(self.num_layers)} but got len(pt_list)={len(pt_list)}."
+            )
+        if self.ratio_lateral is None or self.ratio_smooth is None:
+            raise RuntimeError("Missing ratio lateral/smooth modules for separate_ratio_spatial_head")
+
+        proj_maps: List[Tensor] = []
+        for li, pt in enumerate(pt_list):
+            x = self._tokens_to_map(pt, image_hw=image_hw)
+            # Match head weight dtype when autocast is off (best-effort).
+            try:
+                w_dtype = next(self.parameters()).dtype
+            except Exception:
+                w_dtype = x.dtype
+            if (not torch.is_autocast_enabled()) and x.dtype != w_dtype:
+                x = x.to(dtype=w_dtype)
+            proj_maps.append(self._project_layer_ratio(x, li))
+
+        groups = _auto_group_layers(num_layers=len(proj_maps), num_levels=self.num_levels)
+        group_maps: List[Tensor] = []
+        for g in groups:
+            xs = [proj_maps[i] for i in g if 0 <= i < len(proj_maps)]
+            if not xs:
+                xs = [proj_maps[-1]]
+            group_maps.append(torch.stack(xs, dim=0).mean(dim=0))
+        if self.reverse_level_order and len(group_maps) > 1:
+            group_maps = list(reversed(group_maps))
+
+        B, C, Hp, Wp = group_maps[0].shape
+        c_levels: List[Tensor] = []
+        for i, gm in enumerate(group_maps):
+            scale = 2 ** int(i)
+            th = max(1, Hp // scale)
+            tw = max(1, Wp // scale)
+            if gm.shape[-2:] != (th, tw):
+                gm = F.interpolate(gm, size=(th, tw), mode="bilinear", align_corners=False)
+            c_levels.append(self.ratio_lateral[i](gm))
+
+        p_levels: List[Tensor] = [torch.empty(0)] * self.num_levels
+        prev = None
+        for i in reversed(range(self.num_levels)):
+            c = c_levels[i]
+            if prev is None:
+                p = c
+            else:
+                up = F.interpolate(prev, size=c.shape[-2:], mode="nearest")
+                p = c + up
+            p = self.ratio_smooth[i](p)
+            p_levels[i] = p
+            prev = p
+        return p_levels
+
     def forward(
         self,
         pt_tokens: Union[Tensor, Sequence[Tensor]],
@@ -355,13 +480,29 @@ class FPNScalarHead(nn.Module):
             pt_list: List[Tensor] = [pt_tokens]
         else:
             pt_list = list(pt_tokens)
+        # Main branch
         p_levels = self._build_pyramid(pt_list, image_hw=image_hw)
         pooled = [F.adaptive_avg_pool2d(p, output_size=1).flatten(1) for p in p_levels]
         g = torch.cat(pooled, dim=-1)
         z = self.scalar_mlp(g) if not isinstance(self.scalar_mlp, nn.Identity) else g
 
+        # Ratio branch (mode-dependent)
+        if self.separate_ratio_spatial_head and self.ratio_head is not None:
+            p_levels_r = self._build_pyramid_ratio(pt_list, image_hw=image_hw)
+            pooled_r = [F.adaptive_avg_pool2d(p, output_size=1).flatten(1) for p in p_levels_r]
+            g_ratio = torch.cat(pooled_r, dim=-1)
+            # In separate-spatial mode, ratio_mlp is expected to exist (may be Identity).
+            if self.ratio_mlp is not None:
+                z_ratio = self.ratio_mlp(g_ratio) if not isinstance(self.ratio_mlp, nn.Identity) else g_ratio
+            else:
+                z_ratio = g_ratio
+        elif self.ratio_mlp is not None:
+            z_ratio = self.ratio_mlp(g) if not isinstance(self.ratio_mlp, nn.Identity) else g
+        else:
+            z_ratio = z
+
         reg3 = self.reg3_head(z)
-        ratio = self.ratio_head(z) if self.ratio_head is not None else None
+        ratio = self.ratio_head(z_ratio) if self.ratio_head is not None else None
         ndvi = self.ndvi_head(z) if self.ndvi_head is not None else None
         return {"z": z, "reg3": reg3, "ratio": ratio, "ndvi": ndvi}
 

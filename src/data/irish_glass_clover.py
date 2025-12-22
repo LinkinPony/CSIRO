@@ -16,7 +16,11 @@ class IrishGlassCloverDataset(Dataset):
 
     - Reads data.csv with columns including:
         image_name, dry_total_g_cm2, dry_clover_g_cm2, Sward Height (cm), ...
-    - Only Dry_Total_g and Dry_Clover_g are supervised for reg3.
+    - By default, only Dry_Total_g is supervised for reg3.
+    - Optionally, this dataset can also supervise the biomass ratio head by mapping:
+        - dry_clover_g_cm2                     -> Dry_Clover_g
+        - dry_total_g_cm2 - dry_clover_g_cm2   -> Dry_Green_g
+        - Dry_Dead_g                           = 0
     - Values in dry_total_g_cm2 / dry_clover_g_cm2 are already area-normalized
       (g per unit area, effectively g/m^2 for our purposes) and are used
       directly without any additional area conversion.
@@ -29,6 +33,7 @@ class IrishGlassCloverDataset(Dataset):
         root_dir: str,
         image_subdir: str,
         target_order: Sequence[str],
+        supervise_ratio: bool = False,
         reg3_mean: Optional[Sequence[float]] = None,
         reg3_std: Optional[Sequence[float]] = None,
         log_scale_targets: bool = False,
@@ -38,6 +43,7 @@ class IrishGlassCloverDataset(Dataset):
         self.df = pd.read_csv(csv_path)
         self.root_dir = os.path.abspath(root_dir)
         self.image_subdir = image_subdir
+        self.supervise_ratio: bool = bool(supervise_ratio)
         self.target_order: List[str] = list(target_order)
         self.transform = transform
 
@@ -72,11 +78,8 @@ class IrishGlassCloverDataset(Dataset):
             if name == "Dry_Total_g":
                 v = float(row["dry_total_g_cm2"])
                 m = 1.0
-            elif name == "Dry_Clover_g":
-                v = float(row["dry_clover_g_cm2"])
-                m = 1.0
             else:
-                # No supervision for Dry_Green_g (and any other reg3 targets)
+                # No supervision for any other reg3 targets for this dataset
                 v = 0.0
                 m = 0.0
             reg3_vals.append(v)
@@ -110,13 +113,29 @@ class IrishGlassCloverDataset(Dataset):
         y_species = torch.tensor(0, dtype=torch.long)
         y_state = torch.tensor(0, dtype=torch.long)
 
-        # Biomass decomposition targets are not available for this dataset.
-        # We provide zero tensors with zero masks so that the model can share
-        # the same loss code path while effectively skipping these terms.
+        # Biomass decomposition targets are not available in full for this dataset.
+        # We always return dummy 5D tensors with zero masks so the collate path
+        # stays consistent when mixing datasets.
         y_5d_g = torch.zeros(5, dtype=torch.float32)
         biomass_5d_mask = torch.zeros(5, dtype=torch.float32)
+
+        # Optional ratio supervision (controls the ratio head only; does NOT enable 5D loss)
         y_ratio = torch.zeros(3, dtype=torch.float32)
         ratio_mask = torch.zeros(1, dtype=torch.float32)
+        if self.supervise_ratio:
+            try:
+                total = float(row["dry_total_g_cm2"])
+                clover = float(row["dry_clover_g_cm2"])
+            except Exception:
+                total = float("nan")
+                clover = float("nan")
+            if total == total and clover == clover and total > 0.0:
+                dead = 0.0
+                green = max(0.0, total - clover)
+                y_ratio[0] = float(clover / total)
+                y_ratio[1] = float(dead / total)  # always 0
+                y_ratio[2] = float(green / total)
+                ratio_mask[...] = 1.0
 
         return {
             "image": image,

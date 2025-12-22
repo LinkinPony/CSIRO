@@ -180,11 +180,10 @@ class CutMixBatchAugment:
                 mixed_mask_5d = mask_5d * mask_5d_perm
                 batch["biomass_5d_mask"] = mixed_mask_5d
 
-                # Re-calculate ratios from mixed 5D
-                # 5D: [Clover, Dead, Green, GDM, Total]
+                # --- Ratio supervision mixing ---
+                # Preferred path (CSIRO): recompute ratios from mixed 5D grams when available.
+                # Fallback path (e.g., Irish): mix provided y_ratio directly when no 5D supervision exists.
                 mixed_total = mixed_5d[:, 4].clamp(min=1e-6)
-
-                # Ratio supervision is only valid when all 3 components and total are present and total > 0.
                 ratio_mask_from_5d = (
                     (mixed_mask_5d[:, 0] > 0.0)
                     & (mixed_mask_5d[:, 1] > 0.0)
@@ -193,32 +192,79 @@ class CutMixBatchAugment:
                     & (mixed_5d[:, 4] > 0.0)
                 ).to(dtype=mixed_mask_5d.dtype).unsqueeze(-1)
 
-                if "ratio_mask" in batch:
-                    rm = batch["ratio_mask"]
-                    if isinstance(rm, torch.Tensor) and rm.size(0) == bsz:
-                        rm_mixed = (rm & rm[perm]) if rm.dtype == torch.bool else (rm * rm[perm])
-                        if rm_mixed.dim() == 1:
-                            rm_mixed = rm_mixed.view(bsz, 1)
-                        batch["ratio_mask"] = rm_mixed.to(dtype=mixed_mask_5d.dtype) * ratio_mask_from_5d
-                    else:
-                        batch["ratio_mask"] = ratio_mask_from_5d
-                else:
-                    batch["ratio_mask"] = ratio_mask_from_5d
+                has_any_5d = (mixed_mask_5d.sum(dim=-1, keepdim=True) > 0.0).to(
+                    dtype=mixed_mask_5d.dtype
+                )
 
-                if "y_ratio" in batch:
-                    y_ratio_new = torch.stack([
-                        mixed_5d[:, 0] / mixed_total,
-                        mixed_5d[:, 1] / mixed_total,
-                        mixed_5d[:, 2] / mixed_total,
-                    ], dim=-1)
-                    y_ratio_new = torch.nan_to_num(y_ratio_new, nan=0.0, posinf=0.0, neginf=0.0)
-                    rm = batch.get("ratio_mask", None)
-                    if isinstance(rm, torch.Tensor):
-                        rm_f = rm.to(device=y_ratio_new.device, dtype=y_ratio_new.dtype)
-                        if rm_f.dim() == 1:
-                            rm_f = rm_f.view(bsz, 1)
-                        y_ratio_new = torch.where(rm_f > 0.0, y_ratio_new, torch.zeros_like(y_ratio_new))
-                    batch["y_ratio"] = y_ratio_new
+                y_ratio_existing = batch.get("y_ratio", None)
+                ratio_mask_existing = batch.get("ratio_mask", None)
+
+                y_ratio_mixed = None
+                ratio_mask_mixed = None
+                if (
+                    isinstance(y_ratio_existing, torch.Tensor)
+                    and y_ratio_existing.dim() == 2
+                    and y_ratio_existing.size(0) == bsz
+                    and y_ratio_existing.size(1) >= 3
+                ):
+                    y_ratio_safe = torch.nan_to_num(
+                        y_ratio_existing, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    y_ratio_perm = torch.nan_to_num(
+                        y_ratio_safe[perm], nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    y_ratio_mixed = lam_eff * y_ratio_safe + (1.0 - lam_eff) * y_ratio_perm
+
+                if (
+                    isinstance(ratio_mask_existing, torch.Tensor)
+                    and ratio_mask_existing.size(0) == bsz
+                    and ratio_mask_existing.dim() >= 1
+                ):
+                    if ratio_mask_existing.dtype == torch.bool:
+                        ratio_mask_mixed = (ratio_mask_existing & ratio_mask_existing[perm]).to(
+                            dtype=mixed_mask_5d.dtype
+                        )
+                    else:
+                        ratio_mask_mixed = ratio_mask_existing.to(
+                            dtype=mixed_mask_5d.dtype
+                        ) * ratio_mask_existing[perm].to(dtype=mixed_mask_5d.dtype)
+                    if ratio_mask_mixed.dim() == 1:
+                        ratio_mask_mixed = ratio_mask_mixed.view(bsz, 1)
+
+                if ratio_mask_mixed is None:
+                    ratio_mask_out = ratio_mask_from_5d
+                else:
+                    ratio_mask_out = torch.where(
+                        has_any_5d > 0.0,
+                        ratio_mask_mixed * ratio_mask_from_5d,
+                        ratio_mask_mixed,
+                    )
+                batch["ratio_mask"] = ratio_mask_out
+
+                if isinstance(y_ratio_existing, torch.Tensor):
+                    y_ratio_from_5d = torch.stack(
+                        [
+                            mixed_5d[:, 0] / mixed_total,
+                            mixed_5d[:, 1] / mixed_total,
+                            mixed_5d[:, 2] / mixed_total,
+                        ],
+                        dim=-1,
+                    )
+                    y_ratio_from_5d = torch.nan_to_num(
+                        y_ratio_from_5d, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+
+                    if y_ratio_mixed is None:
+                        y_ratio_out = y_ratio_from_5d
+                    else:
+                        use_from_5d = (has_any_5d > 0.0) & (ratio_mask_from_5d > 0.0)
+                        y_ratio_out = torch.where(use_from_5d, y_ratio_from_5d, y_ratio_mixed)
+
+                    rm_f = ratio_mask_out.to(device=y_ratio_out.device, dtype=y_ratio_out.dtype)
+                    if rm_f.dim() == 1:
+                        rm_f = rm_f.view(bsz, 1)
+                    y_ratio_out = torch.where(rm_f > 0.0, y_ratio_out, torch.zeros_like(y_ratio_out))
+                    batch["y_ratio"] = y_ratio_out
             applied = True
         else:
             # bsz == 1
@@ -268,8 +314,8 @@ class CutMixBatchAugment:
                         mixed_mask_5d = mask_5d * prev_mask_5d
                         batch["biomass_5d_mask"] = mixed_mask_5d
 
+                        # --- Ratio supervision mixing (batch_size == 1 cache mode) ---
                         mixed_total = mixed_5d[:, 4].clamp(min=1e-6)
-
                         ratio_mask_from_5d = (
                             (mixed_mask_5d[:, 0] > 0.0)
                             & (mixed_mask_5d[:, 1] > 0.0)
@@ -278,30 +324,90 @@ class CutMixBatchAugment:
                             & (mixed_5d[:, 4] > 0.0)
                         ).to(dtype=mixed_mask_5d.dtype).unsqueeze(-1)
 
-                        if "y_ratio" in batch:
-                            y_ratio_new = torch.stack([
-                                mixed_5d[:, 0] / mixed_total,
-                                mixed_5d[:, 1] / mixed_total,
-                                mixed_5d[:, 2] / mixed_total,
-                            ], dim=-1)
-                            y_ratio_new = torch.nan_to_num(y_ratio_new, nan=0.0, posinf=0.0, neginf=0.0)
+                        has_any_5d = (mixed_mask_5d.sum(dim=-1, keepdim=True) > 0.0).to(
+                            dtype=mixed_mask_5d.dtype
+                        )
 
-                            rm = batch.get("ratio_mask", None)
-                            pm = prev.get("ratio_mask", None)
-                            if isinstance(rm, torch.Tensor) and isinstance(pm, torch.Tensor) and pm.numel() > 0 and pm.shape == rm.shape:
-                                rm_mixed = (rm.to(torch.bool) & pm.to(torch.bool).to(rm.device)) if (rm.dtype == torch.bool or pm.dtype == torch.bool) else (rm * pm.to(rm.device, dtype=rm.dtype))
-                                if rm_mixed.dim() == 1:
-                                    rm_mixed = rm_mixed.view(bsz, 1)
-                                batch["ratio_mask"] = rm_mixed.to(dtype=mixed_mask_5d.dtype) * ratio_mask_from_5d
+                        y_ratio_existing = batch.get("y_ratio", None)
+                        y_ratio_prev = prev.get("y_ratio", None)
+                        ratio_mask_existing = batch.get("ratio_mask", None)
+                        ratio_mask_prev = prev.get("ratio_mask", None)
+
+                        y_ratio_mixed = None
+                        ratio_mask_mixed = None
+                        if (
+                            isinstance(y_ratio_existing, torch.Tensor)
+                            and isinstance(y_ratio_prev, torch.Tensor)
+                            and y_ratio_prev.shape == y_ratio_existing.shape
+                            and y_ratio_existing.dim() == 2
+                            and y_ratio_existing.size(0) == bsz
+                            and y_ratio_existing.size(1) >= 3
+                        ):
+                            y_ratio_safe = torch.nan_to_num(
+                                y_ratio_existing, nan=0.0, posinf=0.0, neginf=0.0
+                            )
+                            y_ratio_prev_safe = torch.nan_to_num(
+                                y_ratio_prev.to(y_ratio_safe.device, dtype=y_ratio_safe.dtype),
+                                nan=0.0,
+                                posinf=0.0,
+                                neginf=0.0,
+                            )
+                            y_ratio_mixed = lam_eff * y_ratio_safe + (1.0 - lam_eff) * y_ratio_prev_safe
+
+                        if (
+                            isinstance(ratio_mask_existing, torch.Tensor)
+                            and isinstance(ratio_mask_prev, torch.Tensor)
+                            and ratio_mask_prev.shape == ratio_mask_existing.shape
+                            and ratio_mask_existing.dim() >= 1
+                            and ratio_mask_existing.size(0) == bsz
+                        ):
+                            rm = ratio_mask_existing
+                            pm = ratio_mask_prev.to(rm.device)
+                            if rm.dtype == torch.bool or pm.dtype == torch.bool:
+                                ratio_mask_mixed = (rm.to(torch.bool) & pm.to(torch.bool)).to(
+                                    dtype=mixed_mask_5d.dtype
+                                )
                             else:
-                                batch["ratio_mask"] = ratio_mask_from_5d
-                            rm_f = batch.get("ratio_mask", None)
-                            if isinstance(rm_f, torch.Tensor):
-                                rm_f2 = rm_f.to(device=y_ratio_new.device, dtype=y_ratio_new.dtype)
-                                if rm_f2.dim() == 1:
-                                    rm_f2 = rm_f2.view(bsz, 1)
-                                y_ratio_new = torch.where(rm_f2 > 0.0, y_ratio_new, torch.zeros_like(y_ratio_new))
-                            batch["y_ratio"] = y_ratio_new
+                                ratio_mask_mixed = rm.to(dtype=mixed_mask_5d.dtype) * pm.to(
+                                    dtype=mixed_mask_5d.dtype
+                                )
+                            if ratio_mask_mixed.dim() == 1:
+                                ratio_mask_mixed = ratio_mask_mixed.view(bsz, 1)
+
+                        if ratio_mask_mixed is None:
+                            ratio_mask_out = ratio_mask_from_5d
+                        else:
+                            ratio_mask_out = torch.where(
+                                has_any_5d > 0.0,
+                                ratio_mask_mixed * ratio_mask_from_5d,
+                                ratio_mask_mixed,
+                            )
+                        batch["ratio_mask"] = ratio_mask_out
+
+                        if isinstance(y_ratio_existing, torch.Tensor):
+                            y_ratio_from_5d = torch.stack(
+                                [
+                                    mixed_5d[:, 0] / mixed_total,
+                                    mixed_5d[:, 1] / mixed_total,
+                                    mixed_5d[:, 2] / mixed_total,
+                                ],
+                                dim=-1,
+                            )
+                            y_ratio_from_5d = torch.nan_to_num(
+                                y_ratio_from_5d, nan=0.0, posinf=0.0, neginf=0.0
+                            )
+                            if y_ratio_mixed is None:
+                                y_ratio_out = y_ratio_from_5d
+                            else:
+                                use_from_5d = (has_any_5d > 0.0) & (ratio_mask_from_5d > 0.0)
+                                y_ratio_out = torch.where(use_from_5d, y_ratio_from_5d, y_ratio_mixed)
+                            rm_f = ratio_mask_out.to(device=y_ratio_out.device, dtype=y_ratio_out.dtype)
+                            if rm_f.dim() == 1:
+                                rm_f = rm_f.view(bsz, 1)
+                            y_ratio_out = torch.where(
+                                rm_f > 0.0, y_ratio_out, torch.zeros_like(y_ratio_out)
+                            )
+                            batch["y_ratio"] = y_ratio_out
                         applied = True
 
             # Update cache for next time

@@ -145,6 +145,7 @@ def _build_datamodule(
         if irish_cfg.get("csv", None) is not None
         else None,
         irish_image_dir=str(irish_cfg.get("image_dir", "images")),
+        irish_supervise_ratio=bool(irish_cfg.get("supervise_ratio", False)),
         irish_image_size=parse_image_size(
             irish_cfg.get("image_size", cfg["data"]["image_size"])
         )
@@ -304,6 +305,20 @@ def train_single_split(
         backbone_layers_cfg.get("separate_bottlenecks", True)
     )
 
+    # Ratio head coupling mode (enum). Prefer the new single-field config, but
+    # fall back to legacy boolean flags for backward compatibility with old YAMLs.
+    head_cfg = cfg.get("model", {}).get("head", {}) if isinstance(cfg.get("model", {}), dict) else {}
+    try:
+        from src.models.regressor.heads.ratio_mode import resolve_ratio_head_mode
+
+        ratio_head_mode = resolve_ratio_head_mode(
+            head_cfg.get("ratio_head_mode", None),
+            separate_ratio_head=head_cfg.get("separate_ratio_head", None),
+            separate_ratio_spatial_head=head_cfg.get("separate_ratio_spatial_head", None),
+        )
+    except Exception:
+        ratio_head_mode = str(head_cfg.get("ratio_head_mode", "shared") or "shared").strip().lower()
+
     # Optimizer / SAM configuration
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_name = str(optimizer_cfg.get("name", "adamw"))
@@ -347,6 +362,8 @@ def train_single_split(
         use_cls_token=bool(cfg["model"]["head"].get("use_cls_token", True)),
         # Optional patch-based main regression path (scheme A: only main task uses patch path).
         use_patch_reg3=bool(cfg["model"]["head"].get("use_patch_reg3", False)),
+        # Optional separate ratio head branch (decouples ratio MLP trunk from reg3 trunk).
+        ratio_head_mode=str(ratio_head_mode),
         log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
         area_m2=float(area_m2),
         reg3_zscore_mean=list(dm.reg3_zscore_mean or [])

@@ -1,10 +1,12 @@
 {
-  "enabled": false,
+  "enabled": true,
   "versions": [
-    "patch-reg3-seprate_head",
-    "mainfold-mixup-no-patch-reg3-multilayer",
-    "mainfold-mixup-no-patch-reg3-multilayer-log",
-    "vit7b-layer37-39"
+    "vitdet-128-v3",
+    "vitdet-64-irish-e15",
+    "vitdet-320-v2-small-aug-sep-head-mlp",
+    "vitdet-512",
+    "vitdet-320-v2-small-aug",
+    "vitdet-512-seed114514"
   ]
 }
 

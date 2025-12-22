@@ -48,6 +48,8 @@ def init_dpt_head(
         num_outputs_main=int(num_outputs_main),
         num_outputs_ratio=3 if bool(enable_ratio_head) else 0,
         enable_ndvi=bool(enable_ndvi),
+        separate_ratio_head=bool(getattr(model, "separate_ratio_head", False)),
+        separate_ratio_spatial_head=bool(getattr(model, "separate_ratio_spatial_head", False)),
         head_hidden_dims=list(hidden_dims),
         head_activation=str(head_activation),
         dropout=float(dropout or 0.0),

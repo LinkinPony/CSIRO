@@ -52,6 +52,8 @@ def init_fpn_head(
         num_outputs_main=int(num_outputs_main),
         num_outputs_ratio=3 if bool(enable_ratio_head) else 0,
         enable_ndvi=bool(enable_ndvi),
+        separate_ratio_head=bool(getattr(model, "separate_ratio_head", False)),
+        separate_ratio_spatial_head=bool(getattr(model, "separate_ratio_spatial_head", False)),
         patch_size=int(fpn_patch_size),
         reverse_level_order=bool(fpn_reverse_level_order),
     )
