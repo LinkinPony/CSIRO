@@ -1,5 +1,5 @@
 seed: 42
-version: vitdet-512-v3-r16-no-ndvi
+version: vitdet-512-v4-log-fixcv
 data:
   root: data
   train_csv: train.csv
@@ -64,13 +64,38 @@ data:
     watermark:
       enabled: true
       prob: 0.3
+      # Camera-like timestamp watermark (matches typical CSIRO photos):
+      # - larger, bottom-right anchored
+      # - orange digits with a subtle black shadow (no gray "bar"/edge artifacts)
+      style: camera_timestamp
+      # Add variability: mostly bottom-right, sometimes other corners (still "camera-like").
+      position: bottom_right
+      position_choices: [bottom_right, bottom_left, top_right, top_left]
+      position_probs: [0.7, 0.15, 0.10, 0.05]
+      timestamp_prob: 1.0
+      timestamp_format: "%d %m %Y %H:%M"
+      margin_frac_range: [0.008, 0.05]
+      font_size_frac_range: [0.05, 0.10]
+      alpha_range: [150, 255]
+      # Multiple timestamp colors + small RGB jitter for natural variance.
+      color_choices:
+        - [255, 140, 0]
+        - [255, 120, 0]
+        - [255, 170, 40]
+        - [255, 200, 0]
+        - [255, 255, 255]
+      color_jitter: 50
+      render_mode: shadow
+      shadow_color: [0, 0, 0]
+      shadow_alpha_range: [160, 255]
+      shadow_offset_frac_range: [0.03, 0.07]
+      # Optional: set a specific TTF for exact look; otherwise a system TTF (e.g. DejaVuSans-Bold) is auto-detected.
+      # font_path: /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+      # For random string watermark instead of timestamp:
+      # style: random
       texts: []
-      use_random_text: true
+      use_random_text: false
       random_text_length_range: [3, 20]
-      timestamp_prob: 0.5
-      font_size_frac_range: [0.04, 0.12]
-      alpha_range: [128, 200]
-      # color_choices: [[255,255,255],[255,230,0],[0,255,255],[255,128,0]]
     light_spot:
       enabled: true
       # NDVI hand-held device artifacts often look like a small *red* flare (strong core + soft halo).
@@ -104,7 +129,7 @@ data:
       # Optional: if your spots are mostly near the top, uncomment to bias the center:
       # center_y_frac_range: [0.0, 0.6]
     random_erasing:
-      enabled: true
+      enabled: false
       p: 0.25
       scale: [0.02, 0.1]
       ratio: [0.3, 3.3]
@@ -173,7 +198,7 @@ model:
   # - dinov3_vith16plus -> 1280
   # - dinov3_vit7b16    -> 4096
   embedding_dim: 1280
-  log_scale_targets: false
+  log_scale_targets: true
   head:
     # Head architecture:
     # - mlp (legacy global scalar head)

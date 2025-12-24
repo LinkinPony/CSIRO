@@ -1,4 +1,5 @@
 import math
+import os
 import random
 import string
 from datetime import datetime, timedelta
@@ -78,25 +79,91 @@ class RandomWatermark:
         p: float = 0.3,
         texts: Optional[List[str]] = None,
         timestamp_prob: float = 0.5,
+        timestamp_format: str = "%Y-%m-%d %H:%M:%S",
         font_path: Optional[str] = None,
         font_size_frac_range: Tuple[float, float] = (0.04, 0.12),
         alpha_range: Tuple[int, int] = (128, 200),
         color_choices: Optional[List[Tuple[int, int, int]]] = None,
+        color_jitter: int = 0,
         use_random_text: bool = False,
         random_text_length_range: Tuple[int, int] = (6, 12),
         charset: Optional[str] = None,
+        # New: camera-like styling controls (all optional; defaults keep legacy behavior).
+        style: str = "random",  # "random" | "camera_timestamp"
+        position: str = "random",  # "random" | "bottom_right" | "bottom_left" | "top_left" | "top_right"
+        position_choices: Optional[List[str]] = None,
+        position_probs: Optional[List[float]] = None,
+        margin_frac_range: Tuple[float, float] = (0.01, 0.04),
+        render_mode: Optional[str] = None,  # None => style-dependent default ("stroke" for random, "shadow" for camera)
+        # Shadow rendering (used when render_mode == "shadow")
+        shadow_color: Tuple[int, int, int] = (0, 0, 0),
+        shadow_alpha_range: Tuple[int, int] = (140, 255),
+        shadow_offset_frac_range: Tuple[float, float] = (0.03, 0.07),  # of font_size
+        # Stroke rendering (used when render_mode == "stroke")
+        stroke_color: Tuple[int, int, int] = (0, 0, 0),
+        stroke_alpha_mult: float = 1.0,
+        stroke_width_frac: float = 1.0 / 15.0,
     ) -> None:
         self.p = float(p)
         self.texts = list(texts or ["CSIRO", "Biomass", "Train", "Sample"])
         self.timestamp_prob = float(timestamp_prob)
+        self.timestamp_format = str(timestamp_format or "%Y-%m-%d %H:%M:%S")
         self.font_path = font_path
         self.font_size_frac_range = (float(font_size_frac_range[0]), float(font_size_frac_range[1]))
         self.alpha_range = (int(alpha_range[0]), int(alpha_range[1]))
         self.color_choices = list(color_choices or [(255, 255, 255), (255, 230, 0), (0, 255, 255), (255, 128, 0)])
+        self.color_jitter = int(color_jitter)
         self.use_random_text = bool(use_random_text)
         self.random_text_length_range = (int(random_text_length_range[0]), int(random_text_length_range[1]))
         default_charset = string.ascii_uppercase + string.digits
         self.charset = str(charset) if (charset and isinstance(charset, str) and len(charset) > 0) else default_charset
+
+        self.style = str(style or "random").strip().lower()
+        self.position = str(position or "random").strip().lower()
+        self.position_choices: Optional[List[str]] = None
+        self.position_probs: Optional[List[float]] = None
+        if position_choices is not None:
+            try:
+                choices = [str(x).strip().lower() for x in list(position_choices) if str(x).strip() != ""]
+            except Exception:
+                choices = []
+            if len(choices) > 0:
+                self.position_choices = choices
+                if position_probs is not None:
+                    try:
+                        probs = [float(x) for x in list(position_probs)]
+                    except Exception:
+                        probs = []
+                    if len(probs) == len(choices) and any(p > 0.0 for p in probs):
+                        self.position_probs = probs
+        self.margin_frac_range = (float(margin_frac_range[0]), float(margin_frac_range[1]))
+
+        # Defaults by style: keep legacy look for "random"; use shadow for camera-like timestamps.
+        if render_mode is None:
+            self.render_mode = "shadow" if self.style in {"camera", "camera_timestamp"} else "stroke"
+        else:
+            self.render_mode = str(render_mode).strip().lower()
+
+        self.shadow_color = (int(shadow_color[0]), int(shadow_color[1]), int(shadow_color[2]))
+        self.shadow_alpha_range = (int(shadow_alpha_range[0]), int(shadow_alpha_range[1]))
+        self.shadow_offset_frac_range = (float(shadow_offset_frac_range[0]), float(shadow_offset_frac_range[1]))
+
+        self.stroke_color = (int(stroke_color[0]), int(stroke_color[1]), int(stroke_color[2]))
+        self.stroke_alpha_mult = float(stroke_alpha_mult)
+        self.stroke_width_frac = float(stroke_width_frac)
+
+    @staticmethod
+    def _iter_default_font_paths() -> List[str]:
+        # Prefer bold, scalable system fonts. Works well on most Linux distros.
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+        return [p for p in candidates if os.path.exists(p)]
 
     def _choose_font(self, size: int) -> ImageFont.ImageFont:
         try:
@@ -105,9 +172,73 @@ class RandomWatermark:
         except Exception:
             pass
         try:
+            # Try common system fonts (scalable). This fixes "tiny watermark" when no font_path is set.
+            for p in self._iter_default_font_paths():
+                try:
+                    return ImageFont.truetype(p, size=size)
+                except Exception:
+                    continue
+            # Try by name (Pillow may resolve these via fontconfig on some setups)
+            for name in ["DejaVuSans-Bold.ttf", "DejaVuSans.ttf", "LiberationSans-Bold.ttf", "LiberationSans-Regular.ttf"]:
+                try:
+                    return ImageFont.truetype(name, size=size)
+                except Exception:
+                    continue
             return ImageFont.load_default()
         except Exception:
             return ImageFont.load_default()
+
+    def _sample_timestamp_text(self) -> str:
+        # Generate a reproducible pseudo-timestamp based only on RNG state,
+        # which is seeded globally via pl.seed_everything(cfg['seed'], workers=True).
+        base = datetime(2010, 1, 1, 0, 0, 0)
+        # Sample up to ~20 years worth of seconds for variety.
+        max_offset_seconds = 20 * 365 * 24 * 60 * 60
+        offset_seconds = random.randint(0, max_offset_seconds)
+        ts = base + timedelta(seconds=offset_seconds)
+        fmt = self.timestamp_format or "%Y-%m-%d %H:%M:%S"
+        try:
+            return ts.strftime(fmt)
+        except Exception:
+            return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _clamp_int(x: int, lo: int, hi: int) -> int:
+        return lo if x < lo else (hi if x > hi else int(x))
+
+    @staticmethod
+    def _sample_int_range(lo: int, hi: int) -> int:
+        lo_i, hi_i = int(lo), int(hi)
+        if hi_i < lo_i:
+            hi_i = lo_i
+        return random.randint(lo_i, hi_i)
+
+    def _sample_margin_px(self, *, w: int, h: int) -> Tuple[int, int]:
+        lo_f, hi_f = float(self.margin_frac_range[0]), float(self.margin_frac_range[1])
+        lo_f, hi_f = (lo_f, hi_f) if hi_f >= lo_f else (hi_f, lo_f)
+        base = max(0.0, random.uniform(lo_f, hi_f))
+        m = int(round(min(w, h) * base))
+        return max(0, m), max(0, m)
+
+    def _pick_position_bbox_topleft(self, *, w: int, h: int, tw: int, th: int, position: str) -> Tuple[int, int]:
+        # Returns the top-left corner for the *text bounding box* (not the draw origin).
+        pos = str(position or "random").strip().lower()
+        if pos in {"bottom_right", "br"}:
+            mx, my = self._sample_margin_px(w=w, h=h)
+            return max(0, w - tw - mx), max(0, h - th - my)
+        if pos in {"bottom_left", "bl"}:
+            mx, my = self._sample_margin_px(w=w, h=h)
+            return mx, max(0, h - th - my)
+        if pos in {"top_left", "tl"}:
+            mx, my = self._sample_margin_px(w=w, h=h)
+            return mx, my
+        if pos in {"top_right", "tr"}:
+            mx, my = self._sample_margin_px(w=w, h=h)
+            return max(0, w - tw - mx), my
+        # Legacy random placement
+        x0 = random.randint(0, max(0, w - tw)) if w > tw else 0
+        y0 = random.randint(0, max(0, h - th)) if h > th else 0
+        return x0, y0
 
     def __call__(self, img: Image.Image) -> Image.Image:
         if self.p <= 0.0:
@@ -121,49 +252,80 @@ class RandomWatermark:
         overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
 
-        use_ts = random.random() < self.timestamp_prob
-        if use_ts:
-            # Generate a reproducible pseudo-timestamp based only on RNG state,
-            # which is seeded globally via pl.seed_everything(cfg['seed'], workers=True).
-            # This avoids dependence on wall-clock time while still producing
-            # realistic-looking timestamps.
-            base = datetime(2020, 1, 1, 0, 0, 0)
-            # Sample up to ~10 years worth of seconds for variety.
-            max_offset_seconds = 10 * 365 * 24 * 60 * 60
-            offset_seconds = random.randint(0, max_offset_seconds)
-            ts = base + timedelta(seconds=offset_seconds)
-            text = ts.strftime("%Y-%m-%d %H:%M:%S")
+        # Text selection: by style, we can force a camera-like timestamp.
+        if self.style in {"camera", "camera_timestamp"}:
+            text = self._sample_timestamp_text()
         else:
-            if self.use_random_text:
-                lo, hi = self.random_text_length_range
-                if hi < lo:
-                    hi = lo
-                length = random.randint(max(1, lo), max(1, hi))
-                text = "".join(random.choices(self.charset, k=length))
+            use_ts = random.random() < self.timestamp_prob
+            if use_ts:
+                text = self._sample_timestamp_text()
             else:
-                # fallback to provided texts
-                choices = self.texts if len(self.texts) > 0 else ["WATERMARK"]
-                text = random.choice(choices)
+                if self.use_random_text:
+                    lo, hi = self.random_text_length_range
+                    if hi < lo:
+                        hi = lo
+                    length = random.randint(max(1, lo), max(1, hi))
+                    text = "".join(random.choices(self.charset, k=length))
+                else:
+                    # fallback to provided texts
+                    choices = self.texts if len(self.texts) > 0 else ["WATERMARK"]
+                    text = random.choice(choices)
 
         font_size = max(12, int(min(w, h) * random.uniform(*self.font_size_frac_range)))
         font = self._choose_font(font_size)
         color = random.choice(self.color_choices)
+        if self.color_jitter:
+            j = abs(int(self.color_jitter))
+            if j > 0:
+                r = self._clamp_int(int(color[0]) + random.randint(-j, j), 0, 255)
+                g = self._clamp_int(int(color[1]) + random.randint(-j, j), 0, 255)
+                b = self._clamp_int(int(color[2]) + random.randint(-j, j), 0, 255)
+                color = (r, g, b)
         alpha = int(random.randint(*self.alpha_range))
         fill = (int(color[0]), int(color[1]), int(color[2]), alpha)
 
-        # Random position ensuring the text fits
+        # Positioning ensuring the text fits. We position using the text bbox (handles fonts with negative offsets).
         try:
             bbox = draw.textbbox((0, 0), text, font=font)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            left, top, right, bottom = bbox
+            tw, th = right - left, bottom - top
         except Exception:
-            tw, th = font_size * len(text), int(font_size * 1.2)
-        x = random.randint(0, max(0, w - tw)) if w > tw else 0
-        y = random.randint(0, max(0, h - th)) if h > th else 0
+            left, top, tw, th = 0, 0, font_size * len(text), int(font_size * 1.2)
 
-        # Stroke to enhance visibility
-        try:
-            draw.text((x, y), text, font=font, fill=fill, stroke_width=max(1, font_size // 15), stroke_fill=(0, 0, 0, alpha))
-        except Exception:
+        pos = self.position
+        if self.position_choices is not None:
+            try:
+                pos = random.choices(self.position_choices, weights=self.position_probs, k=1)[0]
+            except Exception:
+                pos = random.choice(self.position_choices)
+        x0, y0 = self._pick_position_bbox_topleft(w=w, h=h, tw=int(tw), th=int(th), position=pos)
+        # draw origin so that bbox top-left lands at (x0,y0)
+        x = int(x0 - left)
+        y = int(y0 - top)
+
+        # Render: camera-like shadow or legacy stroke.
+        if self.render_mode == "shadow":
+            # Shadow first (slight offset), then main text.
+            try:
+                lo, hi = float(self.shadow_offset_frac_range[0]), float(self.shadow_offset_frac_range[1])
+                lo, hi = (lo, hi) if hi >= lo else (hi, lo)
+                off = max(1, int(round(font_size * random.uniform(max(0.0, lo), max(0.0, hi)))))
+                shadow_alpha = self._sample_int_range(*self.shadow_alpha_range)
+                shadow_fill = (self.shadow_color[0], self.shadow_color[1], self.shadow_color[2], self._clamp_int(shadow_alpha, 0, 255))
+                draw.text((x + off, y + off), text, font=font, fill=shadow_fill)
+            except Exception:
+                pass
+            draw.text((x, y), text, font=font, fill=fill)
+        elif self.render_mode == "stroke":
+            # Stroke to enhance visibility (legacy behavior).
+            stroke_w = max(1, int(round(font_size * max(0.0, self.stroke_width_frac))))
+            stroke_alpha = int(self._clamp_int(int(round(alpha * self.stroke_alpha_mult)), 0, 255))
+            stroke_fill = (self.stroke_color[0], self.stroke_color[1], self.stroke_color[2], stroke_alpha)
+            try:
+                draw.text((x, y), text, font=font, fill=fill, stroke_width=stroke_w, stroke_fill=stroke_fill)
+            except Exception:
+                draw.text((x, y), text, font=font, fill=fill)
+        else:
             draw.text((x, y), text, font=font, fill=fill)
 
         out = Image.alpha_composite(rgba, overlay)
@@ -600,18 +762,36 @@ def _maybe_add_random_erasing(cfg: Dict[str, Any], transforms_list: List[Any]) -
 def _maybe_add_visual_overlays(cfg: Dict[str, Any], transforms_list: List[Any]) -> None:
     wm_cfg: Dict[str, Any] = dict(cfg.get("watermark", {}))
     if bool(wm_cfg.get("enabled", False)):
+        # Backward compatible: support both "style" and legacy "mode" key naming.
+        style = wm_cfg.get("style", wm_cfg.get("mode", "random"))
+        pos_choices = list(wm_cfg.get("position_choices", wm_cfg.get("anchor_choices", [])) or [])
+        pos_probs = list(wm_cfg.get("position_probs", wm_cfg.get("anchor_probs", [])) or [])
         transforms_list.append(
             RandomWatermark(
                 p=float(wm_cfg.get("prob", 0.3)),
                 texts=list(wm_cfg.get("texts", [])) or None,
                 timestamp_prob=float(wm_cfg.get("timestamp_prob", 0.5)),
+                timestamp_format=str(wm_cfg.get("timestamp_format", wm_cfg.get("timestamp_fmt", "%Y-%m-%d %H:%M:%S"))),
                 font_path=wm_cfg.get("font_path", None),
                 font_size_frac_range=tuple(wm_cfg.get("font_size_frac_range", [0.04, 0.12])),
                 alpha_range=tuple(wm_cfg.get("alpha_range", [128, 200])),
                 color_choices=list(wm_cfg.get("color_choices", [])) or None,
+                color_jitter=int(wm_cfg.get("color_jitter", 0)),
                 use_random_text=bool(wm_cfg.get("use_random_text", False)),
                 random_text_length_range=tuple(wm_cfg.get("random_text_length_range", [6, 12])),
                 charset=str(wm_cfg.get("charset", "")) if wm_cfg.get("charset", None) is not None else None,
+                style=str(style),
+                position=str(wm_cfg.get("position", wm_cfg.get("anchor", "random"))),
+                position_choices=pos_choices or None,
+                position_probs=pos_probs or None,
+                margin_frac_range=tuple(wm_cfg.get("margin_frac_range", [0.01, 0.04])),
+                render_mode=wm_cfg.get("render_mode", None),
+                shadow_color=tuple(wm_cfg.get("shadow_color", [0, 0, 0])),
+                shadow_alpha_range=tuple(wm_cfg.get("shadow_alpha_range", [140, 255])),
+                shadow_offset_frac_range=tuple(wm_cfg.get("shadow_offset_frac_range", [0.03, 0.07])),
+                stroke_color=tuple(wm_cfg.get("stroke_color", [0, 0, 0])),
+                stroke_alpha_mult=float(wm_cfg.get("stroke_alpha_mult", 1.0)),
+                stroke_width_frac=float(wm_cfg.get("stroke_width_frac", 1.0 / 15.0)),
             )
         )
 

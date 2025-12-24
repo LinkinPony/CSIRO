@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "versions": [
     "vitdet-512-v3-r16-no-ndvi",
     "vitdet-512-v3",

@@ -165,6 +165,13 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
         and "Sampling_Date" in full_df.columns
         and "State" in full_df.columns
     )
+    if group_by_date_state and not use_grouped_kfold:
+        logger.warning(
+            "k-fold config requests grouped splitting by (Sampling_Date, State) "
+            "but the dataframe is missing one or both columns. Falling back to per-image k-fold. "
+            "This can significantly inflate CV metrics. "
+            "Ensure your datamodule includes 'Sampling_Date' and 'State' in build_full_dataframe()."
+        )
 
     group_indices = None  # type: ignore[assignment]
     fold_group_ids = None  # type: ignore[assignment]

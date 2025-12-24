@@ -18,3 +18,4 @@ from src.models.regressor.heads.vitdet import (  # noqa: F401
 __all__ = ["ViTDetHeadConfig", "ViTDetScalarHead", "ViTDetMultiLayerScalarHead"]
 
 
+

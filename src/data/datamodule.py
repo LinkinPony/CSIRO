@@ -384,13 +384,16 @@ class PastureDataModule(LightningDataModule):
         )
         image_path_series = df.groupby("image_id")["image_path"].first()
         # also aggregate auxiliary labels
+        # Keep Sampling_Date at image-level so k-fold can optionally group by (Sampling_Date, State).
+        sampling_date_series = df.groupby("image_id")["Sampling_Date"].first()
         height_series = df.groupby("image_id")["Height_Ave_cm"].first()
         ndvi_series = df.groupby("image_id")["Pre_GSHH_NDVI"].first()
         species_series = df.groupby("image_id")["Species"].first()
         state_series = df.groupby("image_id")["State"].first()
         merged = pivot.join(image_path_series, how="inner")
         merged = (
-            merged.join(height_series, how="left")
+            merged.join(sampling_date_series, how="left")
+            .join(height_series, how="left")
             .join(ndvi_series, how="left")
             .join(species_series, how="left")
             .join(state_series, how="left")
@@ -418,6 +421,7 @@ class PastureDataModule(LightningDataModule):
             "Pre_GSHH_NDVI",
             "Species",
             "State",
+            "Sampling_Date",
             "image_path",
             "image_id",
         ]
