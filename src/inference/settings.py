@@ -32,4 +32,18 @@ class InferenceSettings:
     # Inference batch size (decoupled from training config).
     infer_batch_size: int = 1
 
+    # --------------------
+    # MC Dropout (head-only) for uncertainty / robustness.
+    #
+    # IMPORTANT:
+    # - We only enable Dropout layers inside the regression head during inference.
+    # - Backbone stays in eval() and is only forwarded once per batch.
+    # - We do NOT put the whole head in train() (to avoid BatchNorm / other stateful layers).
+    # --------------------
+    mc_dropout_enabled: bool = False
+    mc_dropout_samples: int = 1
+    # Optional base seed for reproducible MC sampling. When set (>=0), per-head seeds
+    # are derived deterministically from this value.
+    mc_dropout_seed: int = -1
+
 

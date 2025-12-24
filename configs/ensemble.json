@@ -1,12 +1,10 @@
 {
   "enabled": true,
   "versions": [
-    "vitdet-128-v3",
-    "vitdet-64-irish-e15",
-    "vitdet-320-v2-small-aug-sep-head-mlp",
-    "vitdet-512",
-    "vitdet-320-v2-small-aug",
-    "vitdet-512-seed114514"
+    "vitdet-512-v3-r16-no-ndvi",
+    "vitdet-512-v3",
+    "vitdet-512-v3-seed2",
+    "vitdet-512-v3-r16"
   ]
 }
 

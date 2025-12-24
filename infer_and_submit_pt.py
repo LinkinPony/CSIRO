@@ -1,5 +1,8 @@
 # ===== Required user variables =====
 # Backward-compat: WEIGHTS_PT_PATH is ignored when HEAD_WEIGHTS_PT_PATH is provided.
+from pickle import TRUE
+
+
 HEAD_WEIGHTS_PT_PATH = "weights/head/"  # regression head-only weights (.pt)
 # Backbone weights path can be EITHER:
 #  - a single weights file (.pt or .pth), OR
@@ -33,6 +36,13 @@ VIT7B_MP_DTYPE = "fp16"  # one of: "fp16", "fp32"
 
 # ===== Inference runtime settings (not read from YAML) =====
 INFER_BATCH_SIZE = 1
+# ===== MC Dropout (head-only) =====
+# When enabled, we keep backbone in eval() and sample the regression head K times with Dropout active.
+# This provides a simple predictive uncertainty estimate and sometimes improves robustness.
+MC_DROPOUT_ENABLED = False
+MC_DROPOUT_SAMPLES = 64  # typical: 8-32
+# Optional base seed for reproducible MC sampling. Set to -1 to disable seeding.
+MC_DROPOUT_SEED = 42
 # ==========================================================
 
 
@@ -101,6 +111,9 @@ def main() -> None:
         vit7b_mp_split_idx=int(VIT7B_MP_SPLIT_IDX),
         vit7b_mp_dtype=str(VIT7B_MP_DTYPE),
         infer_batch_size=int(INFER_BATCH_SIZE),
+        mc_dropout_enabled=bool(MC_DROPOUT_ENABLED),
+        mc_dropout_samples=int(MC_DROPOUT_SAMPLES),
+        mc_dropout_seed=int(MC_DROPOUT_SEED),
     )
     run(settings)
 

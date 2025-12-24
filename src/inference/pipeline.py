@@ -365,7 +365,7 @@ def infer_components_5d_for_model(
     comps_sum: Optional[torch.Tensor] = None
     weight_sum: float = 0.0
 
-    for head_pt in head_weight_paths:
+    for head_i, head_pt in enumerate(head_weight_paths):
         w = float(weight_map.get(head_pt, 1.0))
         if not (w > 0.0):
             continue
@@ -596,6 +596,22 @@ def infer_components_5d_for_model(
                     pass
 
         # --- Run inference for this head ---
+        mc_enabled = bool(getattr(settings, "mc_dropout_enabled", False)) and int(getattr(settings, "mc_dropout_samples", 1)) > 1
+        if mc_enabled:
+            # Optional deterministic seeding (per-head) for reproducible MC dropout.
+            try:
+                seed0 = int(getattr(settings, "mc_dropout_seed", -1))
+            except Exception:
+                seed0 = -1
+            if seed0 >= 0:
+                seed_eff = int(seed0) + int(head_i)
+                torch.manual_seed(seed_eff)
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(seed_eff)
+                except Exception:
+                    pass
+
         if head_type_meta == "fpn":
             rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_fpn(
                 backbone=backbone,
@@ -611,6 +627,8 @@ def infer_components_5d_for_model(
                 head_num_ratio=head_num_ratio if head_is_ratio else 0,
                 use_layerwise_heads=use_layerwise_heads_head,
                 layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                mc_dropout_enabled=mc_enabled,
+                mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
             )
         elif head_type_meta == "vitdet":
             rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_vitdet(
@@ -627,6 +645,8 @@ def infer_components_5d_for_model(
                 head_num_ratio=head_num_ratio if head_is_ratio else 0,
                 use_layerwise_heads=use_layerwise_heads_head,
                 layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                mc_dropout_enabled=mc_enabled,
+                mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
             )
         elif head_type_meta == "dpt":
             rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_dpt(
@@ -643,6 +663,8 @@ def infer_components_5d_for_model(
                 head_num_ratio=head_num_ratio if head_is_ratio else 0,
                 use_layerwise_heads=use_layerwise_heads_head,
                 layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                mc_dropout_enabled=mc_enabled,
+                mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
             )
         elif use_patch_reg3_head:
             rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_patch_mode(
@@ -662,6 +684,8 @@ def infer_components_5d_for_model(
                 num_layers=max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1,
                 use_separate_bottlenecks=use_separate_bottlenecks_head,
                 layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                mc_dropout_enabled=mc_enabled,
+                mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
             )
         else:
             if use_layerwise_heads_head and len(backbone_layer_indices_head) > 0:
@@ -681,6 +705,8 @@ def infer_components_5d_for_model(
                     layer_indices=backbone_layer_indices_head,
                     use_separate_bottlenecks=use_separate_bottlenecks_head,
                     use_cls_token=use_cls_token_head,
+                    mc_dropout_enabled=mc_enabled,
+                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
                 )
             else:
                 feature_extractor = DinoV3FeatureExtractor(backbone)
@@ -704,6 +730,8 @@ def infer_components_5d_for_model(
                     head_total=head_total,
                     use_layerwise_heads=False,
                     num_layers=1,
+                    mc_dropout_enabled=mc_enabled,
+                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
                 )
 
         if rels_in_order_ref is None:

@@ -13,6 +13,52 @@ from src.inference.mp import module_param_dtype, mp_get_devices_from_backbone
 from src.models.head_builder import MultiLayerHeadExport
 
 
+def _enable_dropout_only_train_mode(module: nn.Module, *, enabled: bool) -> int:
+    """
+    Enable/disable Dropout layers while leaving the rest of the module in eval().
+
+    Why:
+      - MC Dropout requires Dropout layers to run in training mode.
+      - Some heads (e.g., DPT scalar head) contain BatchNorm; calling head.train()
+        would change behavior and can update running stats. We avoid that by only
+        toggling Dropout submodules.
+
+    Returns:
+        Number of dropout modules toggled.
+    """
+    n = 0
+    for m in module.modules():
+        if isinstance(
+            m,
+            (
+                nn.Dropout,
+                nn.Dropout1d,
+                nn.Dropout2d,
+                nn.Dropout3d,
+                nn.AlphaDropout,
+                nn.FeatureAlphaDropout,
+            ),
+        ):
+            m.train(enabled)
+            n += 1
+    return n
+
+
+def _maybe_seed_mc_dropout(seed: int) -> None:
+    """
+    Best-effort seeding for reproducible MC dropout sampling.
+    """
+    if int(seed) < 0:
+        return
+    s = int(seed)
+    torch.manual_seed(s)
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(s)
+    except Exception:
+        pass
+
+
 class DinoV3FeatureExtractor(nn.Module):
     def __init__(self, backbone: nn.Module) -> None:
         super().__init__()
@@ -204,19 +250,28 @@ def predict_from_features(
     head_total: int,
     use_layerwise_heads: bool,
     num_layers: int,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     # For model-parallel backbone inference, prefer placing the head on stage1.
     mp_devs = mp_get_devices_from_backbone(head) if isinstance(head, nn.Module) else None
     device = mp_devs[1] if mp_devs is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     head = head.eval().to(device)
+    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+        _enable_dropout_only_train_mode(head, enabled=True)
     N = features_cpu.shape[0]
     preds_list: List[torch.Tensor] = []
     head_dtype = module_param_dtype(head, default=torch.float32)
     with torch.inference_mode():
         for i in range(0, N, max(1, batch_size)):
             chunk = features_cpu[i : i + max(1, batch_size)].to(device, non_blocking=True, dtype=head_dtype)
-            out = head(chunk)
-            preds_list.append(out.detach().cpu().float())
+            k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+            out_sum = None
+            for _ in range(k):
+                out_k = head(chunk)
+                out_sum = out_k if out_sum is None else (out_sum + out_k)
+            out_mean = out_sum / float(k)  # type: ignore[operator]
+            preds_list.append(out_mean.detach().cpu().float())
     if not preds_list:
         empty_main = torch.empty((0, head_num_main), dtype=torch.float32)
         empty_ratio = torch.empty((0, head_num_ratio), dtype=torch.float32) if head_num_ratio > 0 else None
@@ -279,6 +334,9 @@ def predict_main_and_ratio_patch_mode(
     num_layers: int,
     use_separate_bottlenecks: bool,
     layer_indices: Optional[List[int]] = None,
+    *,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Patch-mode inference for a single head:
@@ -312,6 +370,8 @@ def predict_main_and_ratio_patch_mode(
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     # Place head on stage1 to avoid copying patch tokens back to cuda:0.
     head = head.eval().to(device1)
+    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+        _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
@@ -339,14 +399,28 @@ def predict_main_and_ratio_patch_mode(
                     if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
                         # New path: explicit per-layer bottlenecks encoded in head.
                         pt_l = pt_l.to(device1, non_blocking=True, dtype=head_dtype)
-                        layer_main, layer_ratio = head.forward_patch_layer(pt_l, l_idx)
+                        k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                        main_sum = None
+                        ratio_sum = None
+                        for _ in range(k):
+                            layer_main_k, layer_ratio_k = head.forward_patch_layer(pt_l, l_idx)
+                            main_sum = layer_main_k if main_sum is None else (main_sum + layer_main_k)
+                            if layer_ratio_k is not None:
+                                ratio_sum = layer_ratio_k if ratio_sum is None else (ratio_sum + layer_ratio_k)
+                        layer_main = main_sum / float(k)  # type: ignore[operator]
+                        layer_ratio = (ratio_sum / float(k)) if ratio_sum is not None else None
                     else:
                         expected_dim = head_total * num_layers
                         offset = l_idx * head_total
 
                         if head_num_main > 0:
                             patch_features_flat = pt_l.reshape(B * N, C).to(device1, non_blocking=True, dtype=head_dtype)  # (B*N, C)
-                            out_all_patch = head(patch_features_flat)  # (B*N, head_total * L)
+                            k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                            out_sum = None
+                            for _ in range(k):
+                                out_k = head(patch_features_flat)  # (B*N, head_total * L)
+                                out_sum = out_k if out_sum is None else (out_sum + out_k)
+                            out_all_patch = out_sum / float(k)  # type: ignore[operator]
                             if out_all_patch.shape[1] != expected_dim:
                                 raise RuntimeError(
                                     f"Unexpected packed head dimension in patch-mode multi-layer: got {out_all_patch.shape[1]}, "
@@ -359,7 +433,12 @@ def predict_main_and_ratio_patch_mode(
 
                         if head_num_ratio > 0:
                             patch_mean_l = pt_l.mean(dim=1).to(device1, non_blocking=True, dtype=head_dtype)  # (B, C)
-                            out_all_global = head(patch_mean_l)  # (B, head_total * L)
+                            k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                            out_sum_g = None
+                            for _ in range(k):
+                                out_k_g = head(patch_mean_l)  # (B, head_total * L)
+                                out_sum_g = out_k_g if out_sum_g is None else (out_sum_g + out_k_g)
+                            out_all_global = out_sum_g / float(k)  # type: ignore[operator]
                             if out_all_global.shape[1] != expected_dim:
                                 raise RuntimeError(
                                     f"Unexpected packed head dimension for ratio logits in patch-mode multi-layer: got {out_all_global.shape[1]}, "
@@ -394,7 +473,12 @@ def predict_main_and_ratio_patch_mode(
 
                 if head_num_main > 0:
                     patch_features_flat = pt.reshape(B * N, C).to(device1, non_blocking=True, dtype=head_dtype)  # (B*N, C)
-                    out_all_patch = head(patch_features_flat)  # (B*N, head_total)
+                    k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                    out_sum = None
+                    for _ in range(k):
+                        out_k = head(patch_features_flat)  # (B*N, head_total)
+                        out_sum = out_k if out_sum is None else (out_sum + out_k)
+                    out_all_patch = out_sum / float(k)  # type: ignore[operator]
                     out_main_patch = out_all_patch[:, :head_num_main].view(B, N, head_num_main).mean(dim=1)
                 else:
                     out_main_patch = torch.empty((B, 0), dtype=torch.float32, device=device)
@@ -402,7 +486,12 @@ def predict_main_and_ratio_patch_mode(
                 # Ratio logits from global patch-mean
                 if head_num_ratio > 0:
                     patch_mean = pt.mean(dim=1).to(device1, non_blocking=True, dtype=head_dtype)  # (B, C)
-                    out_all_global = head(patch_mean)  # (B, head_total)
+                    k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                    out_sum_g = None
+                    for _ in range(k):
+                        out_k_g = head(patch_mean)  # (B, head_total)
+                        out_sum_g = out_k_g if out_sum_g is None else (out_sum_g + out_k_g)
+                    out_all_global = out_sum_g / float(k)  # type: ignore[operator]
                     out_ratio = out_all_global[:, head_num_main : head_num_main + head_num_ratio]
                 else:
                     out_ratio = None
@@ -436,6 +525,8 @@ def predict_main_and_ratio_fpn(
     *,
     use_layerwise_heads: bool,
     layer_indices: Optional[List[int]] = None,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     FPN-head inference (Phase A).
@@ -458,6 +549,8 @@ def predict_main_and_ratio_fpn(
     feature_extractor = DinoV3FeatureExtractor(backbone)
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     head = head.eval().to(device1)
+    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+        _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
@@ -470,24 +563,39 @@ def predict_main_and_ratio_fpn(
             H = int(images.shape[-2])
             W = int(images.shape[-1])
 
+            # Backbone forward ONCE per batch; head is sampled K times on the same tokens.
             if use_layerwise_heads and layer_indices is not None and len(layer_indices) > 0:
                 _cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
                 pt_list = [pt.to(device1, non_blocking=True, dtype=head_dtype) for pt in pt_list]
-                out = head(pt_list, image_hw=(H, W))  # type: ignore[call-arg]
+                head_in = ("list", pt_list)
             else:
                 _cls, pt = feature_extractor.forward_cls_and_tokens(images)
                 pt = pt.to(device1, non_blocking=True, dtype=head_dtype)
-                out = head(pt, image_hw=(H, W))  # type: ignore[call-arg]
+                head_in = ("single", pt)
 
-            if not isinstance(out, dict):
-                raise RuntimeError("FPN head forward must return a dict")
-            reg3 = out.get("reg3", None)
-            ratio = out.get("ratio", None)
-            if reg3 is None:
-                raise RuntimeError("FPN head did not return 'reg3'")
-            preds_main_list.append(reg3.detach().cpu().float())
-            if head_num_ratio > 0 and ratio is not None:
-                preds_ratio_list.append(ratio.detach().cpu().float())
+            k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+            reg3_sum = None
+            ratio_sum = None
+            for _ in range(k):
+                if head_in[0] == "list":
+                    out = head(head_in[1], image_hw=(H, W))  # type: ignore[call-arg]
+                else:
+                    out = head(head_in[1], image_hw=(H, W))  # type: ignore[call-arg]
+                if not isinstance(out, dict):
+                    raise RuntimeError("FPN head forward must return a dict")
+                reg3 = out.get("reg3", None)
+                ratio = out.get("ratio", None)
+                if reg3 is None:
+                    raise RuntimeError("FPN head did not return 'reg3'")
+                reg3_sum = reg3 if reg3_sum is None else (reg3_sum + reg3)
+                if head_num_ratio > 0 and ratio is not None:
+                    ratio_sum = ratio if ratio_sum is None else (ratio_sum + ratio)
+
+            reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
+            preds_main_list.append(reg3_mean.detach().cpu().float())
+            if head_num_ratio > 0 and ratio_sum is not None:
+                ratio_mean = ratio_sum / float(k)
+                preds_ratio_list.append(ratio_mean.detach().cpu().float())
 
             rels.extend(list(rel_paths))
 
@@ -515,6 +623,8 @@ def predict_main_and_ratio_vitdet(
     *,
     use_layerwise_heads: bool,
     layer_indices: Optional[List[int]] = None,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     ViTDet-head inference (SimpleFeaturePyramid-style scalar head).
@@ -537,6 +647,8 @@ def predict_main_and_ratio_vitdet(
     feature_extractor = DinoV3FeatureExtractor(backbone)
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     head = head.eval().to(device1)
+    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+        _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
@@ -549,24 +661,39 @@ def predict_main_and_ratio_vitdet(
             H = int(images.shape[-2])
             W = int(images.shape[-1])
 
+            # Backbone forward ONCE per batch; head is sampled K times on the same tokens.
             if use_layerwise_heads and layer_indices is not None and len(layer_indices) > 0:
                 _cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
                 pt_list = [pt.to(device1, non_blocking=True, dtype=head_dtype) for pt in pt_list]
-                out = head(pt_list, image_hw=(H, W))  # type: ignore[call-arg]
+                head_in = ("list", pt_list)
             else:
                 _cls, pt = feature_extractor.forward_cls_and_tokens(images)
                 pt = pt.to(device1, non_blocking=True, dtype=head_dtype)
-                out = head(pt, image_hw=(H, W))  # type: ignore[call-arg]
+                head_in = ("single", pt)
 
-            if not isinstance(out, dict):
-                raise RuntimeError("ViTDet head forward must return a dict")
-            reg3 = out.get("reg3", None)
-            ratio = out.get("ratio", None)
-            if reg3 is None:
-                raise RuntimeError("ViTDet head did not return 'reg3'")
-            preds_main_list.append(reg3.detach().cpu().float())
-            if head_num_ratio > 0 and ratio is not None:
-                preds_ratio_list.append(ratio.detach().cpu().float())
+            k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+            reg3_sum = None
+            ratio_sum = None
+            for _ in range(k):
+                if head_in[0] == "list":
+                    out = head(head_in[1], image_hw=(H, W))  # type: ignore[call-arg]
+                else:
+                    out = head(head_in[1], image_hw=(H, W))  # type: ignore[call-arg]
+                if not isinstance(out, dict):
+                    raise RuntimeError("ViTDet head forward must return a dict")
+                reg3 = out.get("reg3", None)
+                ratio = out.get("ratio", None)
+                if reg3 is None:
+                    raise RuntimeError("ViTDet head did not return 'reg3'")
+                reg3_sum = reg3 if reg3_sum is None else (reg3_sum + reg3)
+                if head_num_ratio > 0 and ratio is not None:
+                    ratio_sum = ratio if ratio_sum is None else (ratio_sum + ratio)
+
+            reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
+            preds_main_list.append(reg3_mean.detach().cpu().float())
+            if head_num_ratio > 0 and ratio_sum is not None:
+                ratio_mean = ratio_sum / float(k)
+                preds_ratio_list.append(ratio_mean.detach().cpu().float())
 
             rels.extend(list(rel_paths))
 
@@ -598,6 +725,8 @@ def predict_main_and_ratio_dpt(
     *,
     use_layerwise_heads: bool,
     layer_indices: Optional[List[int]] = None,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     DPT-head inference.
@@ -619,6 +748,8 @@ def predict_main_and_ratio_dpt(
     feature_extractor = DinoV3FeatureExtractor(backbone)
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     head = head.eval().to(device1)
+    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+        _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
@@ -631,26 +762,43 @@ def predict_main_and_ratio_dpt(
             H = int(images.shape[-2])
             W = int(images.shape[-1])
 
+            # Backbone forward ONCE per batch; head is sampled K times on the same tokens.
             if use_layerwise_heads and layer_indices is not None and len(layer_indices) > 0:
                 cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
                 cls_list = [c.to(device1, non_blocking=True, dtype=head_dtype) for c in cls_list]
                 pt_list = [pt.to(device1, non_blocking=True, dtype=head_dtype) for pt in pt_list]
-                out = head(cls_list, pt_list, image_hw=(H, W))  # type: ignore[call-arg]
+                head_in = ("list", (cls_list, pt_list))
             else:
                 cls, pt = feature_extractor.forward_cls_and_tokens(images)
                 cls = cls.to(device1, non_blocking=True, dtype=head_dtype)
                 pt = pt.to(device1, non_blocking=True, dtype=head_dtype)
-                out = head(cls, pt, image_hw=(H, W))  # type: ignore[call-arg]
+                head_in = ("single", (cls, pt))
 
-            if not isinstance(out, dict):
-                raise RuntimeError("DPT head forward must return a dict")
-            reg3 = out.get("reg3", None)
-            ratio = out.get("ratio", None)
-            if reg3 is None:
-                raise RuntimeError("DPT head did not return 'reg3'")
-            preds_main_list.append(reg3.detach().cpu().float())
-            if head_num_ratio > 0 and ratio is not None:
-                preds_ratio_list.append(ratio.detach().cpu().float())
+            k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+            reg3_sum = None
+            ratio_sum = None
+            for _ in range(k):
+                if head_in[0] == "list":
+                    cls_list_i, pt_list_i = head_in[1]
+                    out = head(cls_list_i, pt_list_i, image_hw=(H, W))  # type: ignore[call-arg]
+                else:
+                    cls_i, pt_i = head_in[1]
+                    out = head(cls_i, pt_i, image_hw=(H, W))  # type: ignore[call-arg]
+                if not isinstance(out, dict):
+                    raise RuntimeError("DPT head forward must return a dict")
+                reg3 = out.get("reg3", None)
+                ratio = out.get("ratio", None)
+                if reg3 is None:
+                    raise RuntimeError("DPT head did not return 'reg3'")
+                reg3_sum = reg3 if reg3_sum is None else (reg3_sum + reg3)
+                if head_num_ratio > 0 and ratio is not None:
+                    ratio_sum = ratio if ratio_sum is None else (ratio_sum + ratio)
+
+            reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
+            preds_main_list.append(reg3_mean.detach().cpu().float())
+            if head_num_ratio > 0 and ratio_sum is not None:
+                ratio_mean = ratio_sum / float(k)  # type: ignore[operator]
+                preds_ratio_list.append(ratio_mean.detach().cpu().float())
 
             rels.extend(list(rel_paths))
 
@@ -680,6 +828,8 @@ def predict_main_and_ratio_global_multilayer(
     *,
     use_separate_bottlenecks: bool = False,
     use_cls_token: bool = True,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Global multi-layer inference for a single head.
@@ -701,6 +851,8 @@ def predict_main_and_ratio_global_multilayer(
     feature_extractor = DinoV3FeatureExtractor(backbone)
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     head = head.eval().to(device1)
+    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+        _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     num_layers = len(layer_indices)
@@ -728,12 +880,26 @@ def predict_main_and_ratio_global_multilayer(
                 cls_l = cls_l.to(device1, non_blocking=True, dtype=head_dtype)
                 patch_mean_l = pt_l.mean(dim=1).to(device1, non_blocking=True, dtype=head_dtype)  # (B, C)
                 if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
-                    layer_main, layer_ratio = head.forward_global_layer(cls_l, patch_mean_l, l_idx)
+                    k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                    main_sum = None
+                    ratio_sum = None
+                    for _ in range(k):
+                        layer_main_k, layer_ratio_k = head.forward_global_layer(cls_l, patch_mean_l, l_idx)
+                        main_sum = layer_main_k if main_sum is None else (main_sum + layer_main_k)
+                        if layer_ratio_k is not None:
+                            ratio_sum = layer_ratio_k if ratio_sum is None else (ratio_sum + layer_ratio_k)
+                    layer_main = main_sum / float(k)  # type: ignore[operator]
+                    layer_ratio = (ratio_sum / float(k)) if ratio_sum is not None else None
                 else:
                     feats_l = torch.cat([cls_l, patch_mean_l], dim=-1) if use_cls_token else patch_mean_l
                     feats_l = feats_l.to(device1, non_blocking=True, dtype=head_dtype)
 
-                    out_all = head(feats_l)  # (B, head_total * num_layers)
+                    k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                    out_sum = None
+                    for _ in range(k):
+                        out_k = head(feats_l)  # (B, head_total * num_layers)
+                        out_sum = out_k if out_sum is None else (out_sum + out_k)
+                    out_all = out_sum / float(k)  # type: ignore[operator]
                     expected_dim = head_total * num_layers
                     if out_all.shape[1] != expected_dim:
                         raise RuntimeError(
