@@ -956,6 +956,14 @@ def build_train_transform_augmix(
     """
     cfg = dict(augment_cfg or {})
     augmix_cfg: Dict[str, Any] = dict(cfg.get("augmix", {}) or {})
+    cons_cfg: Dict[str, Any] = dict(augmix_cfg.get("consistency", {}) or {})
+    cons_enabled = bool(cons_cfg.get("enabled", False))
+    num_aug = int(cons_cfg.get("num_aug", cons_cfg.get("num_views_aug", 2)) or 2)
+    if num_aug < 1:
+        num_aug = 1
+    if num_aug > 2:
+        # Keep the first implementation simple: clean + up to 2 aug views (AugMix-style JSD).
+        num_aug = 2
 
     # If explicitly disabled, fall back to the clean eval pipeline.
     if not bool(augmix_cfg.get("enabled", True)):
@@ -1008,10 +1016,30 @@ def build_train_transform_augmix(
         all_ops=bool(augmix_cfg.get("all_ops", augmix_cfg.get("all", False))),
     )
     augmix_tf = AugMix(preprocess, cfg=am_cfg)
-    aug_tf = T.Compose([*pre_pil, augmix_tf])
 
     # Optional: per-sample probability to bypass augmentation and use clean eval pipeline
     no_aug_prob = float(cfg.get("no_augment_prob", cfg.get("clean_sample_prob", 0.0)))
+    if cons_enabled:
+        # Multi-view output for AugMix-style consistency regularization:
+        # returns (clean, aug1, aug2) (or (clean, aug1) if num_aug==1).
+        class AugMixViews:
+            def __init__(self, *, p_clean: float) -> None:
+                self.p_clean = float(p_clean)
+
+            def __call__(self, img: Any):
+                clean = preprocess(img)
+                # When bypassing augmentation, return identical views so consistency loss is ~0.
+                if self.p_clean > 0.0 and torch.rand(()) < self.p_clean:
+                    if num_aug == 1:
+                        return (clean, clean)
+                    return (clean, clean, clean)
+                if num_aug == 1:
+                    return (clean, augmix_tf(img))
+                return (clean, augmix_tf(img), augmix_tf(img))
+
+        return T.Compose([*pre_pil, AugMixViews(p_clean=no_aug_prob)])
+
+    aug_tf = T.Compose([*pre_pil, augmix_tf])
     if no_aug_prob <= 0.0:
         return aug_tf
 

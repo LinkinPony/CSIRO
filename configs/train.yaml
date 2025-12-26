@@ -1,5 +1,5 @@
 seed: 42
-version: mlp-manifold-mixup-augmix
+version: mlp-manifold-mixup-augmix-consistency
 data:
   root: data
   train_csv: train.csv
@@ -61,6 +61,22 @@ data:
       alpha: 1.0
       # When true, include color/contrast/brightness/sharpness ops in addition to the base ops.
       all_ops: true
+      # Consistency regularization (AugMix-style multi-view):
+      # When enabled, the train transform returns (clean, aug1, aug2) and training adds:
+      #  - reg3 consistency (MSE to the mean prediction)
+      #  - ratio consistency (JSD on softmax probabilities)
+      # Manifold mixup remains enabled and is applied in a view-consistent way (same lam/perm across views).
+      consistency:
+        enabled: true
+        # When loss.weighting=uw, treat the *combined* consistency loss as an independent UW task.
+        uw_task: true
+        # Number of augmented views in addition to clean: 1 => (clean, aug1), 2 => (clean, aug1, aug2)
+        num_aug: 2
+        # Weights for consistency terms added to the supervised loss.
+        weight_reg3: 1.0
+        weight_ratio_jsd: 1.0
+        # Numeric clamp epsilon for JSD mixture log.
+        eps: 1.0e-7
     # RandomResizedCrop is disabled by default.
     #
     # On CSIRO images (native ~2:1 aspect ratio), torchvision's default ratio range (3/4..4/3)
@@ -389,7 +405,7 @@ kfold:
   even_split: true
 
 trainer:
-  max_epochs: 30
+  max_epochs: 15
   accelerator: auto
   devices: 1
   precision: 16-mixed

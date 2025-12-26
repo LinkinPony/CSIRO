@@ -44,8 +44,37 @@ class ManifoldMixup:
             enabled=enabled, prob=prob, alpha=alpha, mix_cls_token=mix_cls_token
         )
 
+    def sample_params(self, *, bsz: int, device: torch.device) -> Tuple[float, Tensor]:
+        """
+        Sample a mixup coefficient and permutation for view-consistent mixup.
+
+        Returns:
+            lam: float in [0, 1]
+            perm: LongTensor of shape (bsz,)
+        """
+        b = int(bsz)
+        if b < 2:
+            return 1.0, torch.arange(b, device=device, dtype=torch.long)
+        lam = 1.0
+        if self.alpha > 0.0:
+            try:
+                lam = float(torch.distributions.Beta(self.alpha, self.alpha).sample().item())
+            except Exception:
+                lam = 1.0
+        if not (0.0 <= lam <= 1.0):
+            lam = 1.0 if lam >= 1.0 else 0.0
+        perm = torch.randperm(b, device=device)
+        return lam, perm
+
     def apply(
-        self, z: Tensor, batch: Dict[str, Tensor], *, force: bool = False
+        self,
+        z: Tensor,
+        batch: Dict[str, Tensor],
+        *,
+        force: bool = False,
+        lam: Optional[float] = None,
+        perm: Optional[Tensor] = None,
+        mix_labels: bool = True,
     ) -> Tuple[Tensor, Dict[str, Tensor], bool]:
         """
         Apply manifold mixup on feature tensor z and relevant regression/5D/ratio targets.
@@ -64,16 +93,35 @@ class ManifoldMixup:
                 return z, batch, False
 
         bsz = z.size(0)
-        lam = 1.0
-        if self.alpha > 0.0:
-            lam = float(
-                torch.distributions.Beta(self.alpha, self.alpha).sample().item()
-            )
+        lam_eff = 1.0
+        if lam is not None:
+            try:
+                lam_eff = float(lam)
+            except Exception:
+                lam_eff = 1.0
+        elif self.alpha > 0.0:
+            lam_eff = float(torch.distributions.Beta(self.alpha, self.alpha).sample().item())
+        # Numeric safety
+        if not (0.0 <= lam_eff <= 1.0):
+            lam_eff = 1.0 if lam_eff >= 1.0 else 0.0
 
         # Case 1: standard in-batch mixup for batch_size >= 2 (unchanged behavior).
         if bsz >= 2:
-            perm = torch.randperm(bsz, device=z.device)
-            z_mixed = lam * z + (1.0 - lam) * z[perm]
+            if perm is None:
+                perm_eff = torch.randperm(bsz, device=z.device)
+            else:
+                try:
+                    perm_eff = perm.to(device=z.device)
+                except Exception:
+                    perm_eff = torch.randperm(bsz, device=z.device)
+                if perm_eff.dim() != 1 or perm_eff.numel() != bsz:
+                    perm_eff = torch.randperm(bsz, device=z.device)
+
+            z_mixed = lam_eff * z + (1.0 - lam_eff) * z[perm_eff]
+
+            # View-consistent mode: allow mixing features/tokens without mixing labels.
+            if not bool(mix_labels):
+                return z_mixed, batch, True
 
             # Mix main scalar regression targets (already in normalized space when applicable)
             for key in ("y_reg3", "y_height", "y_ndvi"):
@@ -86,9 +134,9 @@ class ManifoldMixup:
                     ):
                         y_safe = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
                         y_perm = torch.nan_to_num(
-                            y_safe[perm], nan=0.0, posinf=0.0, neginf=0.0
+                            y_safe[perm_eff], nan=0.0, posinf=0.0, neginf=0.0
                         )
-                        batch[key] = lam * y_safe + (1.0 - lam) * y_perm
+                        batch[key] = lam_eff * y_safe + (1.0 - lam_eff) * y_perm
 
             # Mix/AND supervision masks when present (keeps label mixing consistent with missing targets)
             for key in ("reg3_mask", "ndvi_mask"):
@@ -100,9 +148,9 @@ class ManifoldMixup:
                         and m.size(0) == bsz
                     ):
                         if m.dtype == torch.bool:
-                            batch[key] = m & m[perm]
+                            batch[key] = m & m[perm_eff]
                         else:
-                            batch[key] = m * m[perm]
+                            batch[key] = m * m[perm_eff]
 
             # Mix 5D biomass grams and recompute ratio targets from the mixed grams.
             if "y_biomass_5d_g" in batch:
@@ -117,9 +165,9 @@ class ManifoldMixup:
                         y_5d, nan=0.0, posinf=0.0, neginf=0.0
                     )
                     y_5d_perm = torch.nan_to_num(
-                        y_5d_safe[perm], nan=0.0, posinf=0.0, neginf=0.0
+                        y_5d_safe[perm_eff], nan=0.0, posinf=0.0, neginf=0.0
                     )
-                    mixed_5d = lam * y_5d_safe + (1.0 - lam) * y_5d_perm
+                    mixed_5d = lam_eff * y_5d_safe + (1.0 - lam_eff) * y_5d_perm
                     mixed_5d = torch.nan_to_num(
                         mixed_5d, nan=0.0, posinf=0.0, neginf=0.0
                     )
@@ -140,7 +188,7 @@ class ManifoldMixup:
                         mask_5d_safe = torch.isfinite(y_5d_safe).to(
                             device=mixed_5d.device, dtype=mixed_5d.dtype
                         )
-                    mask_5d_perm = mask_5d_safe[perm]
+                    mask_5d_perm = mask_5d_safe[perm_eff]
                     mixed_mask_5d = mask_5d_safe * mask_5d_perm
                     batch["biomass_5d_mask"] = mixed_mask_5d
 
@@ -176,9 +224,9 @@ class ManifoldMixup:
                             y_ratio_existing, nan=0.0, posinf=0.0, neginf=0.0
                         )
                         y_ratio_perm = torch.nan_to_num(
-                            y_ratio_safe[perm], nan=0.0, posinf=0.0, neginf=0.0
+                            y_ratio_safe[perm_eff], nan=0.0, posinf=0.0, neginf=0.0
                         )
-                        y_ratio_mixed = lam * y_ratio_safe + (1.0 - lam) * y_ratio_perm
+                        y_ratio_mixed = lam_eff * y_ratio_safe + (1.0 - lam_eff) * y_ratio_perm
 
                     if (
                         isinstance(ratio_mask_existing, torch.Tensor)
@@ -187,12 +235,12 @@ class ManifoldMixup:
                     ):
                         if ratio_mask_existing.dtype == torch.bool:
                             ratio_mask_mixed = (
-                                ratio_mask_existing & ratio_mask_existing[perm]
+                                ratio_mask_existing & ratio_mask_existing[perm_eff]
                             ).to(dtype=mixed_mask_5d.dtype)
                         else:
                             ratio_mask_mixed = ratio_mask_existing.to(
                                 dtype=mixed_mask_5d.dtype
-                            ) * ratio_mask_existing[perm].to(dtype=mixed_mask_5d.dtype)
+                            ) * ratio_mask_existing[perm_eff].to(dtype=mixed_mask_5d.dtype)
                         if ratio_mask_mixed.dim() == 1:
                             ratio_mask_mixed = ratio_mask_mixed.view(bsz, 1)
 
@@ -269,7 +317,12 @@ class ManifoldMixup:
 
         prev = self._prev
         z_prev = prev["z"].to(z.device, dtype=z.dtype)
-        z_mixed = lam * z + (1.0 - lam) * z_prev
+        z_mixed = lam_eff * z + (1.0 - lam_eff) * z_prev
+
+        # View-consistent mode: allow mixing features without mixing labels.
+        if not bool(mix_labels):
+            self._prev = current
+            return z_mixed, batch, True
 
         # Mix main scalar regression targets with the cached sample.
         for key in ("y_reg3", "y_height", "y_ndvi"):
@@ -286,7 +339,7 @@ class ManifoldMixup:
                     y_prev_safe = torch.nan_to_num(
                         y_prev, nan=0.0, posinf=0.0, neginf=0.0
                     )
-                    batch[key] = lam * y_safe + (1.0 - lam) * y_prev_safe
+                    batch[key] = lam_eff * y_safe + (1.0 - lam_eff) * y_prev_safe
 
         # Mix/AND supervision masks when present.
         for key in ("reg3_mask", "ndvi_mask"):
@@ -396,7 +449,7 @@ class ManifoldMixup:
                         posinf=0.0,
                         neginf=0.0,
                     )
-                    y_ratio_mixed = lam * y_ratio_safe + (1.0 - lam) * y_ratio_prev_safe
+                    y_ratio_mixed = lam_eff * y_ratio_safe + (1.0 - lam_eff) * y_ratio_prev_safe
 
                 if (
                     isinstance(ratio_mask_existing, torch.Tensor)

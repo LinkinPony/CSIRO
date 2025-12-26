@@ -277,6 +277,11 @@ class NdviDenseAsScalarDataset(Dataset):
         # Apply main dataset transforms to image
         if self.transform is not None:
             rgb = self.transform(rgb)
+            # When AugMix consistency is enabled, the main train transform may return multi-view
+            # tensors (clean, aug1, aug2). NDVI-dense is an auxiliary stream and should use
+            # the clean view only.
+            if isinstance(rgb, (list, tuple)) and len(rgb) >= 1:
+                rgb = rgb[0]
         else:
             rgb = T.ToTensor()(rgb)
 

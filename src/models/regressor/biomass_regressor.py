@@ -138,6 +138,8 @@ class BiomassRegressor(
         run_log_dir: Optional[str] = None,
         # Debug config to optionally dump final model input images to disk.
         debug_input_dump_cfg: Optional[Dict[str, Any]] = None,
+        # AugMix consistency configuration (used when train transform returns multi-view images).
+        augmix_consistency_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         # Normalize optimizer hyperparameters before saving them.
@@ -166,6 +168,7 @@ class BiomassRegressor(
         # --- Debug image dump configuration ---
         self._run_log_dir: Optional[str] = str(run_log_dir) if run_log_dir not in (None, "", "null") else None
         self._debug_input_dump_cfg: Dict[str, Any] = dict(debug_input_dump_cfg or {})
+        self._augmix_consistency_cfg: Dict[str, Any] = dict(augmix_consistency_cfg or {})
         self._input_image_mean: Optional[torch.Tensor] = None
         self._input_image_std: Optional[torch.Tensor] = None
         try:
@@ -416,6 +419,13 @@ class BiomassRegressor(
                 task_names.append("ratio")
             if self.enable_5d_loss and self.enable_ratio_head:
                 task_names.append("biomass_5d")
+            # Optional: treat AugMix consistency regularization as an independent UW task.
+            try:
+                cons_cfg = dict(getattr(self, "_augmix_consistency_cfg", {}) or {})
+                if bool(cons_cfg.get("enabled", False)) and bool(cons_cfg.get("uw_task", True)):
+                    task_names.append("consistency")
+            except Exception:
+                pass
             # Keep auxiliary tasks for MTL when enabled
             if self.enable_height:
                 task_names.append("height")

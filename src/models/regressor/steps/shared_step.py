@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from PIL import Image
 
@@ -311,7 +312,212 @@ class SharedStepMixin:
             elif mix_trigger:
                 use_mixup = True
 
-        images: Tensor = batch["image"]
+        images_any = batch["image"]
+        # In rare cases a dataset/transform may return multi-view images even for ndvi-only.
+        # Ensure the NDVI-only path always sees a single tensor.
+        if is_ndvi_only and isinstance(images_any, (list, tuple)) and len(images_any) >= 1:
+            images_any = images_any[0]
+
+        # Multi-view path (AugMix consistency): batch["image"] is a tuple/list of tensors:
+        #   (clean, aug1, aug2)  or (clean, aug1)
+        is_multiview = isinstance(images_any, (list, tuple)) and len(images_any) >= 2
+        if is_multiview and (not is_ndvi_only) and str(stage).lower() == "train":
+            views = list(images_any)
+            images_clean = views[0]
+            images_aug_list = views[1:]
+
+            # For now we do NOT apply CutMix in multi-view mode (would need view-consistent CutMix).
+            use_cutmix = False
+
+            # Optional debug dump: save the clean view (final image fed to the model in the supervised branch).
+            if isinstance(images_clean, torch.Tensor):
+                self._maybe_dump_model_inputs(
+                    images=images_clean,
+                    batch=batch,
+                    stage=stage,
+                    use_cutmix=use_cutmix,
+                    is_ndvi_only=is_ndvi_only,
+                )
+
+            # View-consistent manifold mixup: reuse the same (lam, perm) for all views.
+            mix_lam = None
+            mix_perm = None
+            if use_mixup and getattr(self, "_manifold_mixup", None) is not None and isinstance(images_clean, torch.Tensor):
+                try:
+                    bsz = int(images_clean.size(0))
+                except Exception:
+                    bsz = 0
+                if bsz >= 2:
+                    try:
+                        mix_lam, mix_perm = self._manifold_mixup.sample_params(bsz=bsz, device=images_clean.device)  # type: ignore[union-attr]
+                    except Exception:
+                        mix_lam, mix_perm = None, None
+                else:
+                    # Avoid cache-mode mixup when training multi-view (would update cache multiple times per step).
+                    use_mixup = False
+
+            head_type = str(getattr(self, "_head_type", "mlp")).lower()
+
+            # 1) Supervised branch uses the clean view and mixes labels.
+            (
+                pred_reg3_c,
+                z_c,
+                z_layers_c,
+                ratio_logits_pred_c,
+                ndvi_pred_c,
+                batch_mixed,
+                pred_reg3_layers_c,
+                ratio_logits_layers_c,
+            ) = self._predict_reg3_and_z(
+                images=images_clean,
+                batch=batch,
+                stage=stage,
+                use_mixup=use_mixup,
+                is_ndvi_only=is_ndvi_only,
+                mixup_lam=mix_lam,
+                mixup_perm=mix_perm,
+                mixup_mix_labels=True,
+            )
+
+            # 2) Consistency branches: forward on aug views with the SAME mixup params but WITHOUT mixing labels.
+            cons_cfg = dict(getattr(self, "_augmix_consistency_cfg", {}) or {})
+            cons_enabled = bool(cons_cfg.get("enabled", True))
+            if cons_enabled and images_aug_list:
+                # We support 1 or 2 aug views (AugMix-style).
+                preds_reg3: List[Tensor] = [pred_reg3_c]
+                zs: List[Tensor] = [z_c]
+                z_layers_list: List[Optional[List[Tensor]]] = [z_layers_c]
+                ratio_logits_list: List[Optional[Tensor]] = [ratio_logits_pred_c]
+
+                for img_v in images_aug_list[:2]:
+                    (
+                        pr,
+                        zv,
+                        zl,
+                        rlog,
+                        _nd,
+                        _b2,
+                        _pr_layers,
+                        _rlog_layers,
+                    ) = self._predict_reg3_and_z(
+                        images=img_v,
+                        batch=batch_mixed,
+                        stage=stage,
+                        use_mixup=use_mixup,
+                        is_ndvi_only=is_ndvi_only,
+                        mixup_lam=mix_lam,
+                        mixup_perm=mix_perm,
+                        mixup_mix_labels=False,
+                    )
+                    preds_reg3.append(pr)
+                    zs.append(zv)
+                    z_layers_list.append(zl)
+                    ratio_logits_list.append(rlog)
+
+                # --- reg3 consistency (MSE to mean, analogous to JSD mixture) ---
+                try:
+                    preds_for_cons = []
+                    sp = getattr(self, "out_softplus", None)
+                    for p in preds_reg3:
+                        preds_for_cons.append(sp(p) if sp is not None else p)
+                    pred_bar = torch.stack(preds_for_cons, dim=0).mean(dim=0)
+                    loss_cons_reg3 = torch.zeros((), device=pred_bar.device, dtype=pred_bar.dtype)
+                    for p in preds_for_cons:
+                        loss_cons_reg3 = loss_cons_reg3 + F.mse_loss(p, pred_bar)
+                    loss_cons_reg3 = loss_cons_reg3 / float(len(preds_for_cons))
+                except Exception:
+                    loss_cons_reg3 = pred_reg3_c.sum() * 0.0
+
+                # --- ratio consistency (JSD on probabilities) ---
+                loss_cons_ratio = pred_reg3_c.sum() * 0.0
+                if bool(getattr(self, "enable_ratio_head", False)):
+                    try:
+                        probs: List[Tensor] = []
+
+                        def _get_ratio_logits(zv: Tensor, zl: Optional[List[Tensor]], r_pred: Optional[Tensor]) -> Optional[Tensor]:
+                            if isinstance(r_pred, torch.Tensor):
+                                return r_pred
+                            rh = getattr(self, "ratio_head", None)
+                            if rh is None:
+                                return None
+                            # Layerwise heads (fallback path)
+                            if bool(getattr(self, "use_layerwise_heads", False)) and zl is not None:
+                                lrh = getattr(self, "layer_ratio_heads", None)
+                                if isinstance(lrh, list) and len(lrh) > 0:
+                                    logits_per_layer = [head(zl[idx]) for idx, head in enumerate(lrh)]
+                                    from ...layer_utils import fuse_layerwise_predictions
+                                    w = self._get_backbone_layer_fusion_weights(
+                                        device=logits_per_layer[0].device, dtype=logits_per_layer[0].dtype
+                                    )
+                                    return fuse_layerwise_predictions(logits_per_layer, weights=w)
+                            return rh(zv)  # type: ignore[operator]
+
+                        for zv, zl, r_pred in zip(zs, z_layers_list, ratio_logits_list):
+                            logits = _get_ratio_logits(zv, zl, r_pred)
+                            if logits is None:
+                                probs = []
+                                break
+                            probs.append(F.softmax(logits, dim=-1))
+
+                        if probs:
+                            eps = float(cons_cfg.get("eps", 1e-7))
+                            n = float(len(probs))
+                            p_mix = torch.clamp(sum(probs) / n, eps, 1.0).log()
+                            jsd = torch.zeros((), device=p_mix.device, dtype=p_mix.dtype)
+                            for p in probs:
+                                jsd = jsd + F.kl_div(p_mix, p, reduction="batchmean")
+                            loss_cons_ratio = jsd / n
+                    except Exception:
+                        loss_cons_ratio = pred_reg3_c.sum() * 0.0
+
+                w_reg3 = float(cons_cfg.get("weight_reg3", 1.0))
+                w_ratio = float(cons_cfg.get("weight_ratio_jsd", cons_cfg.get("weight_ratio", 12.0)))
+                self.log(f"{stage}_loss_cons_reg3", loss_cons_reg3, on_step=False, on_epoch=True, prog_bar=False)
+                self.log(f"{stage}_loss_cons_ratio_jsd", loss_cons_ratio, on_step=False, on_epoch=True, prog_bar=False)
+
+                loss_cons_total = (w_reg3 * loss_cons_reg3) + (w_ratio * loss_cons_ratio)
+                self.log(f"{stage}_loss_consistency", loss_cons_total, on_step=False, on_epoch=True, prog_bar=False)
+
+                # If Uncertainty Weighting is enabled, add consistency as its own UW task.
+                # Otherwise, add the (weighted) consistency penalty directly.
+                use_uw_task = bool(cons_cfg.get("uw_task", True))
+                extra_uw = [("consistency", loss_cons_total)] if (self.loss_weighting == "uw" and use_uw_task) else None
+
+                out = self._loss_supervised(
+                    stage=stage,
+                    head_type=head_type,
+                    pred_reg3=pred_reg3_c,
+                    z=z_c,
+                    z_layers=z_layers_c,
+                    ratio_logits_pred=ratio_logits_pred_c,
+                    pred_reg3_layers=pred_reg3_layers_c,
+                    ratio_logits_layers=ratio_logits_layers_c,
+                    ndvi_pred_from_head=ndvi_pred_c,
+                    batch=batch_mixed,
+                    extra_uw_losses=extra_uw,
+                )
+                if self.loss_weighting != "uw" or (not use_uw_task):
+                    out["loss"] = out["loss"] + loss_cons_total
+
+            else:
+                # No consistency branches: fall back to standard supervised loss on the clean view.
+                out = self._loss_supervised(
+                    stage=stage,
+                    head_type=head_type,
+                    pred_reg3=pred_reg3_c,
+                    z=z_c,
+                    z_layers=z_layers_c,
+                    ratio_logits_pred=ratio_logits_pred_c,
+                    pred_reg3_layers=pred_reg3_layers_c,
+                    ratio_logits_layers=ratio_logits_layers_c,
+                    ndvi_pred_from_head=ndvi_pred_c,
+                    batch=batch_mixed,
+                )
+
+            return out
+
+        # --- Single-view (legacy) path ---
+        images: Tensor = images_any  # type: ignore[assignment]
         if use_cutmix and self._cutmix_main is not None:
             try:
                 batch, _ = self._cutmix_main.apply_main_batch(batch, force=True)  # type: ignore[assignment]

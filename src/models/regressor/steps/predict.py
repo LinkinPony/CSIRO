@@ -101,6 +101,9 @@ class PredictionMixin:
         stage: str,
         use_mixup: bool,
         is_ndvi_only: bool,
+        mixup_lam: Optional[float] = None,
+        mixup_perm: Optional[Tensor] = None,
+        mixup_mix_labels: bool = True,
     ) -> Tuple[
         Tensor,
         Tensor,
@@ -164,7 +167,12 @@ class PredictionMixin:
                     try:
                         pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
                         pt_stack, batch, _ = self._manifold_mixup.apply(
-                            pt_stack, batch, force=True
+                            pt_stack,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                         )
                         pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
                     except Exception as e:
@@ -185,7 +193,12 @@ class PredictionMixin:
                 ):
                     try:
                         pt_tokens, batch, _ = self._manifold_mixup.apply(
-                            pt_tokens, batch, force=True
+                            pt_tokens,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                         )
                     except Exception as e:
                         self._raise_manifold_mixup_error(
@@ -237,7 +250,12 @@ class PredictionMixin:
                     try:
                         pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
                         pt_stack, batch, _ = self._manifold_mixup.apply(
-                            pt_stack, batch, force=True
+                            pt_stack,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                         )
                         pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
                     except Exception as e:
@@ -258,7 +276,12 @@ class PredictionMixin:
                 ):
                     try:
                         pt_tokens, batch, _ = self._manifold_mixup.apply(
-                            pt_tokens, batch, force=True
+                            pt_tokens,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                         )
                     except Exception as e:
                         self._raise_manifold_mixup_error(
@@ -335,14 +358,24 @@ class PredictionMixin:
                                 dim=1,
                             )  # (B, L, N+1, C)
                             tok_stack, batch, _ = self._manifold_mixup.apply(
-                                tok_stack, batch, force=True
+                                tok_stack,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
                             )
                             cls_list = [tok_stack[:, i, 0] for i in range(tok_stack.shape[1])]
                             pt_list = [tok_stack[:, i, 1:] for i in range(tok_stack.shape[1])]
                         else:
                             pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
                             pt_stack, batch, _ = self._manifold_mixup.apply(
-                                pt_stack, batch, force=True
+                                pt_stack,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
                             )
                             pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
                     except Exception as e:
@@ -368,13 +401,23 @@ class PredictionMixin:
                                 [cls_tok.unsqueeze(1), pt_tokens], dim=1
                             )  # (B, N+1, C)
                             tok, batch, _ = self._manifold_mixup.apply(
-                                tok, batch, force=True
+                                tok,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
                             )
                             cls_tok = tok[:, 0]
                             pt_tokens = tok[:, 1:]
                         else:
                             pt_tokens, batch, _ = self._manifold_mixup.apply(
-                                pt_tokens, batch, force=True
+                                pt_tokens,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
                             )
                     except Exception as e:
                         self._raise_manifold_mixup_error(
@@ -420,7 +463,12 @@ class PredictionMixin:
                             # (B, L, C): mix along batch dim, preserve layer structure.
                             pm_stack = torch.stack(patch_mean_list, dim=1)
                             pm_stack, batch, _ = self._manifold_mixup.apply(
-                                pm_stack, batch, force=True
+                            pm_stack,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                             )
                             patch_mean_list = [
                                 pm_stack[:, i] for i in range(pm_stack.shape[1])
@@ -438,7 +486,12 @@ class PredictionMixin:
                                 )
                             feats_stack = torch.stack(feats_list, dim=1)
                             feats_stack, batch, _ = self._manifold_mixup.apply(
-                                feats_stack, batch, force=True
+                                feats_stack,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
                             )
                             feats_list = [
                                 feats_stack[:, i] for i in range(feats_stack.shape[1])
@@ -470,7 +523,12 @@ class PredictionMixin:
                     try:
                         pt_stack = torch.stack(pt_list, dim=1)
                         pt_stack, batch, _ = self._manifold_mixup.apply(
-                            pt_stack, batch, force=True
+                            pt_stack,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                         )
                         pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
                     except Exception as e:
@@ -494,7 +552,12 @@ class PredictionMixin:
                 ):
                     try:
                         pt_tokens, batch, _ = self._manifold_mixup.apply(
-                            pt_tokens, batch, force=True
+                            pt_tokens,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                         )
                     except Exception as e:
                         self._raise_manifold_mixup_error(
@@ -522,7 +585,12 @@ class PredictionMixin:
                     patch_mean = pt_tokens.mean(dim=1)
                     try:
                         patch_mean, batch, _ = self._manifold_mixup.apply(
-                            patch_mean, batch, force=True
+                            patch_mean,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                         )
                     except Exception as e:
                         self._raise_manifold_mixup_error(
@@ -541,7 +609,12 @@ class PredictionMixin:
                     if apply_mm and self._manifold_mixup is not None:
                         try:
                             features, batch, _ = self._manifold_mixup.apply(
-                                features, batch, force=True
+                            features,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
                             )
                         except Exception as e:
                             self._raise_manifold_mixup_error(

@@ -465,6 +465,9 @@ def train_single_split(
         input_image_std=list(cfg.get("data", {}).get("normalization", {}).get("std", [0.229, 0.224, 0.225])),
         run_log_dir=str(log_dir),
         debug_input_dump_cfg=dict(cfg.get("data", {}).get("augment", {}).get("debug_dump", {})),
+        augmix_consistency_cfg=dict(
+            cfg.get("data", {}).get("augment", {}).get("augmix", {}).get("consistency", {})
+        ),
     )
 
     head_ckpt_dir = ckpt_dir / "head"

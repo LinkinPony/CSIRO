@@ -74,6 +74,7 @@ class LossesMixin:
         ratio_logits_layers: Optional[List[Tensor]] = None,
         ndvi_pred_from_head: Optional[Tensor],
         batch: Dict[str, Tensor],
+        extra_uw_losses: Optional[List[Tuple[str, Tensor]]] = None,
     ) -> Dict[str, Tensor]:
         """
         Full supervised batch (reg3 + optional ratio/5D + optional aux tasks).
@@ -379,6 +380,10 @@ class LossesMixin:
                     named_losses_simple.append(("ratio", loss_ratio_mse))
                 if loss_5d is not None:
                     named_losses_simple.append(("biomass_5d", loss_5d))
+                if extra_uw_losses:
+                    for name, l in extra_uw_losses:
+                        if isinstance(l, torch.Tensor):
+                            named_losses_simple.append((str(name), l))
                 total_loss = self._uw_sum(named_losses_simple)
             else:
                 total_loss = loss_reg3_total
@@ -516,6 +521,11 @@ class LossesMixin:
                 acc_state = (logits_state.argmax(dim=-1) == y_state).float().mean()
             self.log(f"{stage}_acc_state", acc_state, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("state", loss_state))
+
+        if self.loss_weighting == "uw" and extra_uw_losses:
+            for name, l in extra_uw_losses:
+                if isinstance(l, torch.Tensor):
+                    named_losses.append((str(name), l))
 
         total_loss = self._uw_sum(named_losses)
 
