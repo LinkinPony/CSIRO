@@ -67,6 +67,8 @@ class LossesMixin:
         z: Tensor,
         z_layers: Optional[List[Tensor]],
         ratio_logits_pred: Optional[Tensor],
+        pred_reg3_layers: Optional[List[Tensor]] = None,
+        ratio_logits_layers: Optional[List[Tensor]] = None,
         ndvi_pred_from_head: Optional[Tensor],
         batch: Dict[str, Tensor],
     ) -> Dict[str, Tensor]:
@@ -84,6 +86,12 @@ class LossesMixin:
 
         if self.out_softplus is not None:
             pred_reg3 = self.out_softplus(pred_reg3)
+            # Keep per-layer main predictions consistent with the averaged prediction path.
+            if pred_reg3_layers is not None:
+                try:
+                    pred_reg3_layers = [self.out_softplus(p) for p in pred_reg3_layers]
+                except Exception:
+                    pred_reg3_layers = None
 
         # Optional per-dimension supervision mask for reg3 (to support partial targets)
         if reg3_mask is not None:
@@ -116,17 +124,67 @@ class LossesMixin:
             y_ratio: Optional[Tensor] = batch.get("y_ratio", None)  # (B,3)
             ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
             if y_ratio is not None and ratio_mask is not None:
-                if head_type in ("fpn", "dpt", "vitdet"):
-                    ratio_logits = ratio_logits_pred
-                elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
-                    logits_per_layer: List[Tensor] = []
-                    for idx, head in enumerate(self.layer_ratio_heads):
-                        logits_per_layer.append(head(z_layers[idx]))
-                    ratio_logits = average_layerwise_predictions(logits_per_layer)
-                else:
-                    ratio_logits = self.ratio_head(z)  # type: ignore[operator]
-                if ratio_logits is not None:
-                    p_pred = F.softmax(ratio_logits, dim=-1)
+                # Constraint-aware fusion (preferred): for multi-layer ViTDet, fuse in component space
+                # using per-layer total predictions and per-layer ratio logits.
+                p_pred: Optional[Tensor] = None
+                if (
+                    head_type == "vitdet"
+                    and pred_reg3_layers is not None
+                    and ratio_logits_layers is not None
+                    and len(pred_reg3_layers) > 0
+                    and len(pred_reg3_layers) == len(ratio_logits_layers)
+                ):
+                    try:
+                        # Convert each layer's main prediction to g/m^2, then form components per layer.
+                        comp_layers: List[Tensor] = []
+                        used_idxs: List[int] = []
+                        for li, (p_tot, r_log) in enumerate(zip(pred_reg3_layers, ratio_logits_layers)):
+                            if p_tot is None or r_log is None:
+                                continue
+                            t_gm2 = self._invert_reg3_to_g_per_m2(p_tot).clamp_min(0.0)  # (B,1)
+                            p_l = F.softmax(r_log, dim=-1)  # (B,3)
+                            comp_layers.append(p_l * t_gm2)  # (B,3)
+                            used_idxs.append(int(li))
+                        if comp_layers:
+                            comp_stack = torch.stack(comp_layers, dim=0)  # (K,B,3)
+                            # Optional learned fusion weights from vitdet head (fallback to uniform).
+                            w = None
+                            try:
+                                vh = getattr(self, "vitdet_head", None)
+                                if vh is not None and hasattr(vh, "get_layer_weights"):
+                                    w_full = vh.get_layer_weights(device=comp_stack.device, dtype=comp_stack.dtype)  # type: ignore[attr-defined]
+                                    if isinstance(w_full, torch.Tensor) and w_full.numel() >= (max(used_idxs) + 1):
+                                        idx_t = torch.tensor(used_idxs, device=w_full.device, dtype=torch.long)
+                                        w = w_full.index_select(0, idx_t)
+                            except Exception:
+                                w = None
+                            if w is None:
+                                comp_bar = comp_stack.mean(dim=0)
+                            else:
+                                w = w / w.sum().clamp_min(1e-8)
+                                comp_bar = (w.view(-1, 1, 1) * comp_stack).sum(dim=0)  # (B,3)
+                            tot_bar = comp_bar.sum(dim=-1, keepdim=True).clamp_min(1e-8)  # (B,1)
+                            p_pred = (comp_bar / tot_bar).clamp_min(0.0)
+                            # Renormalize to exactly sum-to-1 (numerical safety).
+                            p_pred = p_pred / p_pred.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    except Exception:
+                        p_pred = None
+
+                # Fallback (legacy): compute p_pred from a single set of ratio logits.
+                if p_pred is None:
+                    if head_type in ("fpn", "dpt", "vitdet"):
+                        ratio_logits = ratio_logits_pred
+                    elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
+                        logits_per_layer: List[Tensor] = []
+                        for idx, head in enumerate(self.layer_ratio_heads):
+                            logits_per_layer.append(head(z_layers[idx]))
+                        ratio_logits = average_layerwise_predictions(logits_per_layer)
+                    else:
+                        ratio_logits = self.ratio_head(z)  # type: ignore[operator]
+                    if ratio_logits is not None:
+                        p_pred = F.softmax(ratio_logits, dim=-1)
+
+                if p_pred is not None:
                     y_ratio_raw = y_ratio
                     y_ratio_safe = torch.nan_to_num(
                         y_ratio_raw, nan=0.0, posinf=0.0, neginf=0.0
@@ -142,6 +200,7 @@ class LossesMixin:
                     p_true = y_ratio_safe.clamp_min(0.0)
                     denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                     p_true = p_true / denom
+
                     diff_ratio = p_pred - p_true
                     mse_per_sample = (diff_ratio * diff_ratio).sum(dim=-1, keepdim=True)  # (B,1)
                     mse_per_sample = torch.where(m > 0.0, mse_per_sample, torch.zeros_like(mse_per_sample))
@@ -163,33 +222,87 @@ class LossesMixin:
         metrics_preds_5d: Optional[Tensor] = None
         metrics_targets_5d: Optional[Tensor] = None
         if self.enable_5d_loss and y_5d_g is not None and mask_5d is not None and self.enable_ratio_head:
-            pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
-            if head_type in ("fpn", "dpt", "vitdet"):
-                ratio_logits = ratio_logits_pred
-            elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
-                logits_per_layer_5d: List[Tensor] = []
-                for idx, head in enumerate(self.layer_ratio_heads):
-                    logits_per_layer_5d.append(head(z_layers[idx]))
-                ratio_logits = average_layerwise_predictions(logits_per_layer_5d)
-            else:
-                ratio_logits = self.ratio_head(z)  # type: ignore[operator]
+            # Constraint-aware fusion (preferred): for multi-layer ViTDet, fuse components across layers.
+            pred_5d_gm2: Optional[Tensor] = None
+            if (
+                head_type == "vitdet"
+                and pred_reg3_layers is not None
+                and ratio_logits_layers is not None
+                and len(pred_reg3_layers) > 0
+                and len(pred_reg3_layers) == len(ratio_logits_layers)
+            ):
+                try:
+                    comp_layers: List[Tensor] = []
+                    used_idxs: List[int] = []
+                    for li, (p_tot, r_log) in enumerate(zip(pred_reg3_layers, ratio_logits_layers)):
+                        if p_tot is None or r_log is None:
+                            continue
+                        t_gm2 = self._invert_reg3_to_g_per_m2(p_tot).clamp_min(0.0)  # (B,1)
+                        p_l = F.softmax(r_log, dim=-1)  # (B,3)
+                        comp_layers.append(p_l * t_gm2)  # (B,3)
+                        used_idxs.append(int(li))
+                    if comp_layers:
+                        comp_stack = torch.stack(comp_layers, dim=0)  # (K,B,3)
+                        w = None
+                        try:
+                            vh = getattr(self, "vitdet_head", None)
+                            if vh is not None and hasattr(vh, "get_layer_weights"):
+                                w_full = vh.get_layer_weights(device=comp_stack.device, dtype=comp_stack.dtype)  # type: ignore[attr-defined]
+                                if isinstance(w_full, torch.Tensor) and w_full.numel() >= (max(used_idxs) + 1):
+                                    idx_t = torch.tensor(used_idxs, device=w_full.device, dtype=torch.long)
+                                    w = w_full.index_select(0, idx_t)
+                        except Exception:
+                            w = None
+                        if w is None:
+                            comp_bar = comp_stack.mean(dim=0)
+                        else:
+                            w = w / w.sum().clamp_min(1e-8)
+                            comp_bar = (w.view(-1, 1, 1) * comp_stack).sum(dim=0)  # (B,3)
+                        clover_pred = comp_bar[:, 0]
+                        dead_pred = comp_bar[:, 1]
+                        green_pred = comp_bar[:, 2]
+                        gdm_pred = clover_pred + green_pred
+                        total_pred = comp_bar.sum(dim=-1)
+                        pred_5d_gm2 = torch.stack(
+                            [clover_pred, dead_pred, green_pred, gdm_pred, total_pred], dim=-1
+                        )
+                except Exception:
+                    pred_5d_gm2 = None
 
-            if ratio_logits is None:
-                p_pred = None
-            else:
-                p_pred = F.softmax(ratio_logits, dim=-1)  # (B,3)
+            if pred_5d_gm2 is None:
+                pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
+                if head_type in ("fpn", "dpt", "vitdet"):
+                    ratio_logits = ratio_logits_pred
+                elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
+                    logits_per_layer_5d: List[Tensor] = []
+                    for idx, head in enumerate(self.layer_ratio_heads):
+                        logits_per_layer_5d.append(head(z_layers[idx]))
+                    ratio_logits = average_layerwise_predictions(logits_per_layer_5d)
+                else:
+                    ratio_logits = self.ratio_head(z)  # type: ignore[operator]
 
-            if p_pred is None:
-                comp_gm2 = torch.zeros((pred_total_gm2.size(0), 3), device=pred_total_gm2.device, dtype=pred_total_gm2.dtype)
-            else:
-                comp_gm2 = p_pred * pred_total_gm2  # (B,3)
+                if ratio_logits is None:
+                    p_pred = None
+                else:
+                    p_pred = F.softmax(ratio_logits, dim=-1)  # (B,3)
 
-            clover_pred = comp_gm2[:, 0]
-            dead_pred = comp_gm2[:, 1]
-            green_pred = comp_gm2[:, 2]
-            gdm_pred = clover_pred + green_pred
-            total_pred = pred_total_gm2.squeeze(-1)
-            pred_5d_gm2 = torch.stack([clover_pred, dead_pred, green_pred, gdm_pred, total_pred], dim=-1)
+                if p_pred is None:
+                    comp_gm2 = torch.zeros(
+                        (pred_total_gm2.size(0), 3),
+                        device=pred_total_gm2.device,
+                        dtype=pred_total_gm2.dtype,
+                    )
+                else:
+                    comp_gm2 = p_pred * pred_total_gm2  # (B,3)
+
+                clover_pred = comp_gm2[:, 0]
+                dead_pred = comp_gm2[:, 1]
+                green_pred = comp_gm2[:, 2]
+                gdm_pred = clover_pred + green_pred
+                total_pred = pred_total_gm2.squeeze(-1)
+                pred_5d_gm2 = torch.stack(
+                    [clover_pred, dead_pred, green_pred, gdm_pred, total_pred], dim=-1
+                )
 
             metrics_preds_5d = pred_5d_gm2 * float(self._area_m2)
             y_5d_g_raw = y_5d_g

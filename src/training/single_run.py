@@ -281,6 +281,16 @@ def train_single_split(
         else {}
     )
     use_layerwise_heads = bool(backbone_layers_cfg.get("enabled", False))
+    # Layer fusion across selected backbone layers:
+    # - "mean" (default): uniform average (legacy behavior)
+    # - "learned": learn softmax weights over layers
+    backbone_layers_fusion = str(
+        backbone_layers_cfg.get(
+            "layer_fusion",
+            backbone_layers_cfg.get("fusion", backbone_layers_cfg.get("fusion_mode", "mean")),
+        )
+        or "mean"
+    ).strip().lower()
 
     # Layer indices can be provided either as:
     #  - backbone_layers.indices (explicit list)
@@ -445,6 +455,7 @@ def train_single_split(
         if isinstance(backbone_layer_indices, (list, tuple))
         else None,
         use_separate_bottlenecks=use_separate_bottlenecks,
+        backbone_layers_fusion=str(backbone_layers_fusion),
         optimizer_name=optimizer_name,
         use_sam=use_sam,
         sam_rho=sam_rho,

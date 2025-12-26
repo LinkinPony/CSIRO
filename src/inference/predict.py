@@ -625,7 +625,13 @@ def predict_main_and_ratio_vitdet(
     layer_indices: Optional[List[int]] = None,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
-) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[
+    List[str],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """
     ViTDet-head inference (SimpleFeaturePyramid-style scalar head).
     """
@@ -654,6 +660,8 @@ def predict_main_and_ratio_vitdet(
     rels: List[str] = []
     preds_main_list: List[torch.Tensor] = []
     preds_ratio_list: List[torch.Tensor] = []
+    preds_main_layers_list: List[torch.Tensor] = []
+    preds_ratio_layers_list: List[torch.Tensor] = []
 
     with torch.inference_mode():
         for images, rel_paths in dl:
@@ -674,6 +682,8 @@ def predict_main_and_ratio_vitdet(
             k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
             reg3_sum = None
             ratio_sum = None
+            reg3_layers_sum = None
+            ratio_layers_sum = None
             for _ in range(k):
                 if head_in[0] == "list":
                     out = head(head_in[1], image_hw=(H, W))  # type: ignore[call-arg]
@@ -683,17 +693,50 @@ def predict_main_and_ratio_vitdet(
                     raise RuntimeError("ViTDet head forward must return a dict")
                 reg3 = out.get("reg3", None)
                 ratio = out.get("ratio", None)
+                reg3_layers = out.get("reg3_layers", None)
+                ratio_layers = out.get("ratio_layers", None)
                 if reg3 is None:
                     raise RuntimeError("ViTDet head did not return 'reg3'")
                 reg3_sum = reg3 if reg3_sum is None else (reg3_sum + reg3)
                 if head_num_ratio > 0 and ratio is not None:
                     ratio_sum = ratio if ratio_sum is None else (ratio_sum + ratio)
+                # Optional per-layer outputs (multi-layer ViTDet): keep as (B, L, D).
+                if isinstance(reg3_layers, list) and len(reg3_layers) > 0:
+                    try:
+                        reg3_layers_t = [t for t in reg3_layers if isinstance(t, torch.Tensor)]
+                        if reg3_layers_t:
+                            reg3_layers_stack = torch.stack(reg3_layers_t, dim=1)
+                            reg3_layers_sum = (
+                                reg3_layers_stack
+                                if reg3_layers_sum is None
+                                else (reg3_layers_sum + reg3_layers_stack)
+                            )
+                    except Exception:
+                        pass
+                if head_num_ratio > 0 and isinstance(ratio_layers, list) and len(ratio_layers) > 0:
+                    try:
+                        ratio_layers_t = [t for t in ratio_layers if isinstance(t, torch.Tensor)]
+                        if ratio_layers_t:
+                            ratio_layers_stack = torch.stack(ratio_layers_t, dim=1)
+                            ratio_layers_sum = (
+                                ratio_layers_stack
+                                if ratio_layers_sum is None
+                                else (ratio_layers_sum + ratio_layers_stack)
+                            )
+                    except Exception:
+                        pass
 
             reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
             preds_main_list.append(reg3_mean.detach().cpu().float())
             if head_num_ratio > 0 and ratio_sum is not None:
                 ratio_mean = ratio_sum / float(k)
                 preds_ratio_list.append(ratio_mean.detach().cpu().float())
+            if reg3_layers_sum is not None:
+                reg3_layers_mean = reg3_layers_sum / float(k)
+                preds_main_layers_list.append(reg3_layers_mean.detach().cpu().float())
+            if head_num_ratio > 0 and ratio_layers_sum is not None:
+                ratio_layers_mean = ratio_layers_sum / float(k)
+                preds_ratio_layers_list.append(ratio_layers_mean.detach().cpu().float())
 
             rels.extend(list(rel_paths))
 
@@ -707,7 +750,17 @@ def predict_main_and_ratio_vitdet(
         preds_ratio = torch.cat(preds_ratio_list, dim=0)
     else:
         preds_ratio = None
-    return rels, preds_main, preds_ratio
+    preds_main_layers: Optional[torch.Tensor]
+    if preds_main_layers_list:
+        preds_main_layers = torch.cat(preds_main_layers_list, dim=0)
+    else:
+        preds_main_layers = None
+    preds_ratio_layers: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_layers_list:
+        preds_ratio_layers = torch.cat(preds_ratio_layers_list, dim=0)
+    else:
+        preds_ratio_layers = None
+    return rels, preds_main, preds_ratio, preds_main_layers, preds_ratio_layers
 
 
 def predict_main_and_ratio_dpt(

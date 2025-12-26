@@ -21,6 +21,50 @@ def _build_activation(name: str) -> nn.Module:
     return nn.ReLU(inplace=True)
 
 
+class LayerNorm2d(nn.Module):
+    """
+    Channel-wise LayerNorm for NCHW tensors (B, C, H, W).
+
+    This matches Detectron2's ViTDet LayerNorm implementation: point-wise mean/variance
+    normalization over the channel dimension.
+    """
+
+    def __init__(self, normalized_shape: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        c = int(normalized_shape)
+        if c <= 0:
+            raise ValueError("LayerNorm2d normalized_shape must be a positive integer.")
+        self.weight = nn.Parameter(torch.ones(c))
+        self.bias = nn.Parameter(torch.zeros(c))
+        self.eps = float(eps)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.dim() != 4:
+            raise RuntimeError(f"LayerNorm2d expects (B,C,H,W), got: {tuple(x.shape)}")
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
+
+
+def _get_norm(norm: Optional[str], channels: int) -> Optional[nn.Module]:
+    """
+    Minimal `get_norm` helper (Detectron2-compatible semantics for LN).
+
+    Supported values:
+    - None / "" : no norm
+    - "LN"      : LayerNorm2d (channel-wise LN over NCHW)
+    """
+
+    n = (norm or "").strip()
+    if n == "":
+        return None
+    if n.upper() == "LN":
+        return LayerNorm2d(int(channels))
+    raise ValueError(f"Unsupported vitdet norm={norm!r}. Supported: '' | 'LN'")
+
+
 @dataclass
 class ViTDetHeadConfig:
     embedding_dim: int
@@ -43,6 +87,8 @@ class ViTDetHeadConfig:
     head_hidden_dims: Sequence[int] = ()
     head_activation: str = "relu"
     dropout: float = 0.0
+    # SimpleFeaturePyramid norm (Detectron2 ViTDet default is LN).
+    norm: str = "LN"
 
 
 class ViTDetScalarHead(nn.Module):
@@ -51,14 +97,14 @@ class ViTDetScalarHead(nn.Module):
 
       - consumes ViT/DINO patch tokens (B, N, C) from a *single* backbone layer
       - reshapes to (B, C, Hp, Wp)
-      - projects to vitdet_dim channels
-      - builds multi-scale feature maps using scale_factors:
-          * 2.0: ConvTranspose2d stride=2
+      - builds a Detectron2-aligned SimpleFeaturePyramid (SFP) over the token map:
+          * 4.0: ConvTranspose2d x2 with channel reduction (dim->dim//2->dim//4),
+                 with LN+GELU between the two upsampling ops (Detectron2 ViTDet)
+          * 2.0: ConvTranspose2d x1 with channel reduction (dim->dim//2)
           * 1.0: Identity
           * 0.5: MaxPool2d stride=2
-          * 0.25: MaxPool2d stride=2 applied twice (downsample x4)
-          * 0.125: MaxPool2d stride=2 applied three times (downsample x8)
-        (4.0 is supported but not used by default in this repo due to memory)
+          * 0.25/0.125: repeated MaxPool2d (repo extension beyond Detectron2)
+        Each scale then applies: 1x1 Conv -> LN -> 3x3 Conv -> LN to produce `vitdet_dim` channels.
       - global-average-pools each scale, concatenates, passes through an MLP, and predicts:
           * reg3 logits: (B, num_outputs_main)
           * ratio logits: (B, num_outputs_ratio) or None
@@ -80,95 +126,79 @@ class ViTDetScalarHead(nn.Module):
         self.separate_ratio_spatial_head = bool(getattr(cfg, "separate_ratio_spatial_head", False))
         self.separate_ratio_head = bool(getattr(cfg, "separate_ratio_head", False)) or self.separate_ratio_spatial_head
 
-        # Token-map projection to vitdet_dim before pyramid generation.
-        self.in_proj = nn.Conv2d(self.embedding_dim, self.vitdet_dim, kernel_size=1, bias=True)
+        # Detectron2-aligned SFP stages.
+        # Important difference vs the repo's previous implementation:
+        #   - We do NOT pre-project to `vitdet_dim` before pyramid generation.
+        #     Instead, we build the pyramid in `embedding_dim` space and then project each
+        #     scale to `vitdet_dim` (= Detectron2's `out_channels`).
+        self.norm: str = str(getattr(cfg, "norm", "LN") or "LN")
+        use_bias = (self.norm or "").strip() == ""  # Detectron2: bias only when no norm
+        dim = int(self.embedding_dim)
+        out_channels = int(self.vitdet_dim)
 
-        # Build per-scale stages (scale op + 1x1 + 3x3 conv).
-        stages: List[nn.Module] = []
-        for s in self.scale_factors:
-            s_key = float(s)
+        def _build_stage(scale: float) -> nn.Sequential:
+            layers: List[nn.Module] = []
+            out_dim = dim
+            s_key = float(scale)
+
             if s_key == 4.0:
-                # Rarely used (memory heavy); keep for completeness.
-                scale_op = nn.Sequential(
-                    nn.ConvTranspose2d(self.vitdet_dim, self.vitdet_dim, kernel_size=2, stride=2),
-                    nn.GELU(),
-                    nn.ConvTranspose2d(self.vitdet_dim, self.vitdet_dim, kernel_size=2, stride=2),
-                )
+                # Detectron2 ViTDet: two upsampling steps with channel reduction.
+                half = max(1, dim // 2)
+                quarter = max(1, dim // 4)
+                layers.append(nn.ConvTranspose2d(dim, half, kernel_size=2, stride=2))
+                n1 = _get_norm(self.norm, half)
+                if n1 is not None:
+                    layers.append(n1)
+                layers.append(nn.GELU())
+                layers.append(nn.ConvTranspose2d(half, quarter, kernel_size=2, stride=2))
+                out_dim = quarter
             elif s_key == 2.0:
-                scale_op = nn.ConvTranspose2d(self.vitdet_dim, self.vitdet_dim, kernel_size=2, stride=2)
+                half = max(1, dim // 2)
+                layers.append(nn.ConvTranspose2d(dim, half, kernel_size=2, stride=2))
+                out_dim = half
             elif s_key == 1.0:
-                scale_op = nn.Identity()
+                out_dim = dim
             elif s_key == 0.5:
-                scale_op = nn.MaxPool2d(kernel_size=2, stride=2)
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                out_dim = dim
             elif s_key == 0.25:
-                scale_op = nn.Sequential(
-                    nn.MaxPool2d(kernel_size=2, stride=2),
-                    nn.MaxPool2d(kernel_size=2, stride=2),
-                )
+                # Repo extension (not in Detectron2): downsample x4.
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                out_dim = dim
             elif s_key == 0.125:
-                scale_op = nn.Sequential(
-                    nn.MaxPool2d(kernel_size=2, stride=2),
-                    nn.MaxPool2d(kernel_size=2, stride=2),
-                    nn.MaxPool2d(kernel_size=2, stride=2),
-                )
+                # Repo extension (not in Detectron2): downsample x8.
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                out_dim = dim
             else:
                 raise ValueError(
                     f"Unsupported vitdet scale_factor={s_key}. Use one of: 4.0, 2.0, 1.0, 0.5, 0.25, 0.125"
                 )
 
-            stages.append(
-                nn.Sequential(
-                    scale_op,
-                    nn.Conv2d(self.vitdet_dim, self.vitdet_dim, kernel_size=1, bias=True),
-                    nn.Conv2d(self.vitdet_dim, self.vitdet_dim, kernel_size=3, padding=1, bias=True),
-                )
+            # 1x1 + 3x3 conv blocks with LN (Detectron2 ViTDet).
+            layers.append(nn.Conv2d(out_dim, out_channels, kernel_size=1, bias=use_bias))
+            n2 = _get_norm(self.norm, out_channels)
+            if n2 is not None:
+                layers.append(n2)
+            layers.append(
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=use_bias)
             )
-        self.stages = nn.ModuleList(stages)
+            n3 = _get_norm(self.norm, out_channels)
+            if n3 is not None:
+                layers.append(n3)
+            return nn.Sequential(*layers)
 
-        # Optional separate spatial branch for ratio: duplicate in_proj + stages.
+        self.stages = nn.ModuleList([_build_stage(float(s)) for s in self.scale_factors])
+
+        # Optional separate spatial branch for ratio: duplicate SFP stages (independent params).
         if self.separate_ratio_spatial_head and self.num_outputs_ratio > 0:
-            self.ratio_in_proj = nn.Conv2d(self.embedding_dim, self.vitdet_dim, kernel_size=1, bias=True)
-            ratio_stages: List[nn.Module] = []
-            for s in self.scale_factors:
-                s_key = float(s)
-                if s_key == 4.0:
-                    scale_op = nn.Sequential(
-                        nn.ConvTranspose2d(self.vitdet_dim, self.vitdet_dim, kernel_size=2, stride=2),
-                        nn.GELU(),
-                        nn.ConvTranspose2d(self.vitdet_dim, self.vitdet_dim, kernel_size=2, stride=2),
-                    )
-                elif s_key == 2.0:
-                    scale_op = nn.ConvTranspose2d(self.vitdet_dim, self.vitdet_dim, kernel_size=2, stride=2)
-                elif s_key == 1.0:
-                    scale_op = nn.Identity()
-                elif s_key == 0.5:
-                    scale_op = nn.MaxPool2d(kernel_size=2, stride=2)
-                elif s_key == 0.25:
-                    scale_op = nn.Sequential(
-                        nn.MaxPool2d(kernel_size=2, stride=2),
-                        nn.MaxPool2d(kernel_size=2, stride=2),
-                    )
-                elif s_key == 0.125:
-                    scale_op = nn.Sequential(
-                        nn.MaxPool2d(kernel_size=2, stride=2),
-                        nn.MaxPool2d(kernel_size=2, stride=2),
-                        nn.MaxPool2d(kernel_size=2, stride=2),
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported vitdet scale_factor={s_key}. Use one of: 4.0, 2.0, 1.0, 0.5, 0.25, 0.125"
-                    )
-                ratio_stages.append(
-                    nn.Sequential(
-                        scale_op,
-                        nn.Conv2d(self.vitdet_dim, self.vitdet_dim, kernel_size=1, bias=True),
-                        nn.Conv2d(self.vitdet_dim, self.vitdet_dim, kernel_size=3, padding=1, bias=True),
-                    )
-                )
-            self.ratio_stages = nn.ModuleList(ratio_stages)
+            self.ratio_stages = nn.ModuleList([_build_stage(float(s)) for s in self.scale_factors])
         else:
-            self.ratio_in_proj = None  # type: ignore[assignment]
             self.ratio_stages = None  # type: ignore[assignment]
+        # Legacy placeholder (kept for backward compatibility with older checkpoints).
+        self.ratio_in_proj = None  # type: ignore[assignment]
 
         # Scalar bottleneck MLP(s) on concatenated pooled pyramid features.
         in_dim = self.vitdet_dim * len(self.scale_factors)
@@ -246,18 +276,16 @@ class ViTDetScalarHead(nn.Module):
             x = x.to(dtype=w_dtype)
 
         # Main branch
-        x_main = self.in_proj(x)
-        feats = [stage(x_main) for stage in self.stages]
+        feats = [stage(x) for stage in self.stages]
         pooled = [F.adaptive_avg_pool2d(f, output_size=1).flatten(1) for f in feats]
         g = torch.cat(pooled, dim=-1) if pooled else torch.empty((x.size(0), 0), device=x.device, dtype=x.dtype)
         z = self.scalar_mlp(g) if not isinstance(self.scalar_mlp, nn.Identity) else g
 
         # Ratio branch (mode-dependent)
         if self.separate_ratio_spatial_head and self.ratio_head is not None:
-            if self.ratio_in_proj is None or self.ratio_stages is None:
+            if self.ratio_stages is None:
                 raise RuntimeError("Missing ratio spatial modules for separate_ratio_spatial_head")
-            x_r = self.ratio_in_proj(x)
-            feats_r = [stage(x_r) for stage in self.ratio_stages]
+            feats_r = [stage(x) for stage in self.ratio_stages]
             pooled_r = [F.adaptive_avg_pool2d(f, output_size=1).flatten(1) for f in feats_r]
             g_ratio = (
                 torch.cat(pooled_r, dim=-1)
@@ -282,18 +310,31 @@ class ViTDetScalarHead(nn.Module):
 class ViTDetMultiLayerScalarHead(nn.Module):
     """
     Multi-layer wrapper: one independent ViTDetScalarHead per backbone layer,
-    and average the final outputs across layers.
+    and fuse the final outputs across layers (mean or learned softmax weights).
     """
 
-    def __init__(self, cfg: ViTDetHeadConfig, *, num_layers: int) -> None:
+    def __init__(
+        self,
+        cfg: ViTDetHeadConfig,
+        *,
+        num_layers: int,
+        layer_fusion: str = "mean",
+    ) -> None:
         super().__init__()
         if int(num_layers) <= 0:
             raise ValueError("num_layers must be >= 1 for ViTDetMultiLayerScalarHead")
         self.cfg = cfg
         self.num_layers = int(num_layers)
+        self.layer_fusion: str = str(layer_fusion or "mean").strip().lower()
         self.heads = nn.ModuleList([ViTDetScalarHead(cfg) for _ in range(self.num_layers)])
         # Expose scalar_dim for downstream aux heads
         self.scalar_dim = int(getattr(self.heads[0], "scalar_dim", cfg.vitdet_dim))
+        # Optional learnable fusion weights. Only create when requested so legacy mean-fusion
+        # heads still load with strict=True.
+        if self.layer_fusion == "learned":
+            self.layer_logits = nn.Parameter(torch.zeros(self.num_layers, dtype=torch.float32))
+        else:
+            self.layer_logits = None  # type: ignore[assignment]
 
     @staticmethod
     def _avg_optional(xs: List[Optional[Tensor]]) -> Optional[Tensor]:
@@ -301,6 +342,58 @@ class ViTDetMultiLayerScalarHead(nn.Module):
         if not ts:
             return None
         return torch.stack(ts, dim=0).mean(dim=0)
+
+    def get_layer_weights(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        """
+        Return fusion weights over layers as a tensor of shape (L,).
+          - mean: uniform weights
+          - learned: softmax(layer_logits)
+        """
+        L = int(self.num_layers)
+        if L <= 0:
+            w = torch.ones(1, dtype=torch.float32)
+        elif self.layer_fusion == "learned" and isinstance(self.layer_logits, torch.Tensor):
+            w = F.softmax(self.layer_logits, dim=0)
+        else:
+            w = torch.full((L,), 1.0 / float(L), dtype=torch.float32)
+        if device is not None:
+            w = w.to(device=device)
+        if dtype is not None:
+            w = w.to(dtype=dtype)
+        return w
+
+    def _fuse_optional(self, xs: List[Optional[Tensor]], *, weights: Tensor) -> Optional[Tensor]:
+        """
+        Fuse optional per-layer tensors with provided weights.
+        If some entries are None, renormalize weights over present layers.
+        """
+        ts: List[Tensor] = []
+        idxs: List[int] = []
+        for i, t in enumerate(xs):
+            if t is None:
+                continue
+            ts.append(t)
+            idxs.append(i)
+        if not ts:
+            return None
+        stacked = torch.stack(ts, dim=0)  # (K, ...)
+        if stacked.shape[0] == 1:
+            return stacked[0]
+        try:
+            idx_t = torch.tensor(idxs, device=weights.device, dtype=torch.long)
+            w = weights.index_select(0, idx_t)
+        except Exception:
+            w = weights[: stacked.shape[0]]
+        w = w.to(device=stacked.device, dtype=stacked.dtype)
+        w = w / w.sum().clamp_min(1e-8)
+        while w.dim() < stacked.dim():
+            w = w.view(*w.shape, 1)
+        return (w * stacked).sum(dim=0)
 
     def forward(
         self,
@@ -321,11 +414,37 @@ class ViTDetMultiLayerScalarHead(nn.Module):
         reg_list = [o.get("reg3", None) for o in outs]
         ratio_list = [o.get("ratio", None) for o in outs]
         ndvi_list = [o.get("ndvi", None) for o in outs]
-        z = self._avg_optional(z_list)
-        reg3 = self._avg_optional(reg_list)
-        ratio = self._avg_optional(ratio_list)
-        ndvi = self._avg_optional(ndvi_list)
-        return {"z": z, "reg3": reg3, "ratio": ratio, "ndvi": ndvi}
+        # Choose weights for fusion (global, per-layer).
+        ref = next((t for t in reg_list if isinstance(t, torch.Tensor)), None)
+        w = self.get_layer_weights(
+            device=(ref.device if isinstance(ref, torch.Tensor) else None),
+            dtype=(ref.dtype if isinstance(ref, torch.Tensor) else None),
+        )
+
+        if self.layer_fusion == "learned":
+            z = self._fuse_optional(z_list, weights=w)
+            reg3 = self._fuse_optional(reg_list, weights=w)
+            ratio = self._fuse_optional(ratio_list, weights=w)
+            ndvi = self._fuse_optional(ndvi_list, weights=w)
+        else:
+            z = self._avg_optional(z_list)
+            reg3 = self._avg_optional(reg_list)
+            ratio = self._avg_optional(ratio_list)
+            ndvi = self._avg_optional(ndvi_list)
+
+        # Expose both fused outputs (legacy keys) and per-layer outputs for downstream
+        # constraint-aware component fusion.
+        return {
+            "z": z,
+            "reg3": reg3,
+            "ratio": ratio,
+            "ndvi": ndvi,
+            "z_layers": z_list,
+            "reg3_layers": reg_list,
+            "ratio_layers": ratio_list,
+            "ndvi_layers": ndvi_list,
+            "layer_weights": w,
+        }
 
 
 def init_vitdet_head(
@@ -376,7 +495,8 @@ def init_vitdet_head(
     )
 
     if use_layerwise_heads:
-        model.vitdet_head = ViTDetMultiLayerScalarHead(cfg, num_layers=num_layers_eff)  # type: ignore[assignment]
+        layer_fusion = str(getattr(model, "backbone_layers_fusion", "mean") or "mean").strip().lower()
+        model.vitdet_head = ViTDetMultiLayerScalarHead(cfg, num_layers=num_layers_eff, layer_fusion=layer_fusion)  # type: ignore[assignment]
         bottleneck_dim = int(getattr(model.vitdet_head, "scalar_dim", int(vitdet_dim)))  # type: ignore[attr-defined]
     else:
         model.vitdet_head = ViTDetScalarHead(cfg)  # type: ignore[assignment]

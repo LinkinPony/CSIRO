@@ -101,7 +101,16 @@ class PredictionMixin:
         stage: str,
         use_mixup: bool,
         is_ndvi_only: bool,
-    ) -> Tuple[Tensor, Tensor, Optional[List[Tensor]], Optional[Tensor], Optional[Tensor], Dict[str, Tensor]]:
+    ) -> Tuple[
+        Tensor,
+        Tensor,
+        Optional[List[Tensor]],
+        Optional[Tensor],
+        Optional[Tensor],
+        Dict[str, Tensor],
+        Optional[List[Tensor]],
+        Optional[List[Tensor]],
+    ]:
         """
         Returns:
             pred_reg3: (B, num_outputs) logits in normalized domain (pre-softplus)
@@ -110,12 +119,16 @@ class PredictionMixin:
             ratio_logits_pred: Optional[(B,3)] ratio logits for FPN/DPT heads
             ndvi_pred: Optional[(B,1)] NDVI pred for FPN/DPT heads
             batch: possibly-updated batch (mixup mutates labels)
+            pred_reg3_layers: Optional[list[(B, num_outputs)]] per-layer reg3 logits (for multi-layer ViTDet)
+            ratio_logits_layers: Optional[list[(B,3)]] per-layer ratio logits (for multi-layer ViTDet)
         """
         pred_reg3: Tensor
         z: Tensor
         z_layers: Optional[List[Tensor]] = None
         ratio_logits_pred: Optional[Tensor] = None
         ndvi_pred: Optional[Tensor] = None
+        pred_reg3_layers: Optional[List[Tensor]] = None
+        ratio_logits_layers: Optional[List[Tensor]] = None
 
         head_type = str(getattr(self, "_head_type", "mlp")).lower()
 
@@ -261,6 +274,17 @@ class PredictionMixin:
             z = out_vitdet.get("z", None)  # type: ignore[assignment]
             ratio_logits_pred = out_vitdet.get("ratio", None)
             ndvi_pred = out_vitdet.get("ndvi", None)
+            # Optional per-layer outputs for constraint-aware fusion downstream.
+            try:
+                pred_reg3_layers = out_vitdet.get("reg3_layers", None)
+                ratio_logits_layers = out_vitdet.get("ratio_layers", None)
+                if not isinstance(pred_reg3_layers, list):
+                    pred_reg3_layers = None
+                if not isinstance(ratio_logits_layers, list):
+                    ratio_logits_layers = None
+            except Exception:
+                pred_reg3_layers = None
+                ratio_logits_layers = None
             if pred_reg3 is None or z is None:
                 raise RuntimeError("ViTDet head did not return required outputs (reg3/z)")
 
@@ -529,6 +553,15 @@ class PredictionMixin:
                 z = self.shared_bottleneck(features)
                 pred_reg3 = self._forward_reg3_logits(z)
 
-        return pred_reg3, z, z_layers, ratio_logits_pred, ndvi_pred, batch
+        return (
+            pred_reg3,
+            z,
+            z_layers,
+            ratio_logits_pred,
+            ndvi_pred,
+            batch,
+            pred_reg3_layers,
+            ratio_logits_layers,
+        )
 
 

@@ -200,6 +200,8 @@ class HeadCheckpoint(Callback):
                         "ratio_head_mode": str(getattr(pl_module, "ratio_head_mode", "shared")),
                         "separate_ratio_head": bool(getattr(pl_module, "separate_ratio_head", False)),
                         "separate_ratio_spatial_head": bool(getattr(pl_module, "separate_ratio_spatial_head", False)),
+                        # Multi-layer fusion mode (mean or learned softmax weights).
+                        "backbone_layers_fusion": str(getattr(pl_module, "backbone_layers_fusion", "mean") or "mean"),
                         # Export without terminal Softplus; inference handles main outputs.
                         "use_output_softplus": False,
                         "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,

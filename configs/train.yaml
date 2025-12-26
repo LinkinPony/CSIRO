@@ -1,5 +1,5 @@
 seed: 42
-version: vitdet-512-v4-log-fixcv
+version: vitdet-new-320
 data:
   root: data
   train_csv: train.csv
@@ -12,7 +12,7 @@ data:
   # NOTE: `image_size` in this YAML is [W, H] (width, height). The code parses it to (H, W)
   # for torchvision transforms (Resize/RandomResizedCrop), which expect (H, W).
   image_size: [960, 480]
-  batch_size: 16
+  batch_size: 8
   val_batch_size: 1
   num_workers: 20
   prefetch_factor: 4
@@ -43,7 +43,7 @@ data:
       enabled: true
       prob: 0.5
     random_affine:
-      enabled: false
+      enabled: true
       degrees: 5.0
       translate: [0.02, 0.02]
       scale: [0.95, 1.05]
@@ -94,14 +94,14 @@ data:
       # For random string watermark instead of timestamp:
       # style: random
       texts: []
-      use_random_text: false
+      use_random_text: true
       random_text_length_range: [3, 20]
     light_spot:
       enabled: true
       # NDVI hand-held device artifacts often look like a small *red* flare (strong core + soft halo).
       # Use flare-style blending (preserve texture) instead of the legacy flat-color composite.
       blend_mode: screen   # one of: composite | screen | additive
-      prob: 0.15
+      prob: 0.3
       # Size tuned for CSIRO 2:1 images (~2000x1000). Typical red hotspot core radius ~0.02-0.06 of min dim.
       radius_frac_range: [0.02, 0.06]
       # Strength (0..1). Higher => more saturated/overexposed center.
@@ -129,7 +129,7 @@ data:
       # Optional: if your spots are mostly near the top, uncomment to bias the center:
       # center_y_frac_range: [0.0, 0.6]
     random_erasing:
-      enabled: false
+      enabled: true
       p: 0.25
       scale: [0.02, 0.1]
       ratio: [0.3, 3.3]
@@ -142,8 +142,8 @@ data:
     #                    CLS+patch tokens are mixed together **regardless** of mix_cls_token.
     manifold_mixup:
       enabled: true
-      prob: 1.0
-      alpha: 1.0
+      prob: 0.5
+      alpha: 0.5
       # When true (default), manifold mixup is applied to the full feature vector,
       # including the CLS token when model.head.use_cls_token=true.
       #
@@ -158,7 +158,7 @@ data:
       alpha: 0.5
       # minmax: [0.3, 0.7]  # optional clamp for bbox size; comment to disable
       use_prev_for_bsz1: true
-    no_augment_prob: 0.2
+    no_augment_prob: 0.1
   normalization:
     mean: [0.485, 0.456, 0.406]
     std: [0.229, 0.224, 0.225]
@@ -198,7 +198,7 @@ model:
   # - dinov3_vith16plus -> 1280
   # - dinov3_vit7b16    -> 4096
   embedding_dim: 1280
-  log_scale_targets: true
+  log_scale_targets: false
   head:
     # Head architecture:
     # - mlp (legacy global scalar head)
@@ -209,10 +209,10 @@ model:
     #           and averages the final outputs)
     type: vitdet
     # ViTDet settings (SimpleFeaturePyramid-style):
-    vitdet_dim: 512
+    vitdet_dim: 320
     vitdet_patch_size: 16
     # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
-    vitdet_scale_factors: [2.0, 1.0, 0.5]
+    vitdet_scale_factors: [4.0, 2.0, 1.0, 0.5]
     # FPN settings (Phase A): spatial pyramid built from ViT patch tokens
     fpn_dim: 256
     fpn_num_levels: 3
@@ -257,6 +257,11 @@ model:
     ratio_head_mode: shared
   backbone_layers:
     enabled: true
+    # How to fuse predictions/features across selected backbone layers (multi-layer mode).
+    # Options:
+    # - mean    : uniform average (legacy behavior)
+    # - learned : learn softmax weights over layers (recommended)
+    layer_fusion: learned
     # When true, each selected backbone layer uses its own bottleneck MLP.
     # When false, all layers share a single bottleneck (legacy behavior).
     separate_bottlenecks: true
@@ -272,7 +277,7 @@ model:
     # Recommended DPT-style 4-layer hooks:
     indices_by_backbone:
       dinov3_vitl16: [5, 11, 17, 23]
-      dinov3_vith16plus: [24,25,26,27,28,29,30,31]
+      dinov3_vith16plus: [25,27,29,31]
       dinov3_vit7b16: [9, 19, 29, 39]
     # Optional explicit override (set to a list to take precedence over indices_by_backbone)
     indices: null
@@ -281,7 +286,7 @@ mtl:
   enabled: true
   tasks:
     height: false
-    ndvi: false
+    ndvi: true
     ndvi_dense: false
     species: false
     state: false
@@ -297,8 +302,8 @@ peft:
   enabled: true
   method: lora
   use_dora: true
-  r: 16
-  lora_alpha: 16
+  r: 4
+  lora_alpha: 4
   lora_dropout: 0.05
   init: true
   last_k_blocks: 0
@@ -315,7 +320,7 @@ loss:
   # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
   use_5d_weighted_mse: true
   # Per-component weights for the 5D MSE term.
-  mse_5d_weights_per_target: [0.33, 0.33, 0.33, 0.0, 0.0]
+  mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
 
 optimizer:
   name: adamw
@@ -331,7 +336,7 @@ optimizer:
 
 scheduler:
   name: cosine
-  warmup_epochs: 3
+  warmup_epochs: 5
   warmup_start_factor: 0.1
 
 kfold:

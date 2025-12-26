@@ -366,9 +366,13 @@ def infer_components_5d_for_model(
     weight_sum: float = 0.0
 
     for head_i, head_pt in enumerate(head_weight_paths):
-        w = float(weight_map.get(head_pt, 1.0))
-        if not (w > 0.0):
+        # NOTE: keep head ensemble weight separate from any internal per-layer fusion weights.
+        head_w = float(weight_map.get(head_pt, 1.0))
+        if not (head_w > 0.0):
             continue
+        # Optional per-layer outputs (available for some multi-layer heads, e.g. ViTDet multi-layer).
+        preds_main_layers: Optional[torch.Tensor] = None
+        preds_ratio_layers: Optional[torch.Tensor] = None
 
         # Load head state/meta (and optional PEFT payload)
         state, meta, peft_payload = load_head_state(head_pt)
@@ -534,7 +538,16 @@ def infer_components_5d_for_model(
                 dropout=head_dropout,
             )
             if use_layerwise_heads_head:
-                head_module = ViTDetMultiLayerScalarHead(vitdet_cfg, num_layers=num_layers_eff)  # type: ignore[assignment]
+                fusion_mode = str(
+                    meta.get(
+                        "backbone_layers_fusion",
+                        meta.get("layer_fusion", first_meta.get("backbone_layers_fusion", "mean")),
+                    )
+                    or "mean"
+                ).strip().lower()
+                head_module = ViTDetMultiLayerScalarHead(  # type: ignore[assignment]
+                    vitdet_cfg, num_layers=num_layers_eff, layer_fusion=fusion_mode
+                )
             else:
                 head_module = ViTDetScalarHead(vitdet_cfg)  # type: ignore[assignment]
         elif head_type_meta == "dpt":
@@ -631,7 +644,13 @@ def infer_components_5d_for_model(
                 mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
             )
         elif head_type_meta == "vitdet":
-            rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_vitdet(
+            (
+                rels_in_order,
+                preds_main,
+                preds_ratio,
+                preds_main_layers,
+                preds_ratio_layers,
+            ) = predict_main_and_ratio_vitdet(
                 backbone=backbone,
                 head=head_module,
                 dataset_root=dataset_root,
@@ -757,26 +776,90 @@ def infer_components_5d_for_model(
         use_output_softplus_cfg = bool(cfg.get("model", {}).get("head", {}).get("use_output_softplus", True))
         if use_output_softplus_cfg and (not log_scale_meta) and (not zscore_enabled):
             preds_main = F.softplus(preds_main)
+            try:
+                if "preds_main_layers" in locals() and preds_main_layers is not None:
+                    preds_main_layers = F.softplus(preds_main_layers)
+            except Exception:
+                pass
 
         if zscore_enabled:
             preds_main = preds_main * reg3_std[:head_num_main] + reg3_mean[:head_num_main]  # type: ignore[index]
+            try:
+                if "preds_main_layers" in locals() and preds_main_layers is not None:
+                    m = reg3_mean[:head_num_main].view(1, 1, -1)  # type: ignore[index]
+                    s = reg3_std[:head_num_main].view(1, 1, -1)  # type: ignore[index]
+                    preds_main_layers = preds_main_layers * s + m
+            except Exception:
+                pass
         if log_scale_meta:
             preds_main = torch.expm1(preds_main).clamp_min(0.0)
+            try:
+                if "preds_main_layers" in locals() and preds_main_layers is not None:
+                    preds_main_layers = torch.expm1(preds_main_layers).clamp_min(0.0)
+            except Exception:
+                pass
 
         # Convert from g/m^2 to grams
         preds_main_g = preds_main * float(area_m2)
+        preds_main_layers_g = None
+        try:
+            if "preds_main_layers" in locals() and preds_main_layers is not None:
+                preds_main_layers_g = preds_main_layers * float(area_m2)
+        except Exception:
+            preds_main_layers_g = None
 
         # Build this head's 5D components in grams
         N = preds_main_g.shape[0]
         if head_is_ratio and preds_ratio is not None and head_num_main >= 1 and head_num_ratio >= 1:
-            total_g = preds_main_g[:, 0].view(N)
-            p_ratio = F.softmax(preds_ratio, dim=-1)
-            zeros = torch.zeros_like(total_g)
-            comp_clover = (total_g * p_ratio[:, 0]) if head_num_ratio > 0 else zeros
-            comp_dead = (total_g * p_ratio[:, 1]) if head_num_ratio > 1 else zeros
-            comp_green = (total_g * p_ratio[:, 2]) if head_num_ratio > 2 else zeros
-            comp_gdm = comp_clover + comp_green
-            comps_5d = torch.stack([comp_clover, comp_dead, comp_green, comp_gdm, total_g], dim=-1)
+            # Prefer constraint-aware fusion when we have multi-layer per-layer outputs:
+            # c_l = softmax(ratio_l) * total_l, then average c across layers.
+            comps_5d = None
+            try:
+                if (
+                    preds_main_layers_g is not None
+                    and ("preds_ratio_layers" in locals())
+                    and (preds_ratio_layers is not None)
+                    and preds_main_layers_g.dim() == 3
+                    and preds_ratio_layers.dim() == 3
+                    and preds_main_layers_g.shape[0] == N
+                    and preds_main_layers_g.shape[1] == preds_ratio_layers.shape[1]
+                ):
+                    L = int(preds_main_layers_g.shape[1])
+                    total_layers_g = preds_main_layers_g[:, :, 0].clamp_min(0.0)  # (N, L)
+                    p_layers = F.softmax(preds_ratio_layers, dim=-1)  # (N, L, 3)
+                    comp_layers = p_layers * total_layers_g.unsqueeze(-1)  # (N, L, 3)
+                    # Optional learned fusion weights from the head module (fallback to uniform).
+                    layer_w: Optional[torch.Tensor] = None
+                    try:
+                        if head_module is not None and hasattr(head_module, "get_layer_weights"):
+                            w_full = head_module.get_layer_weights(device=comp_layers.device, dtype=comp_layers.dtype)  # type: ignore[attr-defined]
+                            if isinstance(w_full, torch.Tensor) and int(w_full.numel()) == L:
+                                layer_w = w_full.detach()
+                    except Exception:
+                        layer_w = None
+                    if layer_w is None:
+                        comp_bar = comp_layers.mean(dim=1)  # (N,3)
+                    else:
+                        layer_w = layer_w / layer_w.sum().clamp_min(1e-8)
+                        comp_bar = (comp_layers * layer_w.view(1, L, 1)).sum(dim=1)
+                    comp_clover = comp_bar[:, 0]
+                    comp_dead = comp_bar[:, 1]
+                    comp_green = comp_bar[:, 2]
+                    total_g = comp_bar.sum(dim=-1)
+                    comp_gdm = comp_clover + comp_green
+                    comps_5d = torch.stack([comp_clover, comp_dead, comp_green, comp_gdm, total_g], dim=-1)
+            except Exception:
+                comps_5d = None
+
+            if comps_5d is None:
+                total_g = preds_main_g[:, 0].view(N)
+                p_ratio = F.softmax(preds_ratio, dim=-1)
+                zeros = torch.zeros_like(total_g)
+                comp_clover = (total_g * p_ratio[:, 0]) if head_num_ratio > 0 else zeros
+                comp_dead = (total_g * p_ratio[:, 1]) if head_num_ratio > 1 else zeros
+                comp_green = (total_g * p_ratio[:, 2]) if head_num_ratio > 2 else zeros
+                comp_gdm = comp_clover + comp_green
+                comps_5d = torch.stack([comp_clover, comp_dead, comp_green, comp_gdm, total_g], dim=-1)
         else:
             comps_list: List[torch.Tensor] = []
             for idx_row in range(N):
@@ -805,10 +888,10 @@ def infer_components_5d_for_model(
 
         comps_5d = comps_5d.detach().cpu().float()
         if comps_sum is None:
-            comps_sum = comps_5d * float(w)
+            comps_sum = comps_5d * head_w
         else:
-            comps_sum = comps_sum + (comps_5d * float(w))
-        weight_sum += float(w)
+            comps_sum = comps_sum + (comps_5d * head_w)
+        weight_sum += head_w
 
         # Free per-head GPU memory early
         try:

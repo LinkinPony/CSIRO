@@ -122,6 +122,9 @@ class BiomassRegressor(
         # When True, each selected backbone layer uses its own bottleneck MLP.
         # When False, all layers share a single bottleneck (legacy behavior).
         use_separate_bottlenecks: bool = True,
+        # How to fuse predictions/features across selected backbone layers (when enabled).
+        # Options: "mean" (default) | "learned"
+        backbone_layers_fusion: str = "mean",
         # Optimizer / SAM configuration
         optimizer_name: Optional[str] = None,
         use_sam: bool = False,
@@ -237,6 +240,7 @@ class BiomassRegressor(
 
         # --- Multi-layer backbone configuration ---
         self.use_layerwise_heads: bool = bool(use_layerwise_heads)
+        self.backbone_layers_fusion: str = str(backbone_layers_fusion or "mean").strip().lower()
         if self.use_layerwise_heads:
             indices = normalize_layer_indices(backbone_layer_indices or [])
             if len(indices) == 0:

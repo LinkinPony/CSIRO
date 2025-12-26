@@ -106,7 +106,16 @@ class SharedStepMixin:
                 pass
 
         head_type = str(getattr(self, "_head_type", "mlp")).lower()
-        pred_reg3, z, z_layers, ratio_logits_pred, ndvi_pred, batch = self._predict_reg3_and_z(
+        (
+            pred_reg3,
+            z,
+            z_layers,
+            ratio_logits_pred,
+            ndvi_pred,
+            batch,
+            pred_reg3_layers,
+            ratio_logits_layers,
+        ) = self._predict_reg3_and_z(
             images=images,
             batch=batch,
             stage=stage,
@@ -131,6 +140,8 @@ class SharedStepMixin:
             z=z,
             z_layers=z_layers,
             ratio_logits_pred=ratio_logits_pred,
+            pred_reg3_layers=pred_reg3_layers,
+            ratio_logits_layers=ratio_logits_layers,
             ndvi_pred_from_head=ndvi_pred,
             batch=batch,
         )
