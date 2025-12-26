@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -130,6 +130,14 @@ class BiomassRegressor(
         use_sam: bool = False,
         sam_rho: float = 0.05,
         sam_adaptive: bool = False,
+        # --- Debug utilities ---
+        # Normalization used for input images (for de-normalizing debug dumps).
+        input_image_mean: Optional[Sequence[float]] = None,
+        input_image_std: Optional[Sequence[float]] = None,
+        # Base run log dir to write debug artifacts under (e.g., outputs/<version>).
+        run_log_dir: Optional[str] = None,
+        # Debug config to optionally dump final model input images to disk.
+        debug_input_dump_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         # Normalize optimizer hyperparameters before saving them.
@@ -154,6 +162,23 @@ class BiomassRegressor(
             head_type_norm = "mlp"
         self._head_type: str = head_type_norm
         self.save_hyperparameters()
+
+        # --- Debug image dump configuration ---
+        self._run_log_dir: Optional[str] = str(run_log_dir) if run_log_dir not in (None, "", "null") else None
+        self._debug_input_dump_cfg: Dict[str, Any] = dict(debug_input_dump_cfg or {})
+        self._input_image_mean: Optional[torch.Tensor] = None
+        self._input_image_std: Optional[torch.Tensor] = None
+        try:
+            if input_image_mean is not None and input_image_std is not None:
+                mean = [float(x) for x in list(input_image_mean)]
+                std = [float(x) for x in list(input_image_std)]
+                if len(mean) == 3 and len(std) == 3 and all(s > 0.0 for s in std):
+                    self._input_image_mean = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
+                    self._input_image_std = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
+        except Exception:
+            # Best-effort: keep None and fall back to saving normalized tensors (or skip denorm).
+            self._input_image_mean = None
+            self._input_image_std = None
 
         feature_extractor = build_feature_extractor(
             backbone_name=backbone_name,
@@ -252,6 +277,19 @@ class BiomassRegressor(
         else:
             self.backbone_layer_indices = []
             self.num_layers = 0
+
+        # Optional learnable fusion weights for the MLP multi-layer path.
+        # For other head types (vitdet/fpn/dpt), multi-layer fusion is implemented inside the head module.
+        if (
+            self.use_layerwise_heads
+            and self._head_type == "mlp"
+            and self.num_layers > 0
+            and self.backbone_layers_fusion == "learned"
+        ):
+            # Stored as logits and converted to weights via softmax during fusion.
+            self.mlp_layer_logits = nn.Parameter(torch.zeros(self.num_layers, dtype=torch.float32))
+        else:
+            self.mlp_layer_logits = None  # type: ignore[assignment]
 
         # Optional per-layer bottlenecks for multi-layer heads
         self.use_separate_bottlenecks: bool = bool(use_separate_bottlenecks)

@@ -70,6 +70,11 @@ class IrishGlassCloverDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
+        # Traceability/debug: provide an image_id compatible with the main pipeline.
+        try:
+            image_id = os.path.splitext(os.path.basename(img_name))[0]
+        except Exception:
+            image_id = str(img_name)
 
         # Build reg3 targets in the global target_order, with a supervision mask
         reg3_vals: List[float] = []
@@ -139,6 +144,7 @@ class IrishGlassCloverDataset(Dataset):
 
         return {
             "image": image,
+            "image_id": image_id,
             # main regression (normalized + original g/m^2)
             "y_reg3": y_reg3_norm,
             "y_reg3_g_m2": y_reg3_g_m2,

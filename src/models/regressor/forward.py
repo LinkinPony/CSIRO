@@ -5,10 +5,46 @@ from typing import Any, List, Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from ..layer_utils import average_layerwise_predictions
+from ..layer_utils import fuse_layerwise_predictions
 
 
 class RegressorForwardMixin:
+    def _get_backbone_layer_fusion_weights(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        """
+        Return fusion weights over selected backbone layers.
+
+        - mean    : uniform weights
+        - learned : softmax(mlp_layer_logits) for the MLP multi-layer path
+
+        For non-MLP heads, fusion is typically implemented inside the head module
+        (e.g. ViTDetMultiLayerScalarHead), so this method falls back to uniform weights.
+        """
+        try:
+            L = int(getattr(self, "num_layers", 0) or 0)
+        except Exception:
+            L = 0
+        mode = str(getattr(self, "backbone_layers_fusion", "mean") or "mean").strip().lower()
+        logits = getattr(self, "mlp_layer_logits", None)
+
+        if L <= 1:
+            w = torch.ones(1, dtype=torch.float32)
+        elif mode == "learned" and isinstance(logits, torch.Tensor) and int(logits.numel()) == int(L):
+            # Keep weights computation in fp32 for numerical stability, then cast as requested.
+            w = torch.softmax(logits.to(dtype=torch.float32), dim=0)
+        else:
+            w = torch.full((int(L),), 1.0 / float(L), dtype=torch.float32)
+
+        if device is not None:
+            w = w.to(device=device)
+        if dtype is not None:
+            w = w.to(dtype=dtype)
+        return w
+
     def _forward_reg3_logits_for_heads(self, z: Tensor, heads: List[nn.Linear]) -> Tensor:
         """
         Compute main reg3 prediction in normalized domain (g/m^2 or z-score),
@@ -144,8 +180,11 @@ class RegressorForwardMixin:
                     heads_l = list(self.reg3_heads)
                 pred_l = self._forward_reg3_logits_for_heads(z_l, heads_l)  # (B, num_outputs)
                 pred_layers.append(pred_l)
-            pred_reg3_logits = average_layerwise_predictions(pred_layers)
-            z_global = average_layerwise_predictions(z_layers)
+            w = self._get_backbone_layer_fusion_weights(
+                device=pred_layers[0].device, dtype=pred_layers[0].dtype
+            )
+            pred_reg3_logits = fuse_layerwise_predictions(pred_layers, weights=w)
+            z_global = fuse_layerwise_predictions(z_layers, weights=w)
             return pred_reg3_logits, z_global, z_layers
 
         # Option B: obtain CLS/patch tokens for all requested layers in a single backbone forward,
@@ -221,8 +260,11 @@ class RegressorForwardMixin:
                 pred_l = pred_patches.mean(dim=1)  # (B, num_outputs)
                 pred_layers.append(pred_l)
 
-        pred_reg3_logits = average_layerwise_predictions(pred_layers)
-        z_global = average_layerwise_predictions(z_layers)
+        w = self._get_backbone_layer_fusion_weights(
+            device=pred_layers[0].device, dtype=pred_layers[0].dtype
+        )
+        pred_reg3_logits = fuse_layerwise_predictions(pred_layers, weights=w)
+        z_global = fuse_layerwise_predictions(z_layers, weights=w)
         return pred_reg3_logits, z_global, z_layers
 
     def forward(self, images: Tensor) -> Tensor:

@@ -1,5 +1,5 @@
 seed: 42
-version: vitdet-new-320
+version: mlp-manifold-mixup-augmix
 data:
   root: data
   train_csv: train.csv
@@ -23,6 +23,44 @@ data:
   # the remaining components via a separate ratio head.
   target_order: [Dry_Total_g]
   augment:
+    # Augmentation policy switch:
+    # - legacy: handcrafted torchvision pipeline (flip/affine/jitter/blur/noise/erasing + overlays)
+    # - augmix: AugMix (single-output tensor; no JSD tuple) + optional overlays
+    policy: augmix
+    # Debug: dump the *final* images fed to the model (after CutMix) for quick sanity checks.
+    # Saved under: outputs/<version>/debug/inputs/ (unless out_dir is overridden).
+    debug_dump:
+      enabled: true
+      stages: [train]
+      # Dump cadence: dump once every N global steps (optimizer steps).
+      every_n_steps: 50
+      # Total cap across the whole run.
+      max_images: 32
+      # How many images to save from each selected batch.
+      num_images_per_step: 4
+      # Save viewable RGB (de-normalized back from mean/std). If false, saves normalized tensors mapped to 0..1.
+      denormalize: true
+      # Output format: png | jpeg | webp
+      format: jpeg
+      # Optional format knobs:
+      png_compress_level: 6
+      jpeg_quality: 90
+      webp_quality: 90
+      # Optional override (relative paths are resolved under run_log_dir):
+      # out_dir: debug/inputs
+    augmix:
+      enabled: true
+      # AugMix knobs (reference-style):
+      # - severity: 1..10 (higher => stronger ops)
+      # - width   : number of augmentation chains mixed
+      # - depth   : chain depth; -1 => random in [1, 3]
+      # - alpha   : Dirichlet/Beta concentration (mixing strength)
+      severity: 3
+      width: 2
+      depth: -1
+      alpha: 1.0
+      # When true, include color/contrast/brightness/sharpness ops in addition to the base ops.
+      all_ops: true
     # RandomResizedCrop is disabled by default.
     #
     # On CSIRO images (native ~2:1 aspect ratio), torchvision's default ratio range (3/4..4/3)
@@ -33,17 +71,20 @@ data:
     random_resized_crop_scale: [0.8, 1.0]
     horizontal_flip_prob: 0.5
     color_jitter:
-      enabled: true
+      # NOTE: ignored when policy=augmix (AugMix provides its own color/contrast ops when all_ops=true).
+      enabled: false
       prob: 0.8
       brightness: 0.2
       contrast: 0.2
       saturation: 0.1
       hue: 0.00
     vertical_flip:
-      enabled: true
+      # NOTE: ignored when policy=augmix.
+      enabled: false
       prob: 0.5
     random_affine:
-      enabled: true
+      # NOTE: ignored when policy=augmix.
+      enabled: false
       degrees: 5.0
       translate: [0.02, 0.02]
       scale: [0.95, 1.05]
@@ -51,13 +92,15 @@ data:
       interpolation: bilinear
       fill: 0
     gaussian_blur:
-      enabled: true
+      # NOTE: ignored when policy=augmix.
+      enabled: false
       kernel_size: 3
       kernel_size_range: [3, 7]
       prob: 0.5
       sigma: [0.1, 1.0]
     gaussian_noise:
-      enabled: true
+      # NOTE: ignored when policy=augmix.
+      enabled: false
       mean: 0.0
       std: 0.01
       prob: 0.5
@@ -129,7 +172,8 @@ data:
       # Optional: if your spots are mostly near the top, uncomment to bias the center:
       # center_y_frac_range: [0.0, 0.6]
     random_erasing:
-      enabled: true
+      # NOTE: ignored when policy=augmix.
+      enabled: false
       p: 0.25
       scale: [0.02, 0.1]
       ratio: [0.3, 3.3]
@@ -207,9 +251,9 @@ model:
     # - vitdet (ViTDet SimpleFeaturePyramid-style head from *single-layer* patch tokens;
     #           when model.backbone_layers.enabled=true, builds one independent head per selected layer
     #           and averages the final outputs)
-    type: vitdet
+    type: mlp
     # ViTDet settings (SimpleFeaturePyramid-style):
-    vitdet_dim: 320
+    vitdet_dim: 256
     vitdet_patch_size: 16
     # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
     vitdet_scale_factors: [4.0, 2.0, 1.0, 0.5]
@@ -239,13 +283,13 @@ model:
     # This flag affects the legacy/global path (use_patch_reg3: false) in both
     # single-layer and multi-layer training/inference. Patch-mode reg3 uses patch
     # tokens directly and is therefore unaffected.
-    use_cls_token: false
+    use_cls_token: true
     # When enabled, use a patch-based main regression path:
     #   - For each patch token, apply the shared MLP head (CLS concatenated with patch token),
     #   - Average per-patch predictions to obtain the image-level output.
     # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
     # the global CLS + mean(patch) bottleneck.
-    use_patch_reg3: true
+    use_patch_reg3: false
     # Biomass ratio head coupling mode.
     #
     # Options:
@@ -261,10 +305,10 @@ model:
     # Options:
     # - mean    : uniform average (legacy behavior)
     # - learned : learn softmax weights over layers (recommended)
-    layer_fusion: learned
+    layer_fusion: mean
     # When true, each selected backbone layer uses its own bottleneck MLP.
     # When false, all layers share a single bottleneck (legacy behavior).
-    separate_bottlenecks: true
+    separate_bottlenecks: false
     # Indices refer to DINOv3 transformer blocks (0-based).
     # Depth depends on backbone:
     # - dinov3_vitl16     : 24 blocks -> valid indices [0, 23]
@@ -286,7 +330,7 @@ mtl:
   enabled: true
   tasks:
     height: false
-    ndvi: true
+    ndvi: false
     ndvi_dense: false
     species: false
     state: false
@@ -309,7 +353,7 @@ peft:
   last_k_blocks: 0
   layers_pattern: blocks
   target_modules: [qkv, proj, w1, w2, w3]
-  lora_lr: 0.0001
+  lora_lr: 0.0005
   lora_weight_decay: 0.0
 
 loss:
@@ -324,7 +368,7 @@ loss:
 
 optimizer:
   name: adamw
-  lr: 0.0001
+  lr: 0.001
   weight_decay: 0.01
   uw_lr: 0.01
   uw_weight_decay: 0.0
@@ -336,11 +380,11 @@ optimizer:
 
 scheduler:
   name: cosine
-  warmup_epochs: 5
+  warmup_epochs: 0
   warmup_start_factor: 0.1
 
 kfold:
-  enabled: true
+  enabled: false
   k: 5
   even_split: true
 
@@ -360,7 +404,7 @@ trainer:
   gradient_clip_algorithm: norm
   swa:
     enabled: true
-    swa_lrs: 0.00005
+    swa_lrs: 0.0001
     swa_epoch_start: 0.8
     annealing_epochs: 5
     annealing_strategy: cos

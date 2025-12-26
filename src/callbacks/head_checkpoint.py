@@ -579,12 +579,27 @@ class HeadCheckpoint(Callback):
                 # backbone blocks were selected.
                 "use_layerwise_heads": bool(getattr(pl_module.hparams, "use_layerwise_heads", False)) if hasattr(pl_module, "hparams") else False,
                 "backbone_layer_indices": list(getattr(pl_module.hparams, "backbone_layer_indices", [])) if hasattr(pl_module, "hparams") else [],
+                # Multi-layer fusion mode (mean or learned softmax weights). For MLP heads the
+                # learnable logits are stored separately in meta (see below).
+                "backbone_layers_fusion": str(getattr(pl_module, "backbone_layers_fusion", "mean") or "mean"),
                 # Whether per-layer bottlenecks were used together with layer-wise heads.
                 "use_separate_bottlenecks": bool(getattr(pl_module.hparams, "use_separate_bottlenecks", False)) if hasattr(pl_module, "hparams") else False,
                 # Order of ratio components packed in the head (if any)
                 "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
             },
         }
+        # Optional: export learned fusion logits for the MLP multi-layer path.
+        # This is kept in meta (not state_dict) to avoid changing the inference head module structure.
+        try:
+            fusion_mode = str(state["meta"].get("backbone_layers_fusion", "mean") or "mean").strip().lower()
+            if fusion_mode == "learned":
+                layer_logits = getattr(pl_module, "mlp_layer_logits", None)
+                if isinstance(layer_logits, torch.Tensor):
+                    state["meta"]["mlp_layer_logits"] = (
+                        layer_logits.detach().cpu().to(dtype=torch.float32).tolist()
+                    )
+        except Exception:
+            pass
         # Optionally bundle LoRA adapter payload alongside the head (to preserve the two-inputs rule at inference)
         try:
             fe = getattr(pl_module, "feature_extractor", None)

@@ -159,6 +159,18 @@ class PastureImageDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
+        # For debugging / traceability (e.g., dumping augmented inputs), keep the original image id.
+        # This is the CSV-derived id without the target suffix (e.g. "ID123456789").
+        try:
+            image_id = str(row.get("image_id", "")).strip()
+        except Exception:
+            image_id = ""
+        if not image_id:
+            try:
+                # Fallback to the file stem (works for typical "IDxxxx.jpg" paths).
+                image_id = os.path.splitext(os.path.basename(str(row.get("image_path", ""))))[0]
+            except Exception:
+                image_id = ""
         # main regression targets (one or more components depending on config.target_order)
         y_reg3_g = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
         reg3_mask = torch.ones_like(y_reg3_g, dtype=torch.float32)
@@ -230,6 +242,7 @@ class PastureImageDataset(Dataset):
             y_state = torch.tensor(0, dtype=torch.long)
         return {
             "image": image,
+            "image_id": image_id,
             "y_reg3": y_reg3,             # normalized (if stats provided)
             "y_reg3_g_m2": y_reg3_g_m2,   # original g/m^2
             "y_reg3_g": y_reg3_g,         # original grams

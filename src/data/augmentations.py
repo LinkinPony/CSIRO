@@ -848,6 +848,19 @@ def build_train_transform(
 ) -> T.Compose:
     cfg = dict(augment_cfg or {})
 
+    # Optional augmentation policy switch.
+    #
+    # - legacy (default): current handcrafted pipeline (flip/affine/jitter/blur/noise/erasing + overlays)
+    # - augmix          : AugMix (single-output tensor, no JSD tuple) + optional watermark/light_spot
+    policy = str(cfg.get("policy", cfg.get("augment_policy", "legacy")) or "legacy").strip().lower()
+    if policy in {"augmix", "aug_mix", "aug-mix"}:
+        return build_train_transform_augmix(
+            image_size=image_size,
+            mean=mean,
+            std=std,
+            augment_cfg=cfg,
+        )
+
     # 1) Geometric and color transforms on PIL images
     pre_tensor: List[Any] = []
     # RandomResizedCrop (optional; disabled by default).
@@ -905,6 +918,97 @@ def build_train_transform(
     _maybe_add_random_erasing(cfg, normalize_and_erasing)
 
     aug_tf = T.Compose(pre_tensor + to_tensor_and_pre_norm + normalize_and_erasing)
+
+    # Optional: per-sample probability to bypass augmentation and use clean eval pipeline
+    no_aug_prob = float(cfg.get("no_augment_prob", cfg.get("clean_sample_prob", 0.0)))
+    if no_aug_prob <= 0.0:
+        return aug_tf
+
+    clean_tf = build_eval_transform(image_size=image_size, mean=mean, std=std)
+
+    class ChoiceByProb:
+        def __init__(self, p_clean: float, clean: Any, aug: Any) -> None:
+            self.p_clean = float(p_clean)
+            self.clean = clean
+            self.aug = aug
+
+        def __call__(self, x: Any) -> Any:
+            if torch.rand(()) < self.p_clean:
+                return self.clean(x)
+            return self.aug(x)
+
+    return ChoiceByProb(no_aug_prob, clean_tf, aug_tf)
+
+
+def build_train_transform_augmix(
+    image_size: Union[int, Tuple[int, int]],
+    mean: Sequence[float],
+    std: Sequence[float],
+    augment_cfg: Optional[Dict[str, Any]] = None,
+) -> T.Compose:
+    """
+    AugMix-based training transform (single output tensor).
+
+    Design goals:
+      - Keep dataloader / training step unchanged: dataset returns a single `Tensor[C,H,W]`.
+      - Avoid stacking legacy "handcrafted" transforms on top of AugMix by default.
+      - Preserve optional visual overlays (watermark / light_spot) from config.
+    """
+    cfg = dict(augment_cfg or {})
+    augmix_cfg: Dict[str, Any] = dict(cfg.get("augmix", {}) or {})
+
+    # If explicitly disabled, fall back to the clean eval pipeline.
+    if not bool(augmix_cfg.get("enabled", True)):
+        return build_eval_transform(image_size=image_size, mean=mean, std=std)
+
+    # 1) Base PIL transforms (size + optional hflip) + optional overlays.
+    pre_pil: List[Any] = []
+
+    rrc_enabled = bool(
+        cfg.get(
+            "random_resized_crop_enabled",
+            bool(dict(cfg.get("random_resized_crop", {})).get("enabled", False)),
+        )
+    )
+    if rrc_enabled:
+        rrc_scale = cfg.get(
+            "random_resized_crop_scale",
+            dict(cfg.get("random_resized_crop", {})).get("scale", [0.8, 1.0]),
+        )
+        rrc_ratio = cfg.get(
+            "random_resized_crop_ratio",
+            dict(cfg.get("random_resized_crop", {})).get("ratio", None),
+        )
+        if rrc_ratio is None:
+            pre_pil.append(T.RandomResizedCrop(image_size, scale=tuple(rrc_scale)))
+        else:
+            pre_pil.append(
+                T.RandomResizedCrop(image_size, scale=tuple(rrc_scale), ratio=tuple(rrc_ratio))
+            )
+    else:
+        pre_pil.append(T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC))
+
+    # Keep horizontal flip as a simple, widely-used geometric augmentation (tunable via YAML).
+    hflip_prob = float(cfg.get("horizontal_flip_prob", cfg.get("horizontal_flip", {}).get("prob", 0.5)))
+    if hflip_prob > 0.0:
+        pre_pil.append(T.RandomHorizontalFlip(p=hflip_prob))
+
+    # Preserve these two augmentations (explicitly favored in the discussion).
+    _maybe_add_visual_overlays(cfg, pre_pil)
+
+    # 2) AugMix -> returns a normalized tensor.
+    from .augmix import AugMix, AugMixConfig
+
+    preprocess = T.Compose([T.ToTensor(), T.Normalize(mean=mean, std=std)])
+    am_cfg = AugMixConfig(
+        severity=int(augmix_cfg.get("severity", augmix_cfg.get("aug_severity", 3))),
+        width=int(augmix_cfg.get("width", augmix_cfg.get("mixture_width", 3))),
+        depth=int(augmix_cfg.get("depth", augmix_cfg.get("mixture_depth", -1))),
+        alpha=float(augmix_cfg.get("alpha", augmix_cfg.get("aug_prob_coeff", 1.0))),
+        all_ops=bool(augmix_cfg.get("all_ops", augmix_cfg.get("all", False))),
+    )
+    augmix_tf = AugMix(preprocess, cfg=am_cfg)
+    aug_tf = T.Compose([*pre_pil, augmix_tf])
 
     # Optional: per-sample probability to bypass augmentation and use clean eval pipeline
     no_aug_prob = float(cfg.get("no_augment_prob", cfg.get("clean_sample_prob", 0.0)))

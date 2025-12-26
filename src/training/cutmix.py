@@ -143,6 +143,15 @@ class CutMixBatchAugment:
 
         if bsz >= 2:
             perm = torch.randperm(bsz, device=images.device)
+            # Optional debug/traceability: keep the permutation indices so downstream
+            # tooling (e.g., input image dumping) can associate mixed samples with both
+            # source IDs. This is safe to ignore in training logic.
+            try:
+                batch["_cutmix_perm"] = perm.detach().cpu()
+                batch["_cutmix_lam"] = float(lam_eff)
+                batch["_cutmix_bbox"] = (int(yl), int(xl), int(yu), int(xu))
+            except Exception:
+                pass
             images_perm = images[perm]
             self._mix_images_with_bbox(images, images_perm, (yl, xl, yu, xu))  # in-place
             # Mix scalar regression targets by lam_eff

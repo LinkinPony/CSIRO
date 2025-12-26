@@ -289,6 +289,8 @@ class NdviDenseAsScalarDataset(Dataset):
 
         return {
             "image": rgb,
+            # Traceability/debug: include a stable id for this tile.
+            "image_id": f"{os.path.splitext(os.path.basename(rgb_path))[0]}_x{x1}-{x2}_y{y1}-{y2}",
             "y_reg3": y_reg3,
             "reg3_mask": reg3_mask,
             "y_height": y_height,

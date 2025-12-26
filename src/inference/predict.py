@@ -59,6 +59,31 @@ def _maybe_seed_mc_dropout(seed: int) -> None:
         pass
 
 
+def _normalize_layer_weights(
+    layer_weights: Optional[torch.Tensor],
+    *,
+    num_layers: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    """
+    Normalize optional fusion weights for multi-layer inference.
+
+    Returns:
+        A tensor of shape (L,) on (device,dtype) summing to 1, or None to indicate
+        uniform averaging should be used.
+    """
+    if layer_weights is None:
+        return None
+    if not isinstance(layer_weights, torch.Tensor):
+        return None
+    if layer_weights.dim() != 1 or int(layer_weights.numel()) != int(num_layers):
+        return None
+    w = layer_weights.to(device=device, dtype=dtype)
+    w = w / w.sum().clamp_min(1e-8)
+    return w
+
+
 class DinoV3FeatureExtractor(nn.Module):
     def __init__(self, backbone: nn.Module) -> None:
         super().__init__()
@@ -250,6 +275,7 @@ def predict_from_features(
     head_total: int,
     use_layerwise_heads: bool,
     num_layers: int,
+    layer_weights: Optional[torch.Tensor] = None,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -301,8 +327,18 @@ def predict_from_features(
         preds_all_L = preds_all.view(N, num_layers, head_total)
         main_layers = preds_all_L[:, :, :head_num_main]  # (N, L, head_num_main)
         ratio_layers = preds_all_L[:, :, head_num_main : head_num_main + head_num_ratio]  # (N, L, head_num_ratio)
-        preds_main = main_layers.mean(dim=1)  # (N, head_num_main)
-        preds_ratio = ratio_layers.mean(dim=1)  # (N, head_num_ratio)
+        w = _normalize_layer_weights(
+            layer_weights,
+            num_layers=num_layers,
+            device=main_layers.device,
+            dtype=main_layers.dtype,
+        )
+        if w is None:
+            preds_main = main_layers.mean(dim=1)  # (N, head_num_main)
+            preds_ratio = ratio_layers.mean(dim=1)  # (N, head_num_ratio)
+        else:
+            preds_main = (main_layers * w.view(1, num_layers, 1)).sum(dim=1)
+            preds_ratio = (ratio_layers * w.view(1, num_layers, 1)).sum(dim=1)
     else:
         # No dedicated ratio outputs: only main predictions are packed.
         if preds_all.shape[1] != head_num_main * num_layers:
@@ -311,7 +347,13 @@ def predict_from_features(
                 f"expected {head_num_main * num_layers}"
             )
         preds_all_L = preds_all.view(N, num_layers, head_num_main)
-        preds_main = preds_all_L.mean(dim=1)
+        w = _normalize_layer_weights(
+            layer_weights,
+            num_layers=num_layers,
+            device=preds_all_L.device,
+            dtype=preds_all_L.dtype,
+        )
+        preds_main = preds_all_L.mean(dim=1) if w is None else (preds_all_L * w.view(1, num_layers, 1)).sum(dim=1)
         preds_ratio = None
 
     return preds_main, preds_ratio
@@ -334,6 +376,7 @@ def predict_main_and_ratio_patch_mode(
     num_layers: int,
     use_separate_bottlenecks: bool,
     layer_indices: Optional[List[int]] = None,
+    layer_weights: Optional[torch.Tensor] = None,
     *,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
@@ -454,13 +497,27 @@ def predict_main_and_ratio_patch_mode(
                         ratio_layers_batch.append(layer_ratio)
 
                 # Average over layers
-                out_main_patch = (
-                    torch.stack(main_layers_batch, dim=0).mean(dim=0)
-                    if len(main_layers_batch) > 0
-                    else torch.empty((images.size(0), 0), dtype=torch.float32, device=device)
-                )
+                if len(main_layers_batch) > 0:
+                    main_stack = torch.stack(main_layers_batch, dim=0)  # (L,B,D)
+                    w = _normalize_layer_weights(
+                        layer_weights,
+                        num_layers=int(main_stack.shape[0]),
+                        device=main_stack.device,
+                        dtype=main_stack.dtype,
+                    )
+                    out_main_patch = main_stack.mean(dim=0) if w is None else (main_stack * w.view(-1, 1, 1)).sum(dim=0)
+                else:
+                    out_main_patch = torch.empty((images.size(0), 0), dtype=torch.float32, device=device)
+
                 if head_num_ratio > 0 and len(ratio_layers_batch) > 0:
-                    out_ratio = torch.stack(ratio_layers_batch, dim=0).mean(dim=0)
+                    ratio_stack = torch.stack(ratio_layers_batch, dim=0)  # (K,B,R)
+                    w = _normalize_layer_weights(
+                        layer_weights,
+                        num_layers=int(ratio_stack.shape[0]),
+                        device=ratio_stack.device,
+                        dtype=ratio_stack.dtype,
+                    )
+                    out_ratio = ratio_stack.mean(dim=0) if w is None else (ratio_stack * w.view(-1, 1, 1)).sum(dim=0)
                 else:
                     out_ratio = None
 
@@ -881,6 +938,7 @@ def predict_main_and_ratio_global_multilayer(
     *,
     use_separate_bottlenecks: bool = False,
     use_cls_token: bool = True,
+    layer_weights: Optional[torch.Tensor] = None,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
@@ -977,13 +1035,27 @@ def predict_main_and_ratio_global_multilayer(
                     ratio_layers_batch.append(layer_ratio)
 
             B = images.size(0)
-            preds_main_batch = (
-                torch.stack(main_layers_batch, dim=0).mean(dim=0)
-                if len(main_layers_batch) > 0
-                else torch.empty((B, 0), dtype=torch.float32, device=device)
-            )
+            if len(main_layers_batch) > 0:
+                main_stack = torch.stack(main_layers_batch, dim=0)  # (L,B,D)
+                w = _normalize_layer_weights(
+                    layer_weights,
+                    num_layers=int(main_stack.shape[0]),
+                    device=main_stack.device,
+                    dtype=main_stack.dtype,
+                )
+                preds_main_batch = main_stack.mean(dim=0) if w is None else (main_stack * w.view(-1, 1, 1)).sum(dim=0)
+            else:
+                preds_main_batch = torch.empty((B, 0), dtype=torch.float32, device=device)
+
             if head_num_ratio > 0 and len(ratio_layers_batch) > 0:
-                preds_ratio_batch = torch.stack(ratio_layers_batch, dim=0).mean(dim=0)
+                ratio_stack = torch.stack(ratio_layers_batch, dim=0)  # (K,B,R)
+                w = _normalize_layer_weights(
+                    layer_weights,
+                    num_layers=int(ratio_stack.shape[0]),
+                    device=ratio_stack.device,
+                    dtype=ratio_stack.dtype,
+                )
+                preds_ratio_batch = ratio_stack.mean(dim=0) if w is None else (ratio_stack * w.view(-1, 1, 1)).sum(dim=0)
             else:
                 preds_ratio_batch = None
 

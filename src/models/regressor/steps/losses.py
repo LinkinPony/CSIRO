@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...layer_utils import average_layerwise_predictions
+from ...layer_utils import fuse_layerwise_predictions
 
 
 class LossesMixin:
@@ -45,7 +45,10 @@ class LossesMixin:
                 return {"loss": zero}
             if self.use_layerwise_heads and self.layer_ndvi_heads is not None and z_layers is not None:
                 preds_layers_ndvi = [head(z_layers[idx]) for idx, head in enumerate(self.layer_ndvi_heads)]
-                pred_ndvi_only = average_layerwise_predictions(preds_layers_ndvi)
+                w = self._get_backbone_layer_fusion_weights(
+                    device=preds_layers_ndvi[0].device, dtype=preds_layers_ndvi[0].dtype
+                )
+                pred_ndvi_only = fuse_layerwise_predictions(preds_layers_ndvi, weights=w)
             else:
                 pred_ndvi_only = self.ndvi_head(z)  # type: ignore[operator]
 
@@ -178,7 +181,10 @@ class LossesMixin:
                         logits_per_layer: List[Tensor] = []
                         for idx, head in enumerate(self.layer_ratio_heads):
                             logits_per_layer.append(head(z_layers[idx]))
-                        ratio_logits = average_layerwise_predictions(logits_per_layer)
+                        w = self._get_backbone_layer_fusion_weights(
+                            device=logits_per_layer[0].device, dtype=logits_per_layer[0].dtype
+                        )
+                        ratio_logits = fuse_layerwise_predictions(logits_per_layer, weights=w)
                     else:
                         ratio_logits = self.ratio_head(z)  # type: ignore[operator]
                     if ratio_logits is not None:
@@ -277,7 +283,10 @@ class LossesMixin:
                     logits_per_layer_5d: List[Tensor] = []
                     for idx, head in enumerate(self.layer_ratio_heads):
                         logits_per_layer_5d.append(head(z_layers[idx]))
-                    ratio_logits = average_layerwise_predictions(logits_per_layer_5d)
+                    w = self._get_backbone_layer_fusion_weights(
+                        device=logits_per_layer_5d[0].device, dtype=logits_per_layer_5d[0].dtype
+                    )
+                    ratio_logits = fuse_layerwise_predictions(logits_per_layer_5d, weights=w)
                 else:
                     ratio_logits = self.ratio_head(z)  # type: ignore[operator]
 
@@ -412,22 +421,34 @@ class LossesMixin:
                 height_preds_layers: List[Tensor] = []
                 for idx, head in enumerate(self.layer_height_heads):
                     height_preds_layers.append(head(z_layers[idx]))
-                pred_height = average_layerwise_predictions(height_preds_layers)
+                w = self._get_backbone_layer_fusion_weights(
+                    device=height_preds_layers[0].device, dtype=height_preds_layers[0].dtype
+                )
+                pred_height = fuse_layerwise_predictions(height_preds_layers, weights=w)
             if self.enable_ndvi and self.layer_ndvi_heads is not None:
                 ndvi_preds_layers: List[Tensor] = []
                 for idx, head in enumerate(self.layer_ndvi_heads):
                     ndvi_preds_layers.append(head(z_layers[idx]))
-                pred_ndvi = average_layerwise_predictions(ndvi_preds_layers)
+                w = self._get_backbone_layer_fusion_weights(
+                    device=ndvi_preds_layers[0].device, dtype=ndvi_preds_layers[0].dtype
+                )
+                pred_ndvi = fuse_layerwise_predictions(ndvi_preds_layers, weights=w)
             if self.enable_species and self.layer_species_heads is not None:
                 species_logits_layers: List[Tensor] = []
                 for idx, head in enumerate(self.layer_species_heads):
                     species_logits_layers.append(head(z_layers[idx]))
-                logits_species = average_layerwise_predictions(species_logits_layers)
+                w = self._get_backbone_layer_fusion_weights(
+                    device=species_logits_layers[0].device, dtype=species_logits_layers[0].dtype
+                )
+                logits_species = fuse_layerwise_predictions(species_logits_layers, weights=w)
             if self.enable_state and self.layer_state_heads is not None:
                 state_logits_layers: List[Tensor] = []
                 for idx, head in enumerate(self.layer_state_heads):
                     state_logits_layers.append(head(z_layers[idx]))
-                logits_state = average_layerwise_predictions(state_logits_layers)
+                w = self._get_backbone_layer_fusion_weights(
+                    device=state_logits_layers[0].device, dtype=state_logits_layers[0].dtype
+                )
+                logits_state = fuse_layerwise_predictions(state_logits_layers, weights=w)
         else:
             pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
             pred_ndvi = self.ndvi_head(z) if self.enable_ndvi else None  # type: ignore[assignment]

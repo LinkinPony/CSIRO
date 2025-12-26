@@ -460,6 +460,11 @@ def train_single_split(
         use_sam=use_sam,
         sam_rho=sam_rho,
         sam_adaptive=sam_adaptive,
+        # Debug: optionally dump the final model input images (after CutMix) for sanity checks.
+        input_image_mean=list(cfg.get("data", {}).get("normalization", {}).get("mean", [0.485, 0.456, 0.406])),
+        input_image_std=list(cfg.get("data", {}).get("normalization", {}).get("std", [0.229, 0.224, 0.225])),
+        run_log_dir=str(log_dir),
+        debug_input_dump_cfg=dict(cfg.get("data", {}).get("augment", {}).get("debug_dump", {})),
     )
 
     head_ckpt_dir = ckpt_dir / "head"

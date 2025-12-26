@@ -459,6 +459,25 @@ def infer_components_5d_for_model(
         use_separate_bottlenecks_head = bool(meta.get("use_separate_bottlenecks", use_separate_bottlenecks_default))
         head_is_ratio = bool(head_num_ratio > 0 and head_total == (head_num_main + head_num_ratio))
 
+        # Multi-layer fusion mode (mean or learned). For MLP multi-layer inference the learned
+        # fusion logits (if any) are exported in head meta as `mlp_layer_logits`.
+        fusion_mode_meta = str(
+            meta.get(
+                "backbone_layers_fusion",
+                meta.get("layer_fusion", first_meta.get("backbone_layers_fusion", "mean")),
+            )
+            or "mean"
+        ).strip().lower()
+        layer_weights_head: Optional[torch.Tensor] = None
+        if use_layerwise_heads_head and fusion_mode_meta == "learned":
+            try:
+                logits_meta = meta.get("mlp_layer_logits", None)
+                if isinstance(logits_meta, (list, tuple)) and len(logits_meta) == len(backbone_layer_indices_head):
+                    logits_t = torch.tensor([float(x) for x in logits_meta], dtype=torch.float32)
+                    layer_weights_head = torch.softmax(logits_t, dim=0)
+            except Exception:
+                layer_weights_head = None
+
         # Ratio head coupling mode (enum). Prefer `ratio_head_mode` when present, but
         # fall back to legacy boolean flags for older exported heads.
         try:
@@ -538,15 +557,8 @@ def infer_components_5d_for_model(
                 dropout=head_dropout,
             )
             if use_layerwise_heads_head:
-                fusion_mode = str(
-                    meta.get(
-                        "backbone_layers_fusion",
-                        meta.get("layer_fusion", first_meta.get("backbone_layers_fusion", "mean")),
-                    )
-                    or "mean"
-                ).strip().lower()
                 head_module = ViTDetMultiLayerScalarHead(  # type: ignore[assignment]
-                    vitdet_cfg, num_layers=num_layers_eff, layer_fusion=fusion_mode
+                    vitdet_cfg, num_layers=num_layers_eff, layer_fusion=fusion_mode_meta
                 )
             else:
                 head_module = ViTDetScalarHead(vitdet_cfg)  # type: ignore[assignment]
@@ -703,6 +715,7 @@ def infer_components_5d_for_model(
                 num_layers=max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1,
                 use_separate_bottlenecks=use_separate_bottlenecks_head,
                 layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                layer_weights=layer_weights_head,
                 mc_dropout_enabled=mc_enabled,
                 mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
             )
@@ -724,6 +737,7 @@ def infer_components_5d_for_model(
                     layer_indices=backbone_layer_indices_head,
                     use_separate_bottlenecks=use_separate_bottlenecks_head,
                     use_cls_token=use_cls_token_head,
+                    layer_weights=layer_weights_head,
                     mc_dropout_enabled=mc_enabled,
                     mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
                 )
