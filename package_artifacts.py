@@ -291,6 +291,22 @@ def copy_optional_third_party(repo_root: Path, weights_dir: Path) -> None:
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "*.pyd", ".git", ".DS_Store"),
         )
 
+    # Copy TabPFN sources for offline TabPFN inference (optional)
+    #
+    # This supports `infer_and_submit_pt.py` using:
+    #   TABPFN_PATH = "third_party/TabPFN/src"
+    tabpfn_src = repo_root / "third_party" / "TabPFN"
+    if tabpfn_src.exists() and tabpfn_src.is_dir():
+        dst = weights_dir / "third_party" / "TabPFN"
+        if dst.exists() and dst.is_dir():
+            shutil.rmtree(dst)
+        shutil.copytree(
+            tabpfn_src,
+            dst,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "*.pyd", ".git", ".DS_Store"),
+        )
+
 
 def copy_top_level_scripts(repo_root: Path, weights_dir: Path) -> list[Path]:
     # Copy selected top-level scripts into weights/scripts/ for portability

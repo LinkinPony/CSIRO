@@ -147,72 +147,11 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
         num_species_classes = None
         num_state_classes = None
 
-    kfold_cfg = cfg.get("kfold", {})
-    num_folds = int(kfold_cfg.get("k", 5))
-    even_split = bool(kfold_cfg.get("even_split", False))
-    # By default, perform grouped k-fold so that all samples from the same
-    # (Sampling_Date, State) pair stay in the same fold.
-    group_by_date_state = bool(kfold_cfg.get("group_by_date_state", True))
+    # Build splits using shared implementation (also used by tabular-only baselines).
+    from src.training.splits import build_kfold_splits
 
-    # Prepare indices and RNG
-    n_samples = len(full_df)
-    indices = np.arange(n_samples)
-    rng = np.random.default_rng(seed=int(cfg.get("seed", 42)))
-
-    # Optionally build group assignments based on Sampling_Date + State
-    use_grouped_kfold = (
-        group_by_date_state
-        and "Sampling_Date" in full_df.columns
-        and "State" in full_df.columns
-    )
-    if group_by_date_state and not use_grouped_kfold:
-        logger.warning(
-            "k-fold config requests grouped splitting by (Sampling_Date, State) "
-            "but the dataframe is missing one or both columns. Falling back to per-image k-fold. "
-            "This can significantly inflate CV metrics. "
-            "Ensure your datamodule includes 'Sampling_Date' and 'State' in build_full_dataframe()."
-        )
-
-    group_indices = None  # type: ignore[assignment]
-    fold_group_ids = None  # type: ignore[assignment]
-    group_sizes = None  # type: ignore[assignment]
-
-    if use_grouped_kfold:
-        # Build a group id per sample: (Sampling_Date, State)
-        dates = full_df["Sampling_Date"].astype(str).to_numpy()
-        states = full_df["State"].astype(str).to_numpy()
-        group_labels = np.array(
-            [f"{d}__{s}" for d, s in zip(dates, states)], dtype=object
-        )
-        unique_groups, group_indices = np.unique(
-            group_labels, return_inverse=True
-        )
-        n_groups = len(unique_groups)
-        group_order = np.arange(n_groups)
-        rng.shuffle(group_order)
-        group_sizes = np.bincount(group_indices, minlength=n_groups)
-
-        # For classic k-fold, assign whole groups to folds greedily by size.
-        if not even_split:
-            fold_group_ids = [[] for _ in range(num_folds)]
-            fold_sizes = [0 for _ in range(num_folds)]
-            for g in group_order:
-                # Always assign the next group to the currently smallest fold.
-                best_fold = int(np.argmin(fold_sizes))
-                fold_group_ids[best_fold].append(int(g))
-                fold_sizes[best_fold] += int(group_sizes[g])
-        else:
-            fold_group_ids = None
-    else:
-        # Fallback: original per-sample k-fold behaviour.
-        # When even_split is disabled, we use classic K-fold style where each fold
-        # uses one contiguous chunk as validation and the remainder as training.
-        # When enabled, for each fold we generate a fresh random 50/50 split.
-        if not even_split:
-            rng.shuffle(indices)
-            folds = np.array_split(indices, num_folds)
-        else:
-            folds = None  # not used under even_split
+    splits = build_kfold_splits(full_df, cfg)
+    num_folds = int(len(splits))
 
     # Export fold splits
     splits_root = log_dir / "folds"
@@ -235,43 +174,7 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
     fold_summaries: List[Dict[str, float]] = []
 
     for fold_idx in range(num_folds):
-        if use_grouped_kfold:
-            assert group_indices is not None
-            assert group_sizes is not None
-            if even_split:
-                # For even_split under grouped k-fold, generate a fresh random
-                # 50/50 split of groups for each fold.
-                n_groups = int(group_sizes.shape[0])
-                perm_groups = rng.permutation(np.arange(n_groups))
-                # Greedy accumulate group sizes until ~50% of samples are covered.
-                target_train = n_samples // 2
-                cum_sizes = group_sizes[perm_groups].cumsum()
-                train_mask_groups = cum_sizes <= target_train
-                if not train_mask_groups.any():
-                    # Ensure at least one group ends up in the training set
-                    train_mask_groups[0] = True
-                train_group_ids = set(perm_groups[train_mask_groups])
-                train_mask = np.isin(group_indices, list(train_group_ids))
-                val_mask = ~train_mask
-                train_idx = np.where(train_mask)[0]
-                val_idx = np.where(val_mask)[0]
-            else:
-                assert fold_group_ids is not None
-                val_group_ids = set(fold_group_ids[fold_idx])
-                val_mask = np.isin(group_indices, list(val_group_ids))
-                val_idx = np.where(val_mask)[0]
-                train_idx = np.where(~val_mask)[0]
-        else:
-            if even_split:
-                perm = rng.permutation(indices)
-                n_train = n_samples // 2
-                train_idx = perm[:n_train]
-                val_idx = perm[n_train:]
-            else:
-                val_idx = folds[fold_idx]
-                train_idx = np.concatenate(
-                    [folds[i] for i in range(num_folds) if i != fold_idx]
-                )
+        train_idx, val_idx = splits[fold_idx]
 
         train_df = full_df.iloc[train_idx].reset_index(drop=True)
         val_df = full_df.iloc[val_idx].reset_index(drop=True)

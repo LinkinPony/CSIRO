@@ -1,0 +1,119 @@
+seed: 42
+
+# This config is for the TabPFN (2.5) demo (`tabpfn_train.py`).
+# - TabPFN input X comes from **image-model head penultimate features** (pre-final-linear),
+#   extracted using the weights defined by `image_features.train_config` + a head checkpoint.
+# - Uses the SAME CSIRO train.csv pivoting logic as the main project.
+# - Uses the SAME k-fold split logic as the main project (optionally grouped by (Sampling_Date, State)).
+# - Evaluation matches the project: weighted R^2 computed in log-space across 5 biomass components.
+#
+# NOTE: TabPFN 2.5 weights are hosted as a gated model on HuggingFace. If you hit auth errors:
+# - Accept terms at https://huggingface.co/Prior-Labs/tabpfn_2_5
+# - Then run `hf auth login` or set HF_TOKEN
+# - Or provide a local checkpoint via `tabpfn.model_path` / `--model-path`
+
+# Version tag used only for output folder naming under logging.log_dir/tabpfn/
+version: tabpfn-2.5-tabular
+
+data:
+  # Keep consistent with the main project (relative to repo root).
+  root: data
+  train_csv: train.csv
+
+  # Keep consistent with the main project pivot filtering:
+  # pivoted rows are dropped if any of these targets are missing for an image_id.
+  #
+  # The TabPFN demo still evaluates on the full 5D biomass vector:
+  # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
+  target_order: [Dry_Total_g]
+
+kfold:
+  # `tabpfn_train.py` always runs CV; this flag is kept for consistency with train.yaml.
+  enabled: true
+
+  # Number of folds
+  k: 5
+
+  # IMPORTANT:
+  # - false: classic k-fold style (each sample should be validated once) -> enables OOF aggregation.
+  # - true : for each fold, generate a fresh random ~50/50 split (NOT classic k-fold).
+  even_split: true
+
+  # Default behavior in the main project: keep all samples from the same
+  # (Sampling_Date, State) group in the same fold.
+  group_by_date_state: true
+
+logging:
+  # Where outputs are written:
+  # <log_dir>/tabpfn/<version>-<timestamp>/{fold_metrics.json,val_predictions.csv,summary.json,...}
+  log_dir: outputs
+
+  # Kept for structural similarity to train.yaml (unused by tabpfn_train.py).
+  ckpt_dir: outputs/checkpoints
+
+image_features:
+  # Use the **image model config** (train.yaml) to define backbone + preprocessing.
+  train_config: configs/train.yaml
+
+  # TabPFN input feature source:
+  # - head_penultimate: use per-fold head penultimate (pre-final-linear) features (requires fold head weights).
+  # - dinov3_only: use frozen DINOv3 CLS token (no LoRA, no head; does not require any fold-specific weights).
+  mode: head_penultimate
+  # mode: dinov3_only
+
+  # Head weights checkpoint used to compute penultimate features (z) inside the head.
+  #
+  # If null, `tabpfn_train.py` will best-effort auto-resolve:
+  #  1) weights/head/infer_head.pt (if loadable)
+  #  2) outputs/checkpoints/<image_config.version>/train_all/head/head-epoch*.pt (latest)
+  #
+  # No downloads are attempted.
+  head_weights_path: null
+
+  # How to reduce multi-layer head features to a single vector per image:
+  # - mean  : use fused z (or mean of z_layers)  -> (D)
+  # - concat: concatenate z_layers               -> (D * L)  (can exceed TabPFN feature limit)
+  fusion: mean
+
+  # Feature extraction dataloader params
+  batch_size: 8
+  num_workers: 8
+
+  # Optional feature cache (speeds up repeated CV runs). When null, no caching.
+  # cache_path: outputs/tabpfn_feature_cache/head_penultimate_features.pt
+  cache_path: null
+
+tabpfn:
+
+  # TabPFN ensemble size (n_estimators in TabPFNRegressor).
+  n_estimators: 8
+
+  # Device setting for TabPFN ("auto"|"cpu"|"cuda"|"cuda:0"|...)
+  device: auto
+
+  # TabPFN fit_mode: fit_preprocessors|low_memory|fit_with_cache|batched
+  fit_mode: fit_preprocessors
+
+  # Inference precision: auto|autocast|float16|bfloat16|float32
+  inference_precision: auto
+
+  # TabPFN has official limits on feature count (e.g. <=2000). Using DINO features can exceed this
+  # (e.g. cls_patch_mean for vith16plus is 2*1280=2560), so we enable this override by default.
+  ignore_pretraining_limits: true
+
+  # MultiOutputRegressor parallelism (each output trains a separate TabPFNRegressor).
+  # Keep 1 by default to avoid heavy duplication of model downloads/memory.
+  n_jobs: 1
+
+  # Telemetry: keep disabled by default.
+  enable_telemetry: false
+
+  # Optional: override cache directory for downloaded TabPFN models.
+  # model_cache_dir: /path/to/cache
+  model_cache_dir: null
+
+  # REQUIRED: explicit local checkpoint path.
+  # This script will NOT attempt to download weights.
+  model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_default.ckpt
+
+

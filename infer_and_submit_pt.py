@@ -1,8 +1,5 @@
 # ===== Required user variables =====
 # Backward-compat: WEIGHTS_PT_PATH is ignored when HEAD_WEIGHTS_PT_PATH is provided.
-from pickle import TRUE
-
-
 HEAD_WEIGHTS_PT_PATH = "weights/head/"  # regression head-only weights (.pt)
 # Backbone weights path can be EITHER:
 #  - a single weights file (.pt or .pth), OR
@@ -24,6 +21,51 @@ PEFT_PATH = "third_party/peft/src"  # path to peft source folder (contains peft/
 # New: specify the project directory that contains both `configs/` and `src/` folders.
 # Example: PROJECT_DIR = "/media/dl/dataset/Git/CSIRO"
 PROJECT_DIR = "."
+
+# ===== TabPFN inference (optional) =====
+# When enabled, this script will:
+#   1) Load CSIRO `train.csv`, pivot to image-level rows
+#   2) Extract **image-model head penultimate features** (pre-final-linear) for train + test images
+#   3) Train TabPFN on the FULL train.csv (no CV)
+#   4) Predict all test images and write `submission.csv`
+#
+# IMPORTANT:
+# - TabPFN weights are loaded **LOCAL-ONLY** from TABPFN_WEIGHTS_CKPT_PATH.
+# - No HuggingFace download / auth is attempted in this script.
+TABPFN_ENABLED = True
+
+# Optional: path to TabPFN python package source (offline-friendly).
+# If you have tabpfn installed in the environment, you can ignore this.
+TABPFN_PATH = "third_party/TabPFN/src"
+
+# TabPFN weights path can be EITHER:
+#  - a single checkpoint file (.ckpt), OR
+#  - a directory containing one or more .ckpt files (the script will auto-select one).
+#
+# REQUIRED when TABPFN_ENABLED=True: local TabPFN 2.5 regressor checkpoint (.ckpt)
+TABPFN_WEIGHTS_CKPT_PATH = "tabpfn_weights/tabpfn-v2.5-regressor-v2.5_default.ckpt"
+
+# TabPFN runtime params
+TABPFN_DEVICE = "auto"  # "auto"|"cpu"|"cuda"|"cuda:0"|...
+TABPFN_N_ESTIMATORS = 8
+TABPFN_FIT_MODE = "fit_preprocessors"
+TABPFN_INFERENCE_PRECISION = "auto"
+TABPFN_IGNORE_PRETRAINING_LIMITS = True
+TABPFN_N_JOBS = 1  # MultiOutputRegressor parallelism (each output fits its own TabPFNRegressor)
+TABPFN_ENABLE_TELEMETRY = False
+TABPFN_MODEL_CACHE_DIR = ""  # optional; e.g. "/tmp/tabpfn_cache"
+
+# Training data for TabPFN:
+# - Default: automatically use <dataset_root>/train.csv, where dataset_root is resolved from INPUT_PATH.
+# - Override: set to an explicit path to train.csv.
+TABPFN_TRAIN_CSV_PATH = "data/train.csv"  # optional override
+
+# Penultimate feature extraction settings
+TABPFN_FEATURE_FUSION = "mean"  # "mean" | "concat" (concat can exceed TabPFN feature limits)
+TABPFN_FEATURE_BATCH_SIZE = 8
+TABPFN_FEATURE_NUM_WORKERS = 8
+TABPFN_FEATURE_CACHE_PATH_TRAIN = ""  # optional .pt cache
+TABPFN_FEATURE_CACHE_PATH_TEST = ""  # optional .pt cache
 
 # ===== Multi-GPU model-parallel inference (Scheme B) =====
 # When running the VERY large dinov3_vit7b16 backbone on 2x16GB GPUs (e.g., Kaggle T4),
@@ -95,6 +137,7 @@ def main() -> None:
     # Prefer local dinov3 / peft bundles when present (offline-friendly).
     _add_import_root(DINOV3_PATH, package_name="dinov3")
     _add_import_root(PEFT_PATH, package_name="peft")
+    _add_import_root(TABPFN_PATH, package_name="tabpfn")
 
     # Validate project directory and import project modules.
     project_dir_abs = os.path.abspath(PROJECT_DIR) if PROJECT_DIR else ""
@@ -106,9 +149,41 @@ def main() -> None:
         raise RuntimeError(f"configs/ not found under PROJECT_DIR: {configs_dir}")
     if not os.path.isdir(src_dir):
         raise RuntimeError(f"src/ not found under PROJECT_DIR: {src_dir}")
+
+    def _resolve_under_project_dir(p: str) -> str:
+        """
+        Resolve a possibly-relative path.
+
+        Kaggle notebooks typically run from `/kaggle/working`, while the repo lives under
+        `/kaggle/input/<dataset>/...`. Users often set PROJECT_DIR correctly but keep
+        vendor paths like `third_party/dinov3` relative. This helper makes those paths
+        behave as-if they were relative to PROJECT_DIR.
+        """
+        raw = str(p or "").strip()
+        if not raw:
+            return raw
+        if os.path.isabs(raw) and os.path.exists(raw):
+            return raw
+        # First: resolve relative to current working dir (backward-compatible)
+        cwd_abs = os.path.abspath(raw)
+        if os.path.exists(cwd_abs):
+            return cwd_abs
+        # Fallback: resolve relative to PROJECT_DIR
+        cand = os.path.join(project_dir_abs, raw)
+        if os.path.exists(cand):
+            return os.path.abspath(cand)
+        return raw
+
+    dinov3_path_resolved = _resolve_under_project_dir(str(DINOV3_PATH))
+    peft_path_resolved = _resolve_under_project_dir(str(PEFT_PATH))
+    tabpfn_path_resolved = _resolve_under_project_dir(str(TABPFN_PATH))
+
+    # Re-add vendor roots using PROJECT_DIR-relative resolution (helps on Kaggle).
+    _add_import_root(dinov3_path_resolved, package_name="dinov3")
+    _add_import_root(peft_path_resolved, package_name="peft")
+    _add_import_root(tabpfn_path_resolved, package_name="tabpfn")
     _add_import_root(project_dir_abs)
 
-    from src.inference.pipeline import run  # noqa: E402
     from src.inference.settings import InferenceSettings  # noqa: E402
 
     settings = InferenceSettings(
@@ -117,8 +192,8 @@ def main() -> None:
         input_path=str(INPUT_PATH),
         output_submission_path=str(OUTPUT_SUBMISSION_PATH),
         project_dir=str(PROJECT_DIR),
-        dinov3_path=str(DINOV3_PATH),
-        peft_path=str(PEFT_PATH),
+        dinov3_path=str(dinov3_path_resolved),
+        peft_path=str(peft_path_resolved),
         use_2gpu_model_parallel_for_vit7b=bool(USE_2GPU_MODEL_PARALLEL_FOR_VIT7B),
         vit7b_mp_split_idx=int(VIT7B_MP_SPLIT_IDX),
         vit7b_mp_dtype=str(VIT7B_MP_DTYPE),
@@ -131,6 +206,33 @@ def main() -> None:
         mc_dropout_samples=int(MC_DROPOUT_SAMPLES),
         mc_dropout_seed=int(MC_DROPOUT_SEED),
     )
+
+    if bool(TABPFN_ENABLED):
+        from src.inference.tabpfn import TabPFNSubmissionSettings, run_tabpfn_submission  # noqa: E402
+
+        tabpfn_settings = TabPFNSubmissionSettings(
+            weights_ckpt_path=str(TABPFN_WEIGHTS_CKPT_PATH),
+            tabpfn_python_path=str(tabpfn_path_resolved),
+            device=str(TABPFN_DEVICE),
+            n_estimators=int(TABPFN_N_ESTIMATORS),
+            fit_mode=str(TABPFN_FIT_MODE),
+            inference_precision=str(TABPFN_INFERENCE_PRECISION),
+            ignore_pretraining_limits=bool(TABPFN_IGNORE_PRETRAINING_LIMITS),
+            n_jobs=int(TABPFN_N_JOBS),
+            enable_telemetry=bool(TABPFN_ENABLE_TELEMETRY),
+            model_cache_dir=str(TABPFN_MODEL_CACHE_DIR),
+            train_csv_path=str(TABPFN_TRAIN_CSV_PATH),
+            feature_fusion=str(TABPFN_FEATURE_FUSION),
+            feature_batch_size=int(TABPFN_FEATURE_BATCH_SIZE),
+            feature_num_workers=int(TABPFN_FEATURE_NUM_WORKERS),
+            feature_cache_path_train=str(TABPFN_FEATURE_CACHE_PATH_TRAIN),
+            feature_cache_path_test=str(TABPFN_FEATURE_CACHE_PATH_TEST),
+        )
+        run_tabpfn_submission(settings=settings, tabpfn=tabpfn_settings)
+        return
+
+    from src.inference.pipeline import run  # noqa: E402
+
     run(settings)
 
 

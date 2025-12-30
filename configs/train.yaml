@@ -436,7 +436,7 @@ scheduler:
   warmup_start_factor: 0.1
 
 kfold:
-  enabled: false
+  enabled: true
   k: 5
   even_split: true
 

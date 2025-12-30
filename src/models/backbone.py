@@ -320,6 +320,37 @@ def load_dinov3_vitl16(
     weights_path: Optional[str] = None,
     check_hash: bool = False,
 ) -> nn.Module:
+    # Prefer importing the vendored `dinov3` package directly.
+    #
+    # Why: `torch.hub.load()` will try to fetch the *repo code* from GitHub when
+    # `repo_or_dir` is a repo string (e.g. "facebookresearch/dinov3"). Even if
+    # `weights_path` is local (so no weights download), Kaggle (offline) would
+    # still crash trying to reach GitHub for the hub repo.
+    #
+    # Using the `dinov3.hub.backbones.*` factory functions avoids TorchHub repo
+    # resolution entirely and is offline-safe as long as the `dinov3` package
+    # is available on `sys.path` (we vendor it under `third_party/dinov3`).
+    try:
+        from dinov3.hub.backbones import dinov3_vitl16 as _dinov3_vitl16  # type: ignore
+
+        if weights_path:
+            model = _dinov3_vitl16(pretrained=False, check_hash=check_hash)
+            state = torch.load(weights_path, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            # Load with strict=False to be robust to minor key mismatches
+            model.load_state_dict(state, strict=False)
+            return model
+
+        if weights_url:
+            # `weights_url` can be a URL or a local file path.
+            return _dinov3_vitl16(pretrained=pretrained, weights=weights_url, check_hash=check_hash)
+
+        return _dinov3_vitl16(pretrained=pretrained, check_hash=check_hash)
+    except Exception:
+        # Fallback: use torch.hub (may require internet unless repo_or_dir is local).
+        pass
+
     # Prefer explicit offline weights if provided
     if weights_path:
         model = torch.hub.load(
@@ -361,6 +392,26 @@ def load_dinov3_vith16plus(
     weights_path: Optional[str] = None,
     check_hash: bool = False,
 ) -> nn.Module:
+    # Prefer importing the vendored `dinov3` package directly to avoid TorchHub
+    # trying to reach GitHub in offline environments (e.g. Kaggle).
+    try:
+        from dinov3.hub.backbones import dinov3_vith16plus as _dinov3_vith16plus  # type: ignore
+
+        if weights_path:
+            model = _dinov3_vith16plus(pretrained=False, check_hash=check_hash)
+            state = torch.load(weights_path, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            model.load_state_dict(state, strict=False)
+            return model
+
+        if weights_url:
+            return _dinov3_vith16plus(pretrained=pretrained, weights=weights_url, check_hash=check_hash)
+
+        return _dinov3_vith16plus(pretrained=pretrained, check_hash=check_hash)
+    except Exception:
+        pass
+
     # Prefer explicit offline weights if provided
     if weights_path:
         model = torch.hub.load(
@@ -407,6 +458,27 @@ def load_dinov3_vit7b16(
     Official LVD1689M pretrain weights filename:
       dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth
     """
+    # Prefer importing the vendored `dinov3` package directly to avoid TorchHub
+    # trying to reach GitHub in offline environments (e.g. Kaggle).
+    try:
+        from dinov3.hub.backbones import dinov3_vit7b16 as _dinov3_vit7b16  # type: ignore
+
+        if weights_path:
+            model = _dinov3_vit7b16(pretrained=False, check_hash=check_hash)
+            state = torch.load(weights_path, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            # Load with strict=False to be robust to minor key mismatches
+            model.load_state_dict(state, strict=False)
+            return model
+
+        if weights_url:
+            return _dinov3_vit7b16(pretrained=pretrained, weights=weights_url, check_hash=check_hash)
+
+        return _dinov3_vit7b16(pretrained=pretrained, check_hash=check_hash)
+    except Exception:
+        pass
+
     # Prefer explicit offline weights if provided
     if weights_path:
         model = torch.hub.load(

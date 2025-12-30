@@ -378,68 +378,15 @@ class PastureDataModule(LightningDataModule):
         self._biomass_5d_std: Optional[List[float]] = None
 
     def _read_and_pivot(self) -> pd.DataFrame:
-        csv_path = os.path.join(self.data_root, self.train_csv)
-        df = pd.read_csv(csv_path)
-        # Do NOT filter by target_order here: we want to keep all canonical biomass
-        # components (Dry_Green_g, Dry_Dead_g, Dry_Clover_g, GDM_g, Dry_Total_g)
-        # so that auxiliary losses (ratio head, 5D weighted MSE) can be computed
-        # even when the main regression head supervises only a subset (e.g., Dry_Total_g).
-        # sample_id in CSV includes target suffix, e.g., IDxxxx__Dry_Clover_g
-        # derive an image_id without suffix to aggregate targets per image
-        df = df.copy()
-        df["image_id"] = df["sample_id"].astype(str).str.split("__", n=1, expand=True)[0]
+        # Shared implementation (kept in src/tabular so tabular-only experiments
+        # can reuse the *exact* same aggregation semantics).
+        from src.data.csiro_pivot import read_and_pivot_csiro_train_csv
 
-        pivot = df.pivot_table(
-            index="image_id",
-            columns="target_name",
-            values="target",
-            aggfunc="first",
+        return read_and_pivot_csiro_train_csv(
+            data_root=self.data_root,
+            train_csv=self.train_csv,
+            target_order=self.target_order,
         )
-        image_path_series = df.groupby("image_id")["image_path"].first()
-        # also aggregate auxiliary labels
-        # Keep Sampling_Date at image-level so k-fold can optionally group by (Sampling_Date, State).
-        sampling_date_series = df.groupby("image_id")["Sampling_Date"].first()
-        height_series = df.groupby("image_id")["Height_Ave_cm"].first()
-        ndvi_series = df.groupby("image_id")["Pre_GSHH_NDVI"].first()
-        species_series = df.groupby("image_id")["Species"].first()
-        state_series = df.groupby("image_id")["State"].first()
-        merged = pivot.join(image_path_series, how="inner")
-        merged = (
-            merged.join(sampling_date_series, how="left")
-            .join(height_series, how="left")
-            .join(ndvi_series, how="left")
-            .join(species_series, how="left")
-            .join(state_series, how="left")
-        )
-        # Ensure all supervised primary targets are present
-        merged = merged.dropna(subset=self.target_order)
-        merged = merged.reset_index(drop=False)
-
-        # Ensure all canonical biomass components are present as columns so that
-        # downstream datasets can build ratio labels and 5D component targets.
-        canonical_targets = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
-        for t in canonical_targets:
-            if t not in merged.columns:
-                merged[t] = np.nan
-
-        # Ensure proper column order: primary targets (target_order), then canonical targets,
-        # followed by auxiliary labels and metadata.
-        target_cols = []
-        for t in list(self.target_order) + canonical_targets:
-            if t not in target_cols and t in merged.columns:
-                target_cols.append(t)
-        cols = [
-            *target_cols,
-            "Height_Ave_cm",
-            "Pre_GSHH_NDVI",
-            "Species",
-            "State",
-            "Sampling_Date",
-            "image_path",
-            "image_id",
-        ]
-        merged = merged[cols]
-        return merged
 
     def setup(self, stage: Optional[str] = None) -> None:
         # If predefined splits are provided, use them and skip random splitting
