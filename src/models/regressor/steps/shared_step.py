@@ -358,7 +358,17 @@ class SharedStepMixin:
 
             head_type = str(getattr(self, "_head_type", "mlp")).lower()
 
-            # 1) Supervised branch uses the clean view and mixes labels.
+            # 1) Forward ALL views.
+            #    - Clean view: may apply manifold mixup AND mixes labels -> produces `batch_mixed`
+            #    - Aug views : use the SAME mixup params but do NOT mix labels (labels already mixed)
+            preds_reg3: List[Tensor] = []
+            zs: List[Tensor] = []
+            z_layers_list: List[Optional[List[Tensor]]] = []
+            ratio_logits_list: List[Optional[Tensor]] = []
+            ndvi_preds: List[Optional[Tensor]] = []
+            pred_reg3_layers_list: List[Optional[List[Tensor]]] = []
+            ratio_logits_layers_list: List[Optional[List[Tensor]]] = []
+
             (
                 pred_reg3_c,
                 z_c,
@@ -378,45 +388,53 @@ class SharedStepMixin:
                 mixup_perm=mix_perm,
                 mixup_mix_labels=True,
             )
+            preds_reg3.append(pred_reg3_c)
+            zs.append(z_c)
+            z_layers_list.append(z_layers_c)
+            ratio_logits_list.append(ratio_logits_pred_c)
+            ndvi_preds.append(ndvi_pred_c)
+            pred_reg3_layers_list.append(pred_reg3_layers_c)
+            ratio_logits_layers_list.append(ratio_logits_layers_c)
 
-            # 2) Consistency branches: forward on aug views with the SAME mixup params but WITHOUT mixing labels.
+            # Keep the original AugMix-style behavior: at most two augmented views.
+            for img_v in images_aug_list[:2]:
+                (
+                    pr,
+                    zv,
+                    zl,
+                    rlog,
+                    ndv,
+                    _b2,
+                    pr_layers,
+                    rlog_layers,
+                ) = self._predict_reg3_and_z(
+                    images=img_v,
+                    batch=batch_mixed,
+                    stage=stage,
+                    use_mixup=use_mixup,
+                    is_ndvi_only=is_ndvi_only,
+                    mixup_lam=mix_lam,
+                    mixup_perm=mix_perm,
+                    mixup_mix_labels=False,
+                )
+                preds_reg3.append(pr)
+                zs.append(zv)
+                z_layers_list.append(zl)
+                ratio_logits_list.append(rlog)
+                ndvi_preds.append(ndv)
+                pred_reg3_layers_list.append(pr_layers)
+                ratio_logits_layers_list.append(rlog_layers)
+
+            # 2) Consistency loss (computed across views).
             cons_cfg = dict(getattr(self, "_augmix_consistency_cfg", {}) or {})
             cons_enabled = bool(cons_cfg.get("enabled", True))
-            if cons_enabled and images_aug_list:
-                # We support 1 or 2 aug views (AugMix-style).
-                preds_reg3: List[Tensor] = [pred_reg3_c]
-                zs: List[Tensor] = [z_c]
-                z_layers_list: List[Optional[List[Tensor]]] = [z_layers_c]
-                ratio_logits_list: List[Optional[Tensor]] = [ratio_logits_pred_c]
-
-                for img_v in images_aug_list[:2]:
-                    (
-                        pr,
-                        zv,
-                        zl,
-                        rlog,
-                        _nd,
-                        _b2,
-                        _pr_layers,
-                        _rlog_layers,
-                    ) = self._predict_reg3_and_z(
-                        images=img_v,
-                        batch=batch_mixed,
-                        stage=stage,
-                        use_mixup=use_mixup,
-                        is_ndvi_only=is_ndvi_only,
-                        mixup_lam=mix_lam,
-                        mixup_perm=mix_perm,
-                        mixup_mix_labels=False,
-                    )
-                    preds_reg3.append(pr)
-                    zs.append(zv)
-                    z_layers_list.append(zl)
-                    ratio_logits_list.append(rlog)
-
-                # --- reg3 consistency (MSE to mean, analogous to JSD mixture) ---
+            loss_cons_reg3 = pred_reg3_c.sum() * 0.0
+            loss_cons_ratio = pred_reg3_c.sum() * 0.0
+            loss_cons_total = pred_reg3_c.sum() * 0.0
+            if cons_enabled and len(preds_reg3) >= 2:
+                # --- reg3 consistency (normalized space; z-score when enabled) ---
                 try:
-                    preds_for_cons = []
+                    preds_for_cons: List[Tensor] = []
                     sp = getattr(self, "out_softplus", None)
                     for p in preds_reg3:
                         preds_for_cons.append(sp(p) if sp is not None else p)
@@ -428,13 +446,14 @@ class SharedStepMixin:
                 except Exception:
                     loss_cons_reg3 = pred_reg3_c.sum() * 0.0
 
-                # --- ratio consistency (JSD on probabilities) ---
-                loss_cons_ratio = pred_reg3_c.sum() * 0.0
+                # --- ratio consistency (LOGITS space: MSE to mean logits) ---
                 if bool(getattr(self, "enable_ratio_head", False)):
                     try:
-                        probs: List[Tensor] = []
+                        logits_list: List[Tensor] = []
 
-                        def _get_ratio_logits(zv: Tensor, zl: Optional[List[Tensor]], r_pred: Optional[Tensor]) -> Optional[Tensor]:
+                        def _get_ratio_logits(
+                            zv: Tensor, zl: Optional[List[Tensor]], r_pred: Optional[Tensor]
+                        ) -> Optional[Tensor]:
                             if isinstance(r_pred, torch.Tensor):
                                 return r_pred
                             rh = getattr(self, "ratio_head", None)
@@ -447,7 +466,8 @@ class SharedStepMixin:
                                     logits_per_layer = [head(zl[idx]) for idx, head in enumerate(lrh)]
                                     from ...layer_utils import fuse_layerwise_predictions
                                     w = self._get_backbone_layer_fusion_weights(
-                                        device=logits_per_layer[0].device, dtype=logits_per_layer[0].dtype
+                                        device=logits_per_layer[0].device,
+                                        dtype=logits_per_layer[0].dtype,
                                     )
                                     return fuse_layerwise_predictions(logits_per_layer, weights=w)
                             return rh(zv)  # type: ignore[operator]
@@ -455,34 +475,55 @@ class SharedStepMixin:
                         for zv, zl, r_pred in zip(zs, z_layers_list, ratio_logits_list):
                             logits = _get_ratio_logits(zv, zl, r_pred)
                             if logits is None:
-                                probs = []
+                                logits_list = []
                                 break
-                            probs.append(F.softmax(logits, dim=-1))
+                            logits_list.append(logits)
 
-                        if probs:
-                            eps = float(cons_cfg.get("eps", 1e-7))
-                            n = float(len(probs))
-                            p_mix = torch.clamp(sum(probs) / n, eps, 1.0).log()
-                            jsd = torch.zeros((), device=p_mix.device, dtype=p_mix.dtype)
-                            for p in probs:
-                                jsd = jsd + F.kl_div(p_mix, p, reduction="batchmean")
-                            loss_cons_ratio = jsd / n
+                        if logits_list:
+                            logits_bar = torch.stack(logits_list, dim=0).mean(dim=0)
+                            loss_cons_ratio = torch.zeros(
+                                (), device=logits_bar.device, dtype=logits_bar.dtype
+                            )
+                            for lg in logits_list:
+                                loss_cons_ratio = loss_cons_ratio + F.mse_loss(lg, logits_bar)
+                            loss_cons_ratio = loss_cons_ratio / float(len(logits_list))
                     except Exception:
                         loss_cons_ratio = pred_reg3_c.sum() * 0.0
 
                 w_reg3 = float(cons_cfg.get("weight_reg3", 1.0))
-                w_ratio = float(cons_cfg.get("weight_ratio_jsd", cons_cfg.get("weight_ratio", 12.0)))
+                # Backward compatible: allow old YAML key `weight_ratio_jsd` but the term is now logits-MSE.
+                w_ratio = float(
+                    cons_cfg.get(
+                        "weight_ratio_logits",
+                        cons_cfg.get("weight_ratio_jsd", cons_cfg.get("weight_ratio", 12.0)),
+                    )
+                )
                 self.log(f"{stage}_loss_cons_reg3", loss_cons_reg3, on_step=False, on_epoch=True, prog_bar=False)
+                # Backward-compatible alias: historically this key existed when we experimented in grams-space.
+                # It is now logged in the same normalized space as `loss_cons_reg3`.
+                self.log(f"{stage}_loss_cons_reg3_g", loss_cons_reg3, on_step=False, on_epoch=True, prog_bar=False)
+
+                # Keep the historical metric name for compatibility, but also log a clearer one.
                 self.log(f"{stage}_loss_cons_ratio_jsd", loss_cons_ratio, on_step=False, on_epoch=True, prog_bar=False)
+                self.log(f"{stage}_loss_cons_ratio_logits", loss_cons_ratio, on_step=False, on_epoch=True, prog_bar=False)
 
                 loss_cons_total = (w_reg3 * loss_cons_reg3) + (w_ratio * loss_cons_ratio)
                 self.log(f"{stage}_loss_consistency", loss_cons_total, on_step=False, on_epoch=True, prog_bar=False)
 
-                # If Uncertainty Weighting is enabled, add consistency as its own UW task.
-                # Otherwise, add the (weighted) consistency penalty directly.
-                use_uw_task = bool(cons_cfg.get("uw_task", True))
-                extra_uw = [("consistency", loss_cons_total)] if (self.loss_weighting == "uw" and use_uw_task) else None
+            # If Uncertainty Weighting is enabled, add consistency as its own UW task.
+            # Otherwise, add the (weighted) consistency penalty directly.
+            use_uw_task = bool(cons_cfg.get("uw_task", True))
+            extra_uw = [("consistency", loss_cons_total)] if (self.loss_weighting == "uw" and use_uw_task) else None
 
+            # 3) Supervised objective uses ALL views (clean + aug views).
+            supervise_aug_views = bool(
+                cons_cfg.get(
+                    "supervise_aug_views",
+                    cons_cfg.get("supervised_use_aug_views", True),
+                )
+            )
+            if not supervise_aug_views:
+                # Clean-only supervised update (aug views contribute via consistency only).
                 out = self._loss_supervised(
                     stage=stage,
                     head_type=head_type,
@@ -495,26 +536,89 @@ class SharedStepMixin:
                     ndvi_pred_from_head=ndvi_pred_c,
                     batch=batch_mixed,
                     extra_uw_losses=extra_uw,
+                    log_metrics=True,
                 )
                 if self.loss_weighting != "uw" or (not use_uw_task):
                     out["loss"] = out["loss"] + loss_cons_total
+                    # Ensure total loss is logged under the standard key.
+                    self.log(f"{stage}_loss", out["loss"], on_step=False, on_epoch=True, prog_bar=True)
+                return out
 
-            else:
-                # No consistency branches: fall back to standard supervised loss on the clean view.
-                out = self._loss_supervised(
+            # Multi-view supervised update: average supervised loss across views.
+            view_outs: List[Dict[str, Tensor]] = []
+            for pr, zv, zl, rlog, ndv, pr_layers, rlog_layers in zip(
+                preds_reg3,
+                zs,
+                z_layers_list,
+                ratio_logits_list,
+                ndvi_preds,
+                pred_reg3_layers_list,
+                ratio_logits_layers_list,
+            ):
+                o = self._loss_supervised(
                     stage=stage,
                     head_type=head_type,
-                    pred_reg3=pred_reg3_c,
-                    z=z_c,
-                    z_layers=z_layers_c,
-                    ratio_logits_pred=ratio_logits_pred_c,
-                    pred_reg3_layers=pred_reg3_layers_c,
-                    ratio_logits_layers=ratio_logits_layers_c,
-                    ndvi_pred_from_head=ndvi_pred_c,
+                    pred_reg3=pr,
+                    z=zv,
+                    z_layers=zl,
+                    ratio_logits_pred=rlog,
+                    pred_reg3_layers=pr_layers,
+                    ratio_logits_layers=rlog_layers,
+                    ndvi_pred_from_head=ndv,
                     batch=batch_mixed,
+                    extra_uw_losses=extra_uw,
+                    log_metrics=False,
                 )
+                if self.loss_weighting != "uw" or (not use_uw_task):
+                    o["loss"] = o["loss"] + loss_cons_total
+                view_outs.append(o)
 
-            return out
+            # Average across views to keep scale comparable to single-view training.
+            loss_total = torch.stack([o["loss"] for o in view_outs], dim=0).mean(dim=0)
+            loss_reg3_mse = torch.stack([o["loss_reg3_mse"] for o in view_outs], dim=0).mean(dim=0)
+            loss_ratio_mse = torch.stack([o["loss_ratio_mse"] for o in view_outs], dim=0).mean(dim=0)
+            loss_5d = torch.stack([o["loss_5d_weighted"] for o in view_outs], dim=0).mean(dim=0)
+            loss_reg3_total = torch.stack([o["loss_reg3_total"] for o in view_outs], dim=0).mean(dim=0)
+            mae_reg3 = torch.stack([o["mae"] for o in view_outs], dim=0).mean(dim=0)
+            mse_reg3_per_dim = torch.stack([o["mse_reg3_per_dim"] for o in view_outs], dim=0).mean(dim=0)
+            mse_5d_per_dim = torch.stack([o["mse_5d_per_dim"] for o in view_outs], dim=0).mean(dim=0)
+
+            # Log aggregated supervised metrics once (preserve historical metric keys).
+            self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            try:
+                for i in range(int(mse_reg3_per_dim.numel())):
+                    self.log(
+                        f"{stage}_mse_reg3_{i}",
+                        mse_reg3_per_dim.view(-1)[i],
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                    )
+            except Exception:
+                pass
+            self.log(f"{stage}_loss_ratio_mse", loss_ratio_mse, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_loss_5d_weighted", loss_5d, on_step=False, on_epoch=True, prog_bar=False)
+            # Restore per-dimension 5D metrics (they were previously logged inside _loss_supervised).
+            try:
+                names_5d = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
+                for i, name in enumerate(names_5d):
+                    self.log(
+                        f"{stage}_mse_5d_{name}",
+                        mse_5d_per_dim.view(-1)[i],
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                    )
+            except Exception:
+                pass
+            self.log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"{stage}_loss", loss_total, on_step=False, on_epoch=True, prog_bar=True)
+
+            return {"loss": loss_total}
 
         # --- Single-view (legacy) path ---
         images: Tensor = images_any  # type: ignore[assignment]

@@ -42,10 +42,37 @@ class TestImageDataset(Dataset):
         return image, rel_path
 
 
-def build_transforms(image_size: Tuple[int, int], mean: List[float], std: List[float]) -> T.Compose:
+def build_transforms(
+    image_size: Tuple[int, int],
+    mean: List[float],
+    std: List[float],
+    *,
+    hflip: bool = False,
+    vflip: bool = False,
+) -> T.Compose:
     """
     Build the evaluation transform used for inference.
     """
-    return build_eval_transform(image_size=image_size, mean=mean, std=std)
+    if not bool(hflip) and not bool(vflip):
+        return build_eval_transform(image_size=image_size, mean=mean, std=std)
+
+    # Deterministic flip TTA view (applied on PIL before resize).
+    # We intentionally do NOT add vertical flips / rotations here since the default
+    # AugMix training policy in this repo uses hflip only (plus Resize).
+    #
+    # Note: vflip is supported as an explicit opt-in (tta_vflip) for users who want it.
+    pre: List[object] = []
+    if bool(vflip):
+        pre.append(T.RandomVerticalFlip(p=1.0))
+    if bool(hflip):
+        pre.append(T.RandomHorizontalFlip(p=1.0))
+    return T.Compose(
+        [
+            *pre,
+            T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+        ]
+    )
 
 

@@ -11,6 +11,225 @@ import torchvision.transforms.functional as F
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageFilter
 
 
+class JitterCrop:
+    """
+    Jitter-crop augmentation for PIL images: crop a window (keeps a target aspect ratio),
+    then resize back to the requested output size.
+
+    This is designed as a *pre-AuGMix* geometric transform:
+      - It runs on PIL images (so it can be placed before AugMix ops).
+      - It produces a fixed output size (H, W), so downstream code can assume a stable shape.
+
+    Two strategy types are supported:
+      - center-biased: crop center is sampled near image center (with small random jitter)
+      - random       : crop window is sampled uniformly over all valid positions
+
+    If both strategies are enabled, one is chosen per-sample according to their probabilities.
+    """
+
+    def __init__(
+        self,
+        *,
+        output_size: Union[int, Tuple[int, int]],
+        p: float = 1.0,
+        scale: Tuple[float, float] = (0.85, 1.0),
+        ratio: Optional[float] = None,
+        interpolation: Optional[T.InterpolationMode] = T.InterpolationMode.BICUBIC,
+        # Strategy mixture
+        center_enabled: bool = True,
+        center_prob: float = 0.5,
+        center_max_offset_frac: Tuple[float, float] = (0.08, 0.08),  # (x_frac, y_frac)
+        center_scale: Optional[Tuple[float, float]] = None,
+        random_enabled: bool = True,
+        random_prob: float = 0.5,
+        random_scale: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        self.output_size = output_size
+        self.p = float(p)
+        self.scale = (float(scale[0]), float(scale[1]))
+        self.ratio = float(ratio) if ratio is not None else None
+        self.interpolation = interpolation or T.InterpolationMode.BICUBIC
+
+        self.center_enabled = bool(center_enabled)
+        self.center_prob = float(center_prob)
+        self.center_max_offset_frac = (
+            float(center_max_offset_frac[0]),
+            float(center_max_offset_frac[1]),
+        )
+        self.center_scale = (
+            (float(center_scale[0]), float(center_scale[1]))
+            if center_scale is not None
+            else None
+        )
+
+        self.random_enabled = bool(random_enabled)
+        self.random_prob = float(random_prob)
+        self.random_scale = (
+            (float(random_scale[0]), float(random_scale[1]))
+            if random_scale is not None
+            else None
+        )
+
+    @staticmethod
+    def _parse_output_hw(output_size: Union[int, Tuple[int, int]]) -> Tuple[int, int]:
+        # output_size is passed around as (H, W) throughout this repo.
+        if isinstance(output_size, int):
+            v = int(output_size)
+            return (v, v)
+        try:
+            h, w = int(output_size[0]), int(output_size[1])
+            return (h, w)
+        except Exception:
+            v = int(output_size)  # type: ignore[arg-type]
+            return (v, v)
+
+    @staticmethod
+    def _clamp(v: int, lo: int, hi: int) -> int:
+        if v < lo:
+            return lo
+        if v > hi:
+            return hi
+        return v
+
+    def _choose_strategy(self) -> Optional[str]:
+        c_ok = self.center_enabled and (self.center_prob > 0.0)
+        r_ok = self.random_enabled and (self.random_prob > 0.0)
+        if not c_ok and not r_ok:
+            return None
+        if c_ok and not r_ok:
+            return "center"
+        if r_ok and not c_ok:
+            return "random"
+        # Both enabled: sample by weights.
+        wc = max(0.0, float(self.center_prob))
+        wr = max(0.0, float(self.random_prob))
+        s = wc + wr
+        if not (s > 0.0):
+            return "center"
+        u = random.random() * s
+        return "center" if u < wc else "random"
+
+    def _sample_scale(self, strat: Optional[str]) -> Tuple[float, float]:
+        if strat == "center" and self.center_scale is not None:
+            return self.center_scale
+        if strat == "random" and self.random_scale is not None:
+            return self.random_scale
+        return self.scale
+
+    def __call__(self, img: Any) -> Any:
+        if not isinstance(img, Image.Image):
+            return img
+
+        out_h, out_w = self._parse_output_hw(self.output_size)
+        out_h = max(1, int(out_h))
+        out_w = max(1, int(out_w))
+
+        # If not applying crop, still resize to ensure stable downstream shape.
+        if self.p <= 0.0 or (self.p < 1.0 and random.random() > self.p):
+            try:
+                return F.resize(img, (out_h, out_w), interpolation=self.interpolation)
+            except Exception:
+                return img.resize((out_w, out_h), resample=Image.BICUBIC)
+
+        W0, H0 = img.size  # PIL: (W,H)
+        if W0 <= 1 or H0 <= 1:
+            try:
+                return F.resize(img, (out_h, out_w), interpolation=self.interpolation)
+            except Exception:
+                return img.resize((out_w, out_h), resample=Image.BICUBIC)
+
+        # Target aspect ratio (w/h). Default: output ratio.
+        if self.ratio is None:
+            r = float(out_w) / float(out_h) if out_h > 0 else 1.0
+        else:
+            r = float(self.ratio)
+        if not (r > 0.0):
+            r = float(out_w) / float(out_h) if out_h > 0 else 1.0
+        if not (r > 0.0):
+            r = 1.0
+
+        # Compute the largest crop that matches the target ratio and fits inside the image.
+        # This avoids "sampling impossible" situations on highly-rectangular images.
+        max_h = int(min(H0, math.floor(float(W0) / float(r))))
+        max_h = max(1, max_h)
+        max_w = int(min(W0, math.floor(float(max_h) * float(r))))
+        max_w = max(1, max_w)
+        max_area = float(max_w * max_h)
+
+        strat = self._choose_strategy()
+        scale_lo, scale_hi = self._sample_scale(strat)
+        # Robustness / sanitation
+        scale_lo = float(scale_lo)
+        scale_hi = float(scale_hi)
+        if scale_lo <= 0.0:
+            scale_lo = 0.01
+        if scale_hi <= 0.0:
+            scale_hi = 0.01
+        if scale_hi < scale_lo:
+            scale_lo, scale_hi = scale_hi, scale_lo
+        # Clamp to (0,1]
+        scale_lo = min(max(scale_lo, 0.01), 1.0)
+        scale_hi = min(max(scale_hi, 0.01), 1.0)
+
+        # Sample desired crop area as a fraction of max_area (ratio-consistent max crop).
+        area_frac = random.uniform(scale_lo, scale_hi)
+        desired_area = float(area_frac) * max_area
+        desired_area = max(1.0, min(desired_area, max_area))
+
+        # Convert area to (w,h) with fixed ratio r (w = r*h).
+        crop_h = int(round(math.sqrt(desired_area / float(r))))
+        crop_h = max(1, min(crop_h, max_h))
+        crop_w = int(round(float(crop_h) * float(r)))
+        crop_w = max(1, min(crop_w, max_w))
+        # Re-adjust crop_h to keep inside bounds after rounding crop_w.
+        crop_h = int(min(max_h, max(1, math.floor(float(crop_w) / float(r)))))
+        crop_h = max(1, min(crop_h, max_h))
+        crop_w = max(1, min(crop_w, max_w))
+
+        # Ensure crop fits.
+        crop_w = min(crop_w, W0)
+        crop_h = min(crop_h, H0)
+        if crop_w <= 0 or crop_h <= 0:
+            try:
+                return F.resize(img, (out_h, out_w), interpolation=self.interpolation)
+            except Exception:
+                return img.resize((out_w, out_h), resample=Image.BICUBIC)
+
+        # Sample crop location.
+        if strat == "center":
+            # Center + jitter in pixels (clamped to valid crop window).
+            max_dx = float(self.center_max_offset_frac[0]) * float(W0)
+            max_dy = float(self.center_max_offset_frac[1]) * float(H0)
+            cx = (float(W0) * 0.5) + random.uniform(-max_dx, max_dx)
+            cy = (float(H0) * 0.5) + random.uniform(-max_dy, max_dy)
+            left = int(round(cx - (float(crop_w) * 0.5)))
+            top = int(round(cy - (float(crop_h) * 0.5)))
+        else:
+            # Fully random placement.
+            max_left = max(0, int(W0 - crop_w))
+            max_top = max(0, int(H0 - crop_h))
+            left = random.randint(0, max_left) if max_left > 0 else 0
+            top = random.randint(0, max_top) if max_top > 0 else 0
+
+        left = self._clamp(int(left), 0, max(0, int(W0 - crop_w)))
+        top = self._clamp(int(top), 0, max(0, int(H0 - crop_h)))
+
+        # Crop + resize back to output size.
+        try:
+            return F.resized_crop(
+                img,
+                top=int(top),
+                left=int(left),
+                height=int(crop_h),
+                width=int(crop_w),
+                size=(out_h, out_w),
+                interpolation=self.interpolation,
+            )
+        except Exception:
+            cropped = img.crop((int(left), int(top), int(left + crop_w), int(top + crop_h)))
+            return cropped.resize((out_w, out_h), resample=Image.BICUBIC)
+
+
 class AddGaussianNoise:
     def __init__(self, mean: float = 0.0, std: float = 0.01, p: float = 0.5) -> None:
         self.mean = float(mean)
@@ -725,6 +944,114 @@ def _maybe_add_vertical_flip(cfg: Dict[str, Any], transforms_list: List[Any]) ->
         transforms_list.append(T.RandomVerticalFlip(p=p))
 
 
+def _maybe_add_jitter_crop(
+    cfg: Dict[str, Any],
+    transforms_list: List[Any],
+    *,
+    image_size: Union[int, Tuple[int, int]],
+) -> bool:
+    """
+    Optional jitter-crop augmentation (crop -> resize back to `image_size`).
+
+    Config lives under `data.augment.jitter_crop`:
+
+    jitter_crop:
+      enabled: true
+      prob: 1.0
+      scale: [0.85, 1.0]         # area fraction (relative to largest ratio-consistent crop)
+      ratio: null                # optional fixed w/h; default uses output ratio from image_size
+      interpolation: bicubic
+      center:
+        enabled: true
+        prob: 0.5
+        max_offset_frac: [0.08, 0.08]   # (x_frac, y_frac) of original image size
+        # scale: [0.85, 1.0]            # optional per-strategy override
+      random:
+        enabled: true
+        prob: 0.5
+        # scale: [0.85, 1.0]            # optional per-strategy override
+    """
+    jc_cfg: Dict[str, Any] = dict(cfg.get("jitter_crop", {}) or {})
+    enabled = bool(cfg.get("jitter_crop_enabled", jc_cfg.get("enabled", False)))
+    if not enabled:
+        return False
+
+    p = float(jc_cfg.get("prob", jc_cfg.get("p", 1.0)))
+
+    scale_raw = jc_cfg.get("scale", jc_cfg.get("area_scale", [0.85, 1.0]))
+    try:
+        scale = (float(scale_raw[0]), float(scale_raw[1]))  # type: ignore[index]
+    except Exception:
+        s = float(scale_raw) if scale_raw is not None else 1.0
+        scale = (s, s)
+
+    ratio_val: Optional[float] = None
+    ratio_raw = jc_cfg.get("ratio", jc_cfg.get("target_ratio", None))
+    if ratio_raw is not None:
+        try:
+            ratio_val = float(ratio_raw)
+        except Exception:
+            ratio_val = None
+
+    interp_name = str(jc_cfg.get("interpolation", "bicubic") or "bicubic").strip().upper()
+    interpolation = getattr(T.InterpolationMode, interp_name, T.InterpolationMode.BICUBIC)
+
+    center_cfg: Dict[str, Any] = dict(jc_cfg.get("center", {}) or {})
+    random_cfg: Dict[str, Any] = dict(jc_cfg.get("random", {}) or {})
+
+    center_enabled = bool(center_cfg.get("enabled", True))
+    center_prob = float(center_cfg.get("prob", 0.5))
+    max_off_raw = center_cfg.get(
+        "max_offset_frac",
+        center_cfg.get("jitter_frac", center_cfg.get("max_offset", [0.08, 0.08])),
+    )
+    if isinstance(max_off_raw, (int, float)):
+        max_offset_frac = (float(max_off_raw), float(max_off_raw))
+    else:
+        try:
+            max_offset_frac = (float(max_off_raw[0]), float(max_off_raw[1]))
+        except Exception:
+            max_offset_frac = (0.08, 0.08)
+
+    center_scale_raw = center_cfg.get("scale", None)
+    center_scale: Optional[Tuple[float, float]] = None
+    if center_scale_raw is not None:
+        try:
+            center_scale = (float(center_scale_raw[0]), float(center_scale_raw[1]))  # type: ignore[index]
+        except Exception:
+            s = float(center_scale_raw)
+            center_scale = (s, s)
+
+    random_enabled = bool(random_cfg.get("enabled", True))
+    random_prob = float(random_cfg.get("prob", 0.5))
+    random_scale_raw = random_cfg.get("scale", None)
+    random_scale: Optional[Tuple[float, float]] = None
+    if random_scale_raw is not None:
+        try:
+            random_scale = (float(random_scale_raw[0]), float(random_scale_raw[1]))  # type: ignore[index]
+        except Exception:
+            s = float(random_scale_raw)
+            random_scale = (s, s)
+
+    transforms_list.append(
+        JitterCrop(
+            output_size=image_size,
+            p=p,
+            scale=scale,
+            ratio=ratio_val,
+            interpolation=interpolation,
+            center_enabled=center_enabled,
+            center_prob=center_prob,
+            center_max_offset_frac=max_offset_frac,
+            center_scale=center_scale,
+            random_enabled=random_enabled,
+            random_prob=random_prob,
+            random_scale=random_scale,
+        )
+    )
+    return True
+
+
 def _maybe_add_blur_and_noise(cfg: Dict[str, Any], before_normalize: List[Any], after_tensor: List[Any]) -> None:
     blur_cfg: Dict[str, Any] = dict(cfg.get("gaussian_blur", {}))
     if bool(blur_cfg.get("enabled", False)):
@@ -863,6 +1190,12 @@ def build_train_transform(
 
     # 1) Geometric and color transforms on PIL images
     pre_tensor: List[Any] = []
+
+    # Jitter-crop (optional): crop -> resize to `image_size`.
+    # This is placed BEFORE AugMix / other PIL ops so the rest of the pipeline sees
+    # a stable input size and consistent aspect ratio.
+    jitter_applied = _maybe_add_jitter_crop(cfg, pre_tensor, image_size=image_size)
+
     # RandomResizedCrop (optional; disabled by default).
     #
     # Why disabled by default:
@@ -870,35 +1203,36 @@ def build_train_transform(
     #     (3/4..4/3) + a high scale (e.g. >=0.8) can make it *impossible* to sample a crop.
     #     In that case, RandomResizedCrop silently falls back to a deterministic center-crop.
     #
-    rrc_enabled = bool(
-        cfg.get(
-            "random_resized_crop_enabled",
-            bool(dict(cfg.get("random_resized_crop", {})).get("enabled", False)),
-        )
-    )
-    if rrc_enabled:
-        rrc_scale = cfg.get(
-            "random_resized_crop_scale",
-            dict(cfg.get("random_resized_crop", {})).get("scale", [0.8, 1.0]),
-        )
-        # Optional override: allow specifying ratio range in YAML (tuple/list of two floats).
-        rrc_ratio = cfg.get(
-            "random_resized_crop_ratio",
-            dict(cfg.get("random_resized_crop", {})).get("ratio", None),
-        )
-        if rrc_ratio is None:
-            pre_tensor.append(T.RandomResizedCrop(image_size, scale=tuple(rrc_scale)))
-        else:
-            pre_tensor.append(
-                T.RandomResizedCrop(
-                    image_size, scale=tuple(rrc_scale), ratio=tuple(rrc_ratio)
-                )
+    if not jitter_applied:
+        rrc_enabled = bool(
+            cfg.get(
+                "random_resized_crop_enabled",
+                bool(dict(cfg.get("random_resized_crop", {})).get("enabled", False)),
             )
-    else:
-        # Safe default: match eval pipeline sizing without introducing random crops.
-        pre_tensor.append(
-            T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC)
         )
+        if rrc_enabled:
+            rrc_scale = cfg.get(
+                "random_resized_crop_scale",
+                dict(cfg.get("random_resized_crop", {})).get("scale", [0.8, 1.0]),
+            )
+            # Optional override: allow specifying ratio range in YAML (tuple/list of two floats).
+            rrc_ratio = cfg.get(
+                "random_resized_crop_ratio",
+                dict(cfg.get("random_resized_crop", {})).get("ratio", None),
+            )
+            if rrc_ratio is None:
+                pre_tensor.append(T.RandomResizedCrop(image_size, scale=tuple(rrc_scale)))
+            else:
+                pre_tensor.append(
+                    T.RandomResizedCrop(
+                        image_size, scale=tuple(rrc_scale), ratio=tuple(rrc_ratio)
+                    )
+                )
+        else:
+            # Safe default: match eval pipeline sizing without introducing random crops.
+            pre_tensor.append(
+                T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC)
+            )
 
     hflip_prob = float(cfg.get("horizontal_flip_prob", cfg.get("horizontal_flip", {}).get("prob", 0.5)))
     if hflip_prob > 0.0:
@@ -972,29 +1306,34 @@ def build_train_transform_augmix(
     # 1) Base PIL transforms (size + optional hflip) + optional overlays.
     pre_pil: List[Any] = []
 
-    rrc_enabled = bool(
-        cfg.get(
-            "random_resized_crop_enabled",
-            bool(dict(cfg.get("random_resized_crop", {})).get("enabled", False)),
-        )
-    )
-    if rrc_enabled:
-        rrc_scale = cfg.get(
-            "random_resized_crop_scale",
-            dict(cfg.get("random_resized_crop", {})).get("scale", [0.8, 1.0]),
-        )
-        rrc_ratio = cfg.get(
-            "random_resized_crop_ratio",
-            dict(cfg.get("random_resized_crop", {})).get("ratio", None),
-        )
-        if rrc_ratio is None:
-            pre_pil.append(T.RandomResizedCrop(image_size, scale=tuple(rrc_scale)))
-        else:
-            pre_pil.append(
-                T.RandomResizedCrop(image_size, scale=tuple(rrc_scale), ratio=tuple(rrc_ratio))
+    # Jitter-crop (optional): crop -> resize to `image_size`, BEFORE AugMix.
+    # This makes crop/resize view-consistent when AugMix multi-view consistency is enabled.
+    jitter_applied = _maybe_add_jitter_crop(cfg, pre_pil, image_size=image_size)
+
+    if not jitter_applied:
+        rrc_enabled = bool(
+            cfg.get(
+                "random_resized_crop_enabled",
+                bool(dict(cfg.get("random_resized_crop", {})).get("enabled", False)),
             )
-    else:
-        pre_pil.append(T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC))
+        )
+        if rrc_enabled:
+            rrc_scale = cfg.get(
+                "random_resized_crop_scale",
+                dict(cfg.get("random_resized_crop", {})).get("scale", [0.8, 1.0]),
+            )
+            rrc_ratio = cfg.get(
+                "random_resized_crop_ratio",
+                dict(cfg.get("random_resized_crop", {})).get("ratio", None),
+            )
+            if rrc_ratio is None:
+                pre_pil.append(T.RandomResizedCrop(image_size, scale=tuple(rrc_scale)))
+            else:
+                pre_pil.append(
+                    T.RandomResizedCrop(image_size, scale=tuple(rrc_scale), ratio=tuple(rrc_ratio))
+                )
+        else:
+            pre_pil.append(T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC))
 
     # Keep horizontal flip as a simple, widely-used geometric augmentation (tunable via YAML).
     hflip_prob = float(cfg.get("horizontal_flip_prob", cfg.get("horizontal_flip", {}).get("prob", 0.5)))

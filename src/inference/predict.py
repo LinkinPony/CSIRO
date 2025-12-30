@@ -235,10 +235,18 @@ def extract_features_for_images(
     num_workers: int,
     *,
     use_cls_token: bool = True,
+    hflip: bool = False,
+    vflip: bool = False,
 ) -> Tuple[List[str], torch.Tensor]:
     mp_devs = mp_get_devices_from_backbone(feature_extractor) if isinstance(feature_extractor, nn.Module) else None
     device = mp_devs[0] if mp_devs is not None else ("cuda" if torch.cuda.is_available() else "cpu")
-    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
 
@@ -380,6 +388,8 @@ def predict_main_and_ratio_patch_mode(
     *,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
+    hflip: bool = False,
+    vflip: bool = False,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Patch-mode inference for a single head:
@@ -398,7 +408,13 @@ def predict_main_and_ratio_patch_mode(
     device1 = mp_devs[1] if mp_devs is not None else device0
     # Convenience alias for any tensors that must live with the head.
     device = device1
-    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(
         ds,
@@ -584,6 +600,8 @@ def predict_main_and_ratio_fpn(
     layer_indices: Optional[List[int]] = None,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
+    hflip: bool = False,
+    vflip: bool = False,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     FPN-head inference (Phase A).
@@ -593,7 +611,13 @@ def predict_main_and_ratio_fpn(
     device1 = mp_devs[1] if mp_devs is not None else device0
     device = device1
 
-    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(
         ds,
@@ -682,6 +706,8 @@ def predict_main_and_ratio_vitdet(
     layer_indices: Optional[List[int]] = None,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
+    hflip: bool = False,
+    vflip: bool = False,
 ) -> Tuple[
     List[str],
     torch.Tensor,
@@ -697,7 +723,13 @@ def predict_main_and_ratio_vitdet(
     device1 = mp_devs[1] if mp_devs is not None else device0
     device = device1
 
-    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(
         ds,
@@ -837,6 +869,8 @@ def predict_main_and_ratio_dpt(
     layer_indices: Optional[List[int]] = None,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
+    hflip: bool = False,
+    vflip: bool = False,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     DPT-head inference.
@@ -845,7 +879,13 @@ def predict_main_and_ratio_dpt(
     device0 = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device1 = mp_devs[1] if mp_devs is not None else device0
 
-    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(
         ds,
@@ -941,6 +981,8 @@ def predict_main_and_ratio_global_multilayer(
     layer_weights: Optional[torch.Tensor] = None,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
+    hflip: bool = False,
+    vflip: bool = False,
 ) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
     """
     Global multi-layer inference for a single head.
@@ -949,7 +991,13 @@ def predict_main_and_ratio_global_multilayer(
     device0 = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device1 = mp_devs[1] if mp_devs is not None else device0
     device = device1
-    tf = build_transforms(image_size=image_size, mean=mean, std=std)
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
     ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
     dl = DataLoader(
         ds,

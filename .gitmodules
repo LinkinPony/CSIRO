@@ -43,3 +43,6 @@
 [submodule "third_party/albumentations"]
 	path = third_party/albumentations
 	url = git@github.com:albumentations-team/albumentations.git
+[submodule "third_party/TabPFN"]
+	path = third_party/TabPFN
+	url = git@github.com:PriorLabs/TabPFN.git

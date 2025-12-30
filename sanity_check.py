@@ -38,12 +38,28 @@ if add_safe_globals is not None and PeftType is not None:  # type: ignore
         pass
 
 
+def resolve_repo_root() -> Path:
+    """
+    Resolve the project root directory that contains both `configs/` and `src/`.
+
+    This script may live either in the repository root or in a packaged
+    `weights/scripts/` directory; in the packaged case, the repo root is the parent
+    of the scripts directory.
+    """
+    here = Path(__file__).resolve().parent
+    if (here / "configs").is_dir() and (here / "src").is_dir():
+        return here
+    if (here.parent / "configs").is_dir() and (here.parent / "src").is_dir():
+        return here.parent
+    return here
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Sanity check runner (config-driven)")
     p.add_argument(
         "--config",
         type=str,
-        default=str(Path(__file__).parent / "configs" / "sanity.yaml"),
+        default=str(resolve_repo_root() / "configs" / "sanity.yaml"),
         help="Path to sanity check YAML config file (not the training config)",
     )
     return p.parse_args()
@@ -446,7 +462,7 @@ def main():
     args = parse_args()
     sanity = load_sanity_cfg(args.config)
 
-    repo_root = Path(__file__).parent
+    repo_root = resolve_repo_root()
     project_dir = _to_abs(str(repo_root), sanity.get("project_dir", "."))
     setup_project_imports(project_dir)
 

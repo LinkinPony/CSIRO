@@ -9,18 +9,34 @@ import math
 import yaml
 
 
+def resolve_repo_root() -> Path:
+    """
+    Resolve the project root directory that contains both `configs/` and `src/`.
+
+    This script may be executed either from the repository root (during training/dev)
+    or from a packaged `weights/scripts/` directory. In the packaged case, the repo
+    root is the parent of the scripts directory.
+    """
+    here = Path(__file__).resolve().parent
+    if (here / "configs").is_dir() and (here / "src").is_dir():
+        return here
+    if (here.parent / "configs").is_dir() and (here.parent / "src").is_dir():
+        return here.parent
+    return here
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Package head weights and project sources into weights/ folder")
     p.add_argument(
         "--config",
         type=str,
-        default=str(Path(__file__).parent / "configs" / "train.yaml"),
+        default=str(resolve_repo_root() / "configs" / "train.yaml"),
         help="Path to YAML config file (to resolve version and output dirs)",
     )
     p.add_argument(
         "--weights-dir",
         type=str,
-        default=str(Path(__file__).parent / "weights"),
+        default=str(resolve_repo_root() / "weights"),
         help="Destination weights directory",
     )
     p.add_argument(
@@ -277,7 +293,7 @@ def copy_optional_third_party(repo_root: Path, weights_dir: Path) -> None:
 
 
 def copy_top_level_scripts(repo_root: Path, weights_dir: Path) -> list[Path]:
-    # Copy selected top-level scripts into weights/ for portability
+    # Copy selected top-level scripts into weights/scripts/ for portability
     script_names = [
         "infer_and_submit_pt.py",
         "package_artifacts.py",
@@ -285,12 +301,21 @@ def copy_top_level_scripts(repo_root: Path, weights_dir: Path) -> list[Path]:
         "sanity_check.py",
     ]
     copied: list[Path] = []
+    scripts_dir = weights_dir / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
     for name in script_names:
         src = repo_root / name
         if src.is_file():
-            dst = weights_dir / name
+            dst = scripts_dir / name
             shutil.copyfile(str(src), str(dst))
             copied.append(dst)
+        # Clean legacy location (weights/<script>.py) if it exists from older packaging runs.
+        legacy_dst = weights_dir / name
+        if legacy_dst.is_file():
+            try:
+                legacy_dst.unlink()
+            except Exception:
+                pass
     return copied
 
 
@@ -461,7 +486,7 @@ def _export_swa_head_from_checkpoint(ckpt_path: Path, dst_dir: Path) -> tuple[Pa
 def main():
     args = parse_args()
     cfg = load_cfg(args.config)
-    repo_root = Path(__file__).parent
+    repo_root = resolve_repo_root()
     ensemble_cfg = load_ensemble_cfg(repo_root)
     log_dir, ckpt_dir = resolve_dirs(cfg)
 
@@ -779,7 +804,7 @@ def main():
         scripts_copied = copy_top_level_scripts(repo_root, weights_dir)
         print(f"Copied configs/ and src/ to: {weights_dir}")
         if scripts_copied:
-            print("Copied scripts to weights/:")
+            print("Copied scripts to weights/scripts/:")
             for p in scripts_copied:
                 print(f" - {p}")
         return
@@ -1107,7 +1132,7 @@ def main():
     scripts_copied = copy_top_level_scripts(repo_root, weights_dir)
     print(f"Copied configs/ and src/ to: {weights_dir}")
     if scripts_copied:
-        print("Copied scripts to weights/:")
+        print("Copied scripts to weights/scripts/:")
         for p in scripts_copied:
             print(f" - {p}")
 

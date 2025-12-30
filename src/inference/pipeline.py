@@ -88,6 +88,97 @@ def parse_image_size(value) -> Tuple[int, int]:
         return (v, v)
 
 
+def _round_to_multiple_int(v: float, multiple: int) -> int:
+    """
+    Round a value to the nearest positive integer multiple (min = multiple).
+
+    Used for multi-scale TTA so that ViT patch grids remain aligned (DINOv3 uses 16x16 patches).
+    """
+    m = int(multiple)
+    if m <= 0:
+        try:
+            return max(1, int(round(float(v))))
+        except Exception:
+            return 1
+    try:
+        x = float(v)
+    except Exception:
+        x = float(m)
+    out = int(round(x / float(m))) * m
+    if out < m:
+        out = m
+    return int(out)
+
+
+def _resolve_tta_views(
+    settings: InferenceSettings,
+    *,
+    base_image_size: Tuple[int, int],
+    patch_multiple: int = 16,
+) -> List[Tuple[Tuple[int, int], bool, bool]]:
+    """
+    Resolve a list of TTA views as (image_size_hw, hflip, vflip).
+
+    - Always includes the base (scale=1.0, no flip) view.
+    - When enabled, expands to: scales x {no-flip, hflip?}.
+    - Scaled sizes are rounded to multiples of `patch_multiple` for ViT patch alignment.
+    """
+    base_h, base_w = int(base_image_size[0]), int(base_image_size[1])
+
+    enabled = bool(getattr(settings, "tta_enabled", False))
+    hflip_enabled = bool(getattr(settings, "tta_hflip", True))
+    vflip_enabled = bool(getattr(settings, "tta_vflip", False))
+    scales_raw = getattr(settings, "tta_scales", (1.0,))
+
+    if not enabled:
+        # Keep return type consistent: (image_size_hw, hflip, vflip)
+        return [((base_h, base_w), False, False)]
+
+    # Sanitize scales (keep order, ensure 1.0 exists).
+    scales: List[float] = []
+    try:
+        for s in (scales_raw or (1.0,)):
+            try:
+                sf = float(s)
+            except Exception:
+                continue
+            if not (sf > 0.0):
+                continue
+            scales.append(sf)
+    except Exception:
+        scales = [1.0]
+    if not scales:
+        scales = [1.0]
+    if all(abs(sf - 1.0) > 1e-8 for sf in scales):
+        scales.append(1.0)
+
+    # Flip combinations:
+    # - always include identity (False, False)
+    # - include hflip if enabled
+    # - include vflip if enabled
+    # - include hvflip if both enabled (dihedral closure for flips)
+    flip_pairs: List[Tuple[bool, bool]] = [(False, False)]
+    if hflip_enabled:
+        flip_pairs.append((True, False))
+    if vflip_enabled:
+        flip_pairs.append((False, True))
+    if hflip_enabled and vflip_enabled:
+        flip_pairs.append((True, True))
+
+    out: List[Tuple[Tuple[int, int], bool, bool]] = []
+    seen = set()
+    for sf in scales:
+        h = _round_to_multiple_int(float(base_h) * float(sf), patch_multiple)
+        w = _round_to_multiple_int(float(base_w) * float(sf), patch_multiple)
+        for hf, vf in flip_pairs:
+            key = (int(h), int(w), bool(hf), bool(vf))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(((int(h), int(w)), bool(hf), bool(vf)))
+    return out
+
+
 def discover_head_weight_paths(path: str) -> List[str]:
     """
     Accept single-file or directory containing a preferred single head or per-fold heads.
@@ -637,96 +728,98 @@ def infer_components_5d_for_model(
                 except Exception:
                     pass
 
-        if head_type_meta == "fpn":
-            rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_fpn(
-                backbone=backbone,
-                head=head_module,
-                dataset_root=dataset_root,
-                image_paths=image_paths,
-                image_size=image_size,
-                mean=mean,
-                std=std,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                head_num_main=head_num_main,
-                head_num_ratio=head_num_ratio if head_is_ratio else 0,
-                use_layerwise_heads=use_layerwise_heads_head,
-                layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
-                mc_dropout_enabled=mc_enabled,
-                mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
-            )
-        elif head_type_meta == "vitdet":
-            (
-                rels_in_order,
-                preds_main,
-                preds_ratio,
-                preds_main_layers,
-                preds_ratio_layers,
-            ) = predict_main_and_ratio_vitdet(
-                backbone=backbone,
-                head=head_module,
-                dataset_root=dataset_root,
-                image_paths=image_paths,
-                image_size=image_size,
-                mean=mean,
-                std=std,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                head_num_main=head_num_main,
-                head_num_ratio=head_num_ratio if head_is_ratio else 0,
-                use_layerwise_heads=use_layerwise_heads_head,
-                layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
-                mc_dropout_enabled=mc_enabled,
-                mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
-            )
-        elif head_type_meta == "dpt":
-            rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_dpt(
-                backbone=backbone,
-                head=head_module,
-                dataset_root=dataset_root,
-                image_paths=image_paths,
-                image_size=image_size,
-                mean=mean,
-                std=std,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                head_num_main=head_num_main,
-                head_num_ratio=head_num_ratio if head_is_ratio else 0,
-                use_layerwise_heads=use_layerwise_heads_head,
-                layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
-                mc_dropout_enabled=mc_enabled,
-                mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
-            )
-        elif use_patch_reg3_head:
-            rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_patch_mode(
-                backbone=backbone,
-                head=head_module,
-                dataset_root=dataset_root,
-                image_paths=image_paths,
-                image_size=image_size,
-                mean=mean,
-                std=std,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                head_num_main=head_num_main,
-                head_num_ratio=head_num_ratio if head_is_ratio else 0,
-                head_total=head_total,
-                use_layerwise_heads=use_layerwise_heads_head,
-                num_layers=max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1,
-                use_separate_bottlenecks=use_separate_bottlenecks_head,
-                layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
-                layer_weights=layer_weights_head,
-                mc_dropout_enabled=mc_enabled,
-                mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
-            )
-        else:
-            if use_layerwise_heads_head and len(backbone_layer_indices_head) > 0:
-                rels_in_order, preds_main, preds_ratio = predict_main_and_ratio_global_multilayer(
+        # Optional TTA: run multiple deterministic views and average raw head outputs.
+        #
+        # Default (when enabled): {identity, hflip}. Optional multi-scale resize is supported
+        # via settings.tta_scales.
+        preds_main_layers: Optional[torch.Tensor] = None
+        preds_ratio_layers: Optional[torch.Tensor] = None
+
+        tta_views = _resolve_tta_views(settings, base_image_size=image_size, patch_multiple=16)
+        rels_view_ref: Optional[List[str]] = None
+        preds_main_sum: Optional[torch.Tensor] = None
+        preds_ratio_sum: Optional[torch.Tensor] = None
+        preds_main_layers_sum: Optional[torch.Tensor] = None
+        preds_ratio_layers_sum: Optional[torch.Tensor] = None
+        n_views: int = 0
+
+        for _view_idx, (image_size_view, hflip_view, vflip_view) in enumerate(tta_views):
+            preds_main_layers_v: Optional[torch.Tensor] = None
+            preds_ratio_layers_v: Optional[torch.Tensor] = None
+
+            if head_type_meta == "fpn":
+                rels_v, preds_main_v, preds_ratio_v = predict_main_and_ratio_fpn(
                     backbone=backbone,
                     head=head_module,
                     dataset_root=dataset_root,
                     image_paths=image_paths,
-                    image_size=image_size,
+                    image_size=image_size_view,
+                    mean=mean,
+                    std=std,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    head_num_main=head_num_main,
+                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                    use_layerwise_heads=use_layerwise_heads_head,
+                    layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                    mc_dropout_enabled=mc_enabled,
+                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    hflip=bool(hflip_view),
+                    vflip=bool(vflip_view),
+                )
+            elif head_type_meta == "vitdet":
+                (
+                    rels_v,
+                    preds_main_v,
+                    preds_ratio_v,
+                    preds_main_layers_v,
+                    preds_ratio_layers_v,
+                ) = predict_main_and_ratio_vitdet(
+                    backbone=backbone,
+                    head=head_module,
+                    dataset_root=dataset_root,
+                    image_paths=image_paths,
+                    image_size=image_size_view,
+                    mean=mean,
+                    std=std,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    head_num_main=head_num_main,
+                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                    use_layerwise_heads=use_layerwise_heads_head,
+                    layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                    mc_dropout_enabled=mc_enabled,
+                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    hflip=bool(hflip_view),
+                    vflip=bool(vflip_view),
+                )
+            elif head_type_meta == "dpt":
+                rels_v, preds_main_v, preds_ratio_v = predict_main_and_ratio_dpt(
+                    backbone=backbone,
+                    head=head_module,
+                    dataset_root=dataset_root,
+                    image_paths=image_paths,
+                    image_size=image_size_view,
+                    mean=mean,
+                    std=std,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    head_num_main=head_num_main,
+                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                    use_layerwise_heads=use_layerwise_heads_head,
+                    layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                    mc_dropout_enabled=mc_enabled,
+                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    hflip=bool(hflip_view),
+                    vflip=bool(vflip_view),
+                )
+            elif use_patch_reg3_head:
+                rels_v, preds_main_v, preds_ratio_v = predict_main_and_ratio_patch_mode(
+                    backbone=backbone,
+                    head=head_module,
+                    dataset_root=dataset_root,
+                    image_paths=image_paths,
+                    image_size=image_size_view,
                     mean=mean,
                     std=std,
                     batch_size=batch_size,
@@ -734,38 +827,100 @@ def infer_components_5d_for_model(
                     head_num_main=head_num_main,
                     head_num_ratio=head_num_ratio if head_is_ratio else 0,
                     head_total=head_total,
-                    layer_indices=backbone_layer_indices_head,
+                    use_layerwise_heads=use_layerwise_heads_head,
+                    num_layers=max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1,
                     use_separate_bottlenecks=use_separate_bottlenecks_head,
-                    use_cls_token=use_cls_token_head,
+                    layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
                     layer_weights=layer_weights_head,
                     mc_dropout_enabled=mc_enabled,
                     mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    hflip=bool(hflip_view),
+                    vflip=bool(vflip_view),
                 )
             else:
-                feature_extractor = DinoV3FeatureExtractor(backbone)
-                rels_in_order, features_cpu = extract_features_for_images(
-                    feature_extractor=feature_extractor,
-                    dataset_root=dataset_root,
-                    image_paths=image_paths,
-                    image_size=image_size,
-                    mean=mean,
-                    std=std,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    use_cls_token=use_cls_token_head,
+                if use_layerwise_heads_head and len(backbone_layer_indices_head) > 0:
+                    rels_v, preds_main_v, preds_ratio_v = predict_main_and_ratio_global_multilayer(
+                        backbone=backbone,
+                        head=head_module,
+                        dataset_root=dataset_root,
+                        image_paths=image_paths,
+                        image_size=image_size_view,
+                        mean=mean,
+                        std=std,
+                        batch_size=batch_size,
+                        num_workers=num_workers,
+                        head_num_main=head_num_main,
+                        head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                        head_total=head_total,
+                        layer_indices=backbone_layer_indices_head,
+                        use_separate_bottlenecks=use_separate_bottlenecks_head,
+                        use_cls_token=use_cls_token_head,
+                        layer_weights=layer_weights_head,
+                        mc_dropout_enabled=mc_enabled,
+                        mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                        hflip=bool(hflip_view),
+                        vflip=bool(vflip_view),
+                    )
+                else:
+                    feature_extractor = DinoV3FeatureExtractor(backbone)
+                    rels_v, features_cpu = extract_features_for_images(
+                        feature_extractor=feature_extractor,
+                        dataset_root=dataset_root,
+                        image_paths=image_paths,
+                        image_size=image_size_view,
+                        mean=mean,
+                        std=std,
+                        batch_size=batch_size,
+                        num_workers=num_workers,
+                        use_cls_token=use_cls_token_head,
+                        hflip=bool(hflip_view),
+                        vflip=bool(vflip_view),
+                    )
+                    preds_main_v, preds_ratio_v = predict_from_features(
+                        features_cpu=features_cpu,
+                        head=head_module,
+                        batch_size=batch_size,
+                        head_num_main=head_num_main,
+                        head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                        head_total=head_total,
+                        use_layerwise_heads=False,
+                        num_layers=1,
+                        mc_dropout_enabled=mc_enabled,
+                        mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    )
+
+            if rels_view_ref is None:
+                rels_view_ref = rels_v
+            elif rels_view_ref != rels_v:
+                raise RuntimeError("Image order mismatch across TTA views for a head; aborting.")
+
+            preds_main_sum = preds_main_v if preds_main_sum is None else (preds_main_sum + preds_main_v)
+            if head_is_ratio and head_num_ratio > 0 and preds_ratio_v is not None:
+                preds_ratio_sum = preds_ratio_v if preds_ratio_sum is None else (preds_ratio_sum + preds_ratio_v)
+
+            if preds_main_layers_v is not None:
+                preds_main_layers_sum = (
+                    preds_main_layers_v
+                    if preds_main_layers_sum is None
+                    else (preds_main_layers_sum + preds_main_layers_v)
                 )
-                preds_main, preds_ratio = predict_from_features(
-                    features_cpu=features_cpu,
-                    head=head_module,
-                    batch_size=batch_size,
-                    head_num_main=head_num_main,
-                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
-                    head_total=head_total,
-                    use_layerwise_heads=False,
-                    num_layers=1,
-                    mc_dropout_enabled=mc_enabled,
-                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+            if preds_ratio_layers_v is not None:
+                preds_ratio_layers_sum = (
+                    preds_ratio_layers_v
+                    if preds_ratio_layers_sum is None
+                    else (preds_ratio_layers_sum + preds_ratio_layers_v)
                 )
+
+            n_views += 1
+
+        if rels_view_ref is None or preds_main_sum is None or n_views <= 0:
+            raise RuntimeError("TTA produced no predictions for this head.")
+
+        rels_in_order = rels_view_ref
+        preds_main = preds_main_sum / float(n_views)
+        preds_ratio = (preds_ratio_sum / float(n_views)) if preds_ratio_sum is not None else None
+        preds_main_layers = (preds_main_layers_sum / float(n_views)) if preds_main_layers_sum is not None else None
+        preds_ratio_layers = (preds_ratio_layers_sum / float(n_views)) if preds_ratio_layers_sum is not None else None
 
         if rels_in_order_ref is None:
             rels_in_order_ref = rels_in_order
@@ -790,37 +945,23 @@ def infer_components_5d_for_model(
         use_output_softplus_cfg = bool(cfg.get("model", {}).get("head", {}).get("use_output_softplus", True))
         if use_output_softplus_cfg and (not log_scale_meta) and (not zscore_enabled):
             preds_main = F.softplus(preds_main)
-            try:
-                if "preds_main_layers" in locals() and preds_main_layers is not None:
-                    preds_main_layers = F.softplus(preds_main_layers)
-            except Exception:
-                pass
+            if preds_main_layers is not None:
+                preds_main_layers = F.softplus(preds_main_layers)
 
         if zscore_enabled:
             preds_main = preds_main * reg3_std[:head_num_main] + reg3_mean[:head_num_main]  # type: ignore[index]
-            try:
-                if "preds_main_layers" in locals() and preds_main_layers is not None:
-                    m = reg3_mean[:head_num_main].view(1, 1, -1)  # type: ignore[index]
-                    s = reg3_std[:head_num_main].view(1, 1, -1)  # type: ignore[index]
-                    preds_main_layers = preds_main_layers * s + m
-            except Exception:
-                pass
+            if preds_main_layers is not None:
+                m = reg3_mean[:head_num_main].view(1, 1, -1)  # type: ignore[index]
+                s = reg3_std[:head_num_main].view(1, 1, -1)  # type: ignore[index]
+                preds_main_layers = preds_main_layers * s + m
         if log_scale_meta:
             preds_main = torch.expm1(preds_main).clamp_min(0.0)
-            try:
-                if "preds_main_layers" in locals() and preds_main_layers is not None:
-                    preds_main_layers = torch.expm1(preds_main_layers).clamp_min(0.0)
-            except Exception:
-                pass
+            if preds_main_layers is not None:
+                preds_main_layers = torch.expm1(preds_main_layers).clamp_min(0.0)
 
         # Convert from g/m^2 to grams
         preds_main_g = preds_main * float(area_m2)
-        preds_main_layers_g = None
-        try:
-            if "preds_main_layers" in locals() and preds_main_layers is not None:
-                preds_main_layers_g = preds_main_layers * float(area_m2)
-        except Exception:
-            preds_main_layers_g = None
+        preds_main_layers_g = (preds_main_layers * float(area_m2)) if preds_main_layers is not None else None
 
         # Build this head's 5D components in grams
         N = preds_main_g.shape[0]
@@ -831,7 +972,6 @@ def infer_components_5d_for_model(
             try:
                 if (
                     preds_main_layers_g is not None
-                    and ("preds_ratio_layers" in locals())
                     and (preds_ratio_layers is not None)
                     and preds_main_layers_g.dim() == 3
                     and preds_ratio_layers.dim() == 3

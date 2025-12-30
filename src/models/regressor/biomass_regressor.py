@@ -446,6 +446,31 @@ class BiomassRegressor(
         self._cutmix_main = CutMixBatchAugment.from_cfg(cutmix_cfg)
         # --- Manifold mixup on bottleneck representation ---
         self._manifold_mixup = ManifoldMixup.from_cfg(manifold_mixup_cfg)
+        # Control where manifold mixup is applied in the forward path.
+        #
+        # - "features" (default): mix the global feature vectors (CLS/patch-mean concat) or
+        #   patch-mean features depending on `mix_cls_token`.
+        # - "tokens": mix backbone patch tokens (v186 behavior for multi-layer MLP path),
+        #   then downstream code computes global features from the mixed tokens.
+        try:
+            mm_cfg = dict(manifold_mixup_cfg or {})
+            apply_on = str(mm_cfg.get("apply_on", mm_cfg.get("apply", "features")) or "features")
+            self._manifold_mixup_apply_on = apply_on.strip().lower()
+        except Exception:
+            self._manifold_mixup_apply_on = "features"
+        try:
+            if self._manifold_mixup is not None:
+                logger.info(
+                    "ManifoldMixup enabled (prob={}, alpha={}, mix_cls_token={}, detach_pair={}, apply_on={})",
+                    getattr(self._manifold_mixup, "prob", None),
+                    getattr(self._manifold_mixup, "alpha", None),
+                    getattr(self._manifold_mixup, "mix_cls_token", None),
+                    getattr(self._manifold_mixup, "detach_pair", None),
+                    getattr(self, "_manifold_mixup_apply_on", None),
+                )
+        except Exception:
+            # Best-effort only: do not fail model init if logging fails.
+            pass
 
         # --------------------
         # Head-type initialization (mlp/fpn/dpt)

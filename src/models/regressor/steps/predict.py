@@ -51,11 +51,14 @@ class PredictionMixin:
         mm = getattr(self, "_manifold_mixup", None)
         if mm is None:
             return "<none>"
+        apply_on = getattr(self, "_manifold_mixup_apply_on", None)
         return (
             f"enabled={getattr(mm, 'enabled', None)}, "
             f"prob={getattr(mm, 'prob', None)}, "
             f"alpha={getattr(mm, 'alpha', None)}, "
-            f"mix_cls_token={getattr(mm, 'mix_cls_token', None)}"
+            f"mix_cls_token={getattr(mm, 'mix_cls_token', None)}, "
+            f"detach_pair={getattr(mm, 'detach_pair', None)}, "
+            f"apply_on={apply_on}"
         )
 
     def _raise_manifold_mixup_error(
@@ -443,9 +446,6 @@ class PredictionMixin:
                 images, self.backbone_layer_indices
             )
             if not self.use_patch_reg3:
-                # Build per-layer patch means (B, C).
-                patch_mean_list: List[Tensor] = [pt.mean(dim=1) for pt in pt_list]
-
                 apply_mm = bool(
                     use_mixup
                     and self._manifold_mixup is not None
@@ -453,65 +453,103 @@ class PredictionMixin:
                     and (not is_ndvi_only)
                 )
 
-                feats_list: List[Tensor] = []
-                if apply_mm and self._manifold_mixup is not None:
-                    try:
-                        # If requested, keep CLS tokens intact and mix only patch features.
-                        if self.use_cls_token and (
-                            not bool(getattr(self._manifold_mixup, "mix_cls_token", True))
-                        ):
-                            # (B, L, C): mix along batch dim, preserve layer structure.
-                            pm_stack = torch.stack(patch_mean_list, dim=1)
-                            pm_stack, batch, _ = self._manifold_mixup.apply(
-                            pm_stack,
-                            batch,
-                            force=True,
-                            lam=mixup_lam,
-                            perm=mixup_perm,
-                            mix_labels=mixup_mix_labels,
-                            )
-                            patch_mean_list = [
-                                pm_stack[:, i] for i in range(pm_stack.shape[1])
-                            ]
-                            feats_list = [
-                                torch.cat([cls_l, pm_l], dim=-1)
-                                for cls_l, pm_l in zip(cls_list, patch_mean_list)
-                            ]
-                        else:
-                            for cls_l, pm_l in zip(cls_list, patch_mean_list):
-                                feats_list.append(
-                                    torch.cat([cls_l, pm_l], dim=-1)
-                                    if self.use_cls_token
-                                    else pm_l
-                                )
-                            feats_stack = torch.stack(feats_list, dim=1)
-                            feats_stack, batch, _ = self._manifold_mixup.apply(
-                                feats_stack,
+                apply_on = str(getattr(self, "_manifold_mixup_apply_on", "features") or "features").strip().lower()
+                tokens_mode = apply_on in {"tokens", "patch_tokens", "pt_tokens", "pt"}
+
+                # v186 behavior for the multi-layer MLP path: apply manifold mixup directly on
+                # backbone patch tokens (CLS tokens remain intact), then compute global features.
+                if tokens_mode:
+                    if apply_mm and self._manifold_mixup is not None and pt_list:
+                        try:
+                            pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
+                            pt_stack, batch, _ = self._manifold_mixup.apply(
+                                pt_stack,
                                 batch,
                                 force=True,
                                 lam=mixup_lam,
                                 perm=mixup_perm,
                                 mix_labels=mixup_mix_labels,
                             )
-                            feats_list = [
-                                feats_stack[:, i] for i in range(feats_stack.shape[1])
-                            ]
-                    except Exception as e:
-                        self._raise_manifold_mixup_error(
-                            context="mlp/multilayer/global_features",
-                            err=e,
-                            batch=batch,
-                            cls_list=cls_list,
-                            pt_list=pt_list,
-                        )
+                            pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
+                        except Exception as e:
+                            self._raise_manifold_mixup_error(
+                                context="mlp/multilayer/patch_tokens (apply_on=tokens)",
+                                err=e,
+                                batch=batch,
+                                cls_list=cls_list,
+                                pt_list=pt_list,
+                            )
+                    pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(
+                        images=None, cls_list=cls_list, pt_list=pt_list
+                    )
+                else:
+                    # Current default: build per-layer patch means (B, C), optionally apply
+                    # manifold mixup on global features or patch-mean features, then run heads.
+                    patch_mean_list: List[Tensor] = [pt.mean(dim=1) for pt in pt_list]
 
-                if not feats_list:
-                    for cls_l, pm_l in zip(cls_list, patch_mean_list):
-                        feats_list.append(
-                            torch.cat([cls_l, pm_l], dim=-1) if self.use_cls_token else pm_l
-                        )
+                    feats_list: List[Tensor] = []
+                    if apply_mm and self._manifold_mixup is not None:
+                        try:
+                            # If requested, keep CLS tokens intact and mix only patch features.
+                            if self.use_cls_token and (
+                                not bool(getattr(self._manifold_mixup, "mix_cls_token", True))
+                            ):
+                                # (B, L, C): mix along batch dim, preserve layer structure.
+                                pm_stack = torch.stack(patch_mean_list, dim=1)
+                                pm_stack, batch, _ = self._manifold_mixup.apply(
+                                    pm_stack,
+                                    batch,
+                                    force=True,
+                                    lam=mixup_lam,
+                                    perm=mixup_perm,
+                                    mix_labels=mixup_mix_labels,
+                                )
+                                patch_mean_list = [
+                                    pm_stack[:, i] for i in range(pm_stack.shape[1])
+                                ]
+                                feats_list = [
+                                    torch.cat([cls_l, pm_l], dim=-1)
+                                    for cls_l, pm_l in zip(cls_list, patch_mean_list)
+                                ]
+                            else:
+                                for cls_l, pm_l in zip(cls_list, patch_mean_list):
+                                    feats_list.append(
+                                        torch.cat([cls_l, pm_l], dim=-1)
+                                        if self.use_cls_token
+                                        else pm_l
+                                    )
+                                feats_stack = torch.stack(feats_list, dim=1)
+                                feats_stack, batch, _ = self._manifold_mixup.apply(
+                                    feats_stack,
+                                    batch,
+                                    force=True,
+                                    lam=mixup_lam,
+                                    perm=mixup_perm,
+                                    mix_labels=mixup_mix_labels,
+                                )
+                                feats_list = [
+                                    feats_stack[:, i] for i in range(feats_stack.shape[1])
+                                ]
+                        except Exception as e:
+                            self._raise_manifold_mixup_error(
+                                context="mlp/multilayer/global_features",
+                                err=e,
+                                batch=batch,
+                                cls_list=cls_list,
+                                pt_list=pt_list,
+                            )
 
-                pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(images=None, feats_list=feats_list)
+                    if not feats_list:
+                        for cls_l, pm_l in zip(cls_list, patch_mean_list):
+                            feats_list.append(
+                                torch.cat([cls_l, pm_l], dim=-1)
+                                if self.use_cls_token
+                                else pm_l
+                            )
+
+                    pred_reg3, z, z_layers = self._compute_reg3_and_z_multilayer(
+                        images=None, feats_list=feats_list
+                    )
             else:
                 # Patch-mode: optionally apply manifold mixup on the DINO patch tokens.
                 if (

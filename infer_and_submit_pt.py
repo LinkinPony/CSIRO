@@ -40,10 +40,22 @@ INFER_BATCH_SIZE = 1
 # When enabled, we keep backbone in eval() and sample the regression head K times with Dropout active.
 # This provides a simple predictive uncertainty estimate and sometimes improves robustness.
 MC_DROPOUT_ENABLED = False
-MC_DROPOUT_SAMPLES = 64  # typical: 8-32
+MC_DROPOUT_SAMPLES = 16  # typical: 8-32
 # Optional base seed for reproducible MC sampling. Set to -1 to disable seeding.
 MC_DROPOUT_SEED = 42
 # ==========================================================
+
+# ===== Test-Time Augmentation (TTA) =====
+# Conservative defaults that match the repo's AugMix training policy:
+# - Horizontal flip is the only consistently used geometric augmentation.
+# - Optional multi-scale resize can be enabled, but increases compute cost.
+TTA_ENABLED = False
+TTA_HFLIP = True
+TTA_VFLIP = True
+# Scales are multipliers applied to cfg.data.image_size (H,W) and will be rounded to multiples of 16.
+# Typical options: [1.0] (off), or [0.9, 1.0, 1.1] (heavier).
+TTA_SCALES = [1.0]
+# =======================================
 
 
 import os
@@ -111,6 +123,10 @@ def main() -> None:
         vit7b_mp_split_idx=int(VIT7B_MP_SPLIT_IDX),
         vit7b_mp_dtype=str(VIT7B_MP_DTYPE),
         infer_batch_size=int(INFER_BATCH_SIZE),
+        tta_enabled=bool(TTA_ENABLED),
+        tta_hflip=bool(TTA_HFLIP),
+        tta_vflip=bool(TTA_VFLIP),
+        tta_scales=tuple(float(x) for x in (TTA_SCALES or [1.0])),
         mc_dropout_enabled=bool(MC_DROPOUT_ENABLED),
         mc_dropout_samples=int(MC_DROPOUT_SAMPLES),
         mc_dropout_seed=int(MC_DROPOUT_SEED),

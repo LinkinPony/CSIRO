@@ -33,6 +33,22 @@ class InferenceSettings:
     infer_batch_size: int = 1
 
     # --------------------
+    # Test-Time Augmentation (TTA)
+    #
+    # Notes:
+    # - This repo's default eval transform is just Resize -> ToTensor -> Normalize.
+    # - For the AugMix training policy, the only consistently used geometric aug is horizontal flip.
+    # - We therefore default to a conservative TTA set: optional hflip and optional multi-scale resize.
+    #
+    # `tta_scales` are multipliers applied to cfg.data.image_size (H,W).
+    # Example: (0.9, 1.0, 1.1). Sizes are rounded to multiples of the ViT patch size (16).
+    # --------------------
+    tta_enabled: bool = False
+    tta_hflip: bool = True
+    tta_vflip: bool = False
+    tta_scales: tuple[float, ...] = (1.0,)
+
+    # --------------------
     # MC Dropout (head-only) for uncertainty / robustness.
     #
     # IMPORTANT:

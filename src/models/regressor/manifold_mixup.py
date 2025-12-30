@@ -19,6 +19,10 @@ class ManifoldMixup:
         prob: float,
         alpha: float,
         mix_cls_token: bool = True,
+        # When True, stop gradients through the "paired" sample in in-batch mixup (bsz>=2).
+        # This makes bsz>=2 closer to the bsz==1 cache-mode behavior where the cached sample
+        # is detached (i.e., acts like a feature/tokens perturbation rather than a coupled update).
+        detach_pair: bool = False,
     ) -> None:
         self.enabled: bool = bool(enabled)
         self.prob: float = float(prob)
@@ -27,6 +31,7 @@ class ManifoldMixup:
         # including the CLS token when present. When False (and use_cls_token=True),
         # we can keep CLS intact and mix only the patch features.
         self.mix_cls_token: bool = bool(mix_cls_token)
+        self.detach_pair: bool = bool(detach_pair)
         # Previous-sample cache to support batch_size == 1 manifold mixup
         self._prev: Optional[Dict[str, Tensor]] = None
 
@@ -38,10 +43,15 @@ class ManifoldMixup:
         prob = float(cfg.get("prob", 0.0))
         alpha = float(cfg.get("alpha", 1.0))
         mix_cls_token = bool(cfg.get("mix_cls_token", True))
+        detach_pair = bool(cfg.get("detach_pair", False))
         if (not enabled) or prob <= 0.0:
             return None
         return ManifoldMixup(
-            enabled=enabled, prob=prob, alpha=alpha, mix_cls_token=mix_cls_token
+            enabled=enabled,
+            prob=prob,
+            alpha=alpha,
+            mix_cls_token=mix_cls_token,
+            detach_pair=detach_pair,
         )
 
     def sample_params(self, *, bsz: int, device: torch.device) -> Tuple[float, Tensor]:
@@ -117,7 +127,10 @@ class ManifoldMixup:
                 if perm_eff.dim() != 1 or perm_eff.numel() != bsz:
                     perm_eff = torch.randperm(bsz, device=z.device)
 
-            z_mixed = lam_eff * z + (1.0 - lam_eff) * z[perm_eff]
+            z_other = z[perm_eff]
+            if bool(getattr(self, "detach_pair", False)):
+                z_other = z_other.detach()
+            z_mixed = lam_eff * z + (1.0 - lam_eff) * z_other
 
             # View-consistent mode: allow mixing features/tokens without mixing labels.
             if not bool(mix_labels):
@@ -374,7 +387,7 @@ class ManifoldMixup:
                 y_5d_prev_safe = torch.nan_to_num(
                     y_5d_prev, nan=0.0, posinf=0.0, neginf=0.0
                 )
-                mixed_5d = lam * y_5d_safe + (1.0 - lam) * y_5d_prev_safe
+                mixed_5d = lam_eff * y_5d_safe + (1.0 - lam_eff) * y_5d_prev_safe
                 mixed_5d = torch.nan_to_num(
                     mixed_5d, nan=0.0, posinf=0.0, neginf=0.0
                 )

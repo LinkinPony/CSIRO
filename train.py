@@ -16,13 +16,28 @@ from src.training.single_run import (
     train_single_split,
 )
 
+def resolve_repo_root() -> Path:
+    """
+    Resolve the project root directory that contains both `configs/` and `src/`.
+
+    This script may live either in the repository root or in a packaged
+    `weights/scripts/` directory; in the packaged case, the repo root is the parent
+    of the scripts directory.
+    """
+    here = Path(__file__).resolve().parent
+    if (here / "configs").is_dir() and (here / "src").is_dir():
+        return here
+    if (here.parent / "configs").is_dir() and (here.parent / "src").is_dir():
+        return here.parent
+    return here
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
         type=str,
-        default=str(Path(__file__).parent / "configs" / "train.yaml"),
+        default=str(resolve_repo_root() / "configs" / "train.yaml"),
         help="Path to YAML config file",
     )
     return parser.parse_args()
@@ -67,7 +82,7 @@ def main():
         import shutil
         dinov3_src = cfg["model"].get("weights_path")
         if dinov3_src and str(dinov3_src).strip() and os.path.isfile(str(dinov3_src)):
-            repo_root = Path(__file__).parent
+            repo_root = resolve_repo_root()
             dinov3_dir = repo_root / "dinov3_weights"
             dinov3_dir.mkdir(parents=True, exist_ok=True)
             # Copy using the *source* filename so different backbones (e.g. vit7b) do not

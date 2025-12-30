@@ -75,10 +75,15 @@ class LossesMixin:
         ndvi_pred_from_head: Optional[Tensor],
         batch: Dict[str, Tensor],
         extra_uw_losses: Optional[List[Tuple[str, Tensor]]] = None,
+        # When False, compute losses but do NOT call `self.log`. Useful for multi-view
+        # training where we want to aggregate losses across views and log only once.
+        log_metrics: bool = True,
     ) -> Dict[str, Tensor]:
         """
         Full supervised batch (reg3 + optional ratio/5D + optional aux tasks).
         """
+        # Local logging shim (avoids repeated `if log_metrics:` guards everywhere).
+        _log = self.log if bool(log_metrics) else (lambda *args, **kwargs: None)
         # y_reg3 provided by dataset is already in normalized domain (z-score on g/m^2 when enabled)
         y_reg3_raw: Tensor = batch["y_reg3"]  # (B, num_outputs)
         y_reg3: Tensor = torch.nan_to_num(y_reg3_raw, nan=0.0, posinf=0.0, neginf=0.0)
@@ -112,15 +117,17 @@ class LossesMixin:
         loss_reg3_mse = diff2_reg3.sum() / mask_sum_reg3
 
         # Always log base reg3 metrics
-        self.log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+        _log(f"{stage}_loss_reg3_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+        _log(f"{stage}_mse_reg3", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
         mae_reg3 = diff_reg3.abs().sum() / mask_sum_reg3
-        self.log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+        _log(f"{stage}_mae_reg3", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+        # Per-dimension MSE is useful for debugging; compute always (cheap) and log only when enabled.
         with torch.no_grad():
             per_dim_den = mask.sum(dim=0).clamp_min(1.0)
             per_dim_mse = diff2_reg3.sum(dim=0) / per_dim_den
-            for i in range(per_dim_mse.shape[0]):
-                self.log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
+            if bool(log_metrics):
+                for i in range(per_dim_mse.shape[0]):
+                    _log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
 
         # --- Ratio MSE loss ---
         loss_ratio_mse: Optional[Tensor] = None
@@ -214,7 +221,7 @@ class LossesMixin:
                     num = mse_per_sample.sum()
                     den = m.sum().clamp_min(1.0)
                     loss_ratio_mse = (num / den)
-                    self.log(
+                    _log(
                         f"{stage}_loss_ratio_mse",
                         loss_ratio_mse,
                         on_step=False,
@@ -224,6 +231,7 @@ class LossesMixin:
 
         # --- 5D weighted MSE loss ---
         loss_5d: Optional[Tensor] = None
+        mse_5d_per_dim: Optional[Tensor] = None
         y_5d_g: Optional[Tensor] = batch.get("y_biomass_5d_g", None)  # (B,5) grams
         mask_5d: Optional[Tensor] = batch.get("biomass_5d_mask", None)  # (B,5)
         metrics_preds_5d: Optional[Tensor] = None
@@ -350,14 +358,15 @@ class LossesMixin:
             per_dim_den_raw = m5.sum(dim=0)
             per_dim_den = per_dim_den_raw.clamp_min(1.0)
             mse_per_dim = diff2_5d.sum(dim=0) / per_dim_den  # (5,)
+            mse_5d_per_dim = mse_per_dim
             valid_weight = w * (per_dim_den_raw > 0).to(dtype=w.dtype)
             total_w = valid_weight.sum().clamp_min(1e-8)
             loss_5d = (valid_weight * mse_per_dim).sum() / total_w
 
             names_5d = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
             for i, name in enumerate(names_5d):
-                self.log(f"{stage}_mse_5d_{name}", mse_per_dim[i], on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_loss_5d_weighted", loss_5d, on_step=False, on_epoch=True, prog_bar=False)
+                _log(f"{stage}_mse_5d_{name}", mse_per_dim[i], on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_loss_5d_weighted", loss_5d, on_step=False, on_epoch=True, prog_bar=False)
 
         # Aggregate reg3-related losses for logging
         loss_reg3_total = loss_reg3_mse
@@ -365,7 +374,7 @@ class LossesMixin:
             loss_reg3_total = loss_reg3_total + loss_ratio_mse
         if loss_5d is not None:
             loss_reg3_total = loss_reg3_total + loss_5d
-        self.log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
+        _log(f"{stage}_loss_reg3", loss_reg3_total, on_step=False, on_epoch=True, prog_bar=False)
 
         # If MTL is disabled or all auxiliary tasks are off, optimize only the reg3 path.
         if (not self.mtl_enabled) or (
@@ -387,9 +396,9 @@ class LossesMixin:
                 total_loss = self._uw_sum(named_losses_simple)
             else:
                 total_loss = loss_reg3_total
-            self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
-            self.log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+            _log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
 
             if metrics_preds_5d is not None and metrics_targets_5d is not None:
                 preds_out = metrics_preds_5d.detach()
@@ -403,12 +412,28 @@ class LossesMixin:
                         targets_out = y_gm2 * float(self._area_m2)
                     else:
                         targets_out = self._invert_reg3_to_grams(y_reg3.detach())
+            # Ensure optional losses are always present for callers that want to aggregate.
+            zero = (loss_reg3_mse.sum() * 0.0)
+            loss_ratio_out = loss_ratio_mse if loss_ratio_mse is not None else zero
+            loss_5d_out = loss_5d if loss_5d is not None else zero
+            if mse_5d_per_dim is None:
+                mse_5d_per_dim_out = torch.zeros(
+                    5, device=loss_reg3_mse.device, dtype=loss_reg3_mse.dtype
+                )
+            else:
+                mse_5d_per_dim_out = mse_5d_per_dim.detach()
             return {
                 "loss": total_loss,
                 "mae": mae_reg3,
                 "mse": loss_reg3_mse,
                 "preds": preds_out,
                 "targets": targets_out,
+                "loss_reg3_mse": loss_reg3_mse,
+                "loss_ratio_mse": loss_ratio_out,
+                "loss_5d_weighted": loss_5d_out,
+                "loss_reg3_total": loss_reg3_total,
+                "mse_reg3_per_dim": per_dim_mse.detach(),
+                "mse_5d_per_dim": mse_5d_per_dim_out,
             }
 
         # Otherwise, compute enabled auxiliary task heads and losses
@@ -469,10 +494,10 @@ class LossesMixin:
 
         if self.enable_height:
             loss_height = F.mse_loss(pred_height, y_height)  # type: ignore[arg-type]
-            self.log(f"{stage}_loss_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mse_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_loss_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_mse_height", loss_height, on_step=False, on_epoch=True, prog_bar=False)
             mae_height = F.l1_loss(pred_height, y_height)  # type: ignore[arg-type]
-            self.log(f"{stage}_mae_height", mae_height, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_mae_height", mae_height, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("height", loss_height))
 
         if self.enable_ndvi:
@@ -501,25 +526,25 @@ class LossesMixin:
                     zero_nd = (z.sum() * 0.0)
                     loss_ndvi = zero_nd
                     mae_ndvi = zero_nd
-            self.log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
-            self.log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_loss_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("ndvi", loss_ndvi))
 
         if self.enable_species and logits_species is not None:
             loss_species = F.cross_entropy(logits_species, y_species)
-            self.log(f"{stage}_loss_species", loss_species, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_loss_species", loss_species, on_step=False, on_epoch=True, prog_bar=False)
             with torch.no_grad():
                 acc_species = (logits_species.argmax(dim=-1) == y_species).float().mean()
-            self.log(f"{stage}_acc_species", acc_species, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_acc_species", acc_species, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("species", loss_species))
 
         if self.enable_state and logits_state is not None:
             loss_state = F.cross_entropy(logits_state, y_state)
-            self.log(f"{stage}_loss_state", loss_state, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_loss_state", loss_state, on_step=False, on_epoch=True, prog_bar=False)
             with torch.no_grad():
                 acc_state = (logits_state.argmax(dim=-1) == y_state).float().mean()
-            self.log(f"{stage}_acc_state", acc_state, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_acc_state", acc_state, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("state", loss_state))
 
         if self.loss_weighting == "uw" and extra_uw_losses:
@@ -531,9 +556,9 @@ class LossesMixin:
 
         mae = mae_reg3
         mse = loss_reg3_mse
-        self.log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log(f"{stage}_mae", mae, on_step=False, on_epoch=True, prog_bar=False)
-        self.log(f"{stage}_mse", mse, on_step=False, on_epoch=True, prog_bar=False)
+        _log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+        _log(f"{stage}_mae", mae, on_step=False, on_epoch=True, prog_bar=False)
+        _log(f"{stage}_mse", mse, on_step=False, on_epoch=True, prog_bar=False)
 
         if metrics_preds_5d is not None and metrics_targets_5d is not None:
             preds_out = metrics_preds_5d.detach()
@@ -554,6 +579,16 @@ class LossesMixin:
             "mse": mse,
             "preds": preds_out,
             "targets": targets_out,
+            "loss_reg3_mse": loss_reg3_mse,
+            "loss_ratio_mse": (loss_ratio_mse if loss_ratio_mse is not None else (loss_reg3_mse.sum() * 0.0)),
+            "loss_5d_weighted": (loss_5d if loss_5d is not None else (loss_reg3_mse.sum() * 0.0)),
+            "loss_reg3_total": loss_reg3_total,
+            "mse_reg3_per_dim": per_dim_mse.detach(),
+            "mse_5d_per_dim": (
+                mse_5d_per_dim.detach()
+                if mse_5d_per_dim is not None
+                else torch.zeros(5, device=loss_reg3_mse.device, dtype=loss_reg3_mse.dtype)
+            ),
         }
 
 

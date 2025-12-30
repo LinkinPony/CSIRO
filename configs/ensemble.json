@@ -1,10 +1,9 @@
 {
   "enabled": false,
   "versions": [
-    "vitdet-512-v3-r16-no-ndvi",
-    "vitdet-512-v3",
-    "vitdet-512-v3-seed2",
-    "vitdet-512-v3-r16"
+    "vitdet-320-detach-pair-augmix",
+    "vitdet-320-start-again-detach-pair",
+    "v186-align-lb0.76-vith16plus"
   ]
 }
 
