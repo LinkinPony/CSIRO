@@ -41,6 +41,10 @@ class TabPFNSubmissionSettings:
     train_csv_path: str = ""
 
     # Head-penultimate feature extraction settings
+    # Feature source mode (matches configs/train_tabpfn.yaml):
+    # - "head_penultimate": use regression head's penultimate (pre-final-linear) features (default; existing behavior)
+    # - "dinov3_only"     : use frozen DINOv3 CLS token features (no LoRA, no head)
+    feature_mode: str = "head_penultimate"
     feature_fusion: str = "mean"  # "mean" | "concat"
     feature_batch_size: int = 8
     feature_num_workers: int = 8
@@ -76,15 +80,23 @@ def _import_tabpfn_regressor(*, tabpfn_python_path: str = "") -> type:
     """
     Import TabPFNRegressor (prefer installed package; fallback to vendored source path).
     """
+    # Ensure the optional `tabpfn-common-utils` dependency is available (offline no-op shim)
+    # before importing TabPFN.
+    from src.tabular.tabpfn_patches import apply_tabpfn_runtime_patches, install_tabpfn_common_utils_shim
+
+    install_tabpfn_common_utils_shim()
+
     try:
         from tabpfn import TabPFNRegressor  # type: ignore
 
+        apply_tabpfn_runtime_patches()
         return TabPFNRegressor
     except Exception:
         if tabpfn_python_path:
             _add_import_root(tabpfn_python_path, package_name="tabpfn")
             from tabpfn import TabPFNRegressor  # type: ignore
 
+            apply_tabpfn_runtime_patches()
             return TabPFNRegressor
         raise
 
@@ -585,6 +597,145 @@ def extract_head_penultimate_features(
     return list(image_paths), feats_np
 
 
+def extract_dinov3_cls_features(
+    *,
+    project_dir: str,
+    dataset_root: str,
+    cfg_train_yaml: dict,
+    dino_weights_pt_file: str,
+    image_paths: List[str],
+    batch_size: int,
+    num_workers: int,
+    cache_path: Optional[str],
+) -> Tuple[List[str], np.ndarray]:
+    """
+    Extract frozen DINOv3 CLS token features for a list of image rel paths.
+
+    This matches `configs/train_tabpfn.yaml` / `tabpfn_train.py` mode: `dinov3_only`:
+    - no LoRA injection
+    - no regression head usage
+    - TabPFN X is the backbone CLS token
+    """
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader
+
+    from src.inference.data import TestImageDataset, build_transforms
+    from src.inference.paths import resolve_path_best_effort
+    from src.models.backbone import build_feature_extractor
+
+    project_dir_abs = os.path.abspath(project_dir) if project_dir else ""
+    dataset_root_abs = os.path.abspath(dataset_root) if dataset_root else ""
+
+    backbone_name = str(cfg_train_yaml.get("model", {}).get("backbone", "") or "").strip()
+    if not backbone_name:
+        raise RuntimeError("configs/train.yaml missing model.backbone")
+
+    # Preprocessing (reuse train.yaml to match model training)
+    image_size_raw = cfg_train_yaml.get("data", {}).get("image_size", 224)
+    try:
+        if isinstance(image_size_raw, (list, tuple)) and len(image_size_raw) == 2:
+            image_size = (int(image_size_raw[1]), int(image_size_raw[0]))  # (H,W)
+        else:
+            v = int(image_size_raw)
+            image_size = (v, v)
+    except Exception:
+        v = int(image_size_raw)
+        image_size = (v, v)
+    mean = list(cfg_train_yaml.get("data", {}).get("normalization", {}).get("mean", [0.485, 0.456, 0.406]))
+    std = list(cfg_train_yaml.get("data", {}).get("normalization", {}).get("std", [0.229, 0.224, 0.225]))
+
+    # Optional cache
+    cache_path_eff = str(cache_path).strip() if isinstance(cache_path, str) and str(cache_path).strip() else ""
+    if cache_path_eff and project_dir_abs:
+        cache_path_eff = resolve_path_best_effort(project_dir_abs, cache_path_eff)
+        if os.path.isfile(cache_path_eff):
+            try:
+                obj = torch.load(cache_path_eff, map_location="cpu")
+                if isinstance(obj, dict) and "image_paths" in obj and "features" in obj:
+                    cached_paths = list(obj["image_paths"])
+                    feats = obj["features"]
+                    cached_meta = dict(obj.get("meta", {}) or {})
+                    if (
+                        cached_paths == list(image_paths)
+                        and isinstance(feats, torch.Tensor)
+                        and feats.dim() == 2
+                        and str(cached_meta.get("mode", "")) == "dinov3_only"
+                        and str(cached_meta.get("backbone", "")) == str(backbone_name)
+                        and str(cached_meta.get("weights_path", "")) == str(dino_weights_pt_file)
+                        and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
+                    ):
+                        return cached_paths, feats.cpu().numpy()
+            except Exception:
+                pass
+
+    tf = build_transforms(image_size=image_size, mean=mean, std=std, hflip=False, vflip=False)
+    ds = TestImageDataset(list(image_paths), root_dir=str(dataset_root_abs), transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    print(
+        f"[TABPFN] Extracting DINOv3 CLS features (dinov3_only): backbone={backbone_name} weights={dino_weights_pt_file} image_size={tuple(image_size)}"
+    )
+
+    # IMPORTANT: no LoRA injection here (plain frozen DINOv3 only)
+    feature_extractor = build_feature_extractor(
+        backbone_name=backbone_name,
+        pretrained=bool(cfg_train_yaml.get("model", {}).get("pretrained", True)),
+        weights_url=str(cfg_train_yaml.get("model", {}).get("weights_url", "") or "") or None,
+        weights_path=str(dino_weights_pt_file),
+        gradient_checkpointing=False,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    feature_extractor = feature_extractor.eval().to(device)
+
+    feats_cpu: List[torch.Tensor] = []
+    rels: List[str] = []
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device, non_blocking=True)
+            cls, _pt = feature_extractor.forward_cls_and_tokens(images)  # type: ignore[attr-defined]
+            feats_cpu.append(cls.detach().cpu().float())
+            rels.extend(list(rel_paths))
+
+    if rels != list(image_paths):
+        raise RuntimeError("Feature extraction order mismatch (unexpected dataloader ordering).")
+
+    features = torch.cat(feats_cpu, dim=0) if feats_cpu else torch.empty((0, 0), dtype=torch.float32)
+    if int(features.shape[0]) != int(len(image_paths)):
+        raise RuntimeError(f"Feature extraction produced wrong N: got {features.shape[0]}, expected {len(image_paths)}")
+
+    feats_np = features.cpu().numpy().astype(np.float32, copy=False)
+
+    if cache_path_eff:
+        try:
+            os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
+            torch.save(
+                {
+                    "image_paths": list(image_paths),
+                    "features": features.cpu(),
+                    "meta": {
+                        "mode": "dinov3_only",
+                        "backbone": str(backbone_name),
+                        "weights_path": str(dino_weights_pt_file),
+                        "image_size": tuple(image_size),
+                    },
+                },
+                cache_path_eff,
+            )
+            print(f"[TABPFN] Saved feature cache -> {cache_path_eff}")
+        except Exception as e:
+            print(f"[TABPFN][WARN] Saving feature cache failed: {e}")
+
+    return list(image_paths), feats_np
+
+
 def _write_submission_csv(df_test, image_to_components: dict[str, dict[str, float]], output_path: str) -> None:
     rows = []
     for _, r in df_test.iterrows():
@@ -698,34 +849,65 @@ def run_tabpfn_submission(
     print("[TABPFN] Training data:", train_csv_path)
     print("[TABPFN] Train images:", len(df_train), "Test images:", len(unique_test_paths))
     print("[TABPFN] DINO weights:", dino_weights_file)
-    print("[TABPFN] Head weights:", str(settings.head_weights_pt_path))
+    feature_mode = str(getattr(tabpfn, "feature_mode", "head_penultimate") or "head_penultimate").strip().lower()
+    if feature_mode not in ("head_penultimate", "dinov3_only"):
+        raise ValueError(f"Unsupported TabPFN feature_mode: {feature_mode!r} (expected 'head_penultimate' or 'dinov3_only')")
+
+    if feature_mode == "dinov3_only":
+        print("[TABPFN] Feature mode: dinov3_only (CLS token; no head)")
+        print("[TABPFN] Head weights: (unused for dinov3_only)")
+    else:
+        print("[TABPFN] Feature mode: head_penultimate (pre-final-linear)")
+        print("[TABPFN] Head weights:", str(settings.head_weights_pt_path))
     print("[TABPFN] TabPFN ckpt (local):", ckpt_path)
 
     # Extract features (train + test)
-    _train_rels, X_train = extract_head_penultimate_features(
-        project_dir=project_dir_abs,
-        dataset_root=str(dataset_root),
-        cfg_train_yaml=cfg,
-        dino_weights_pt_file=str(dino_weights_file),
-        head_weights_pt_path=str(settings.head_weights_pt_path),
-        image_paths=df_train["image_path"].astype(str).tolist(),
-        fusion=str(tabpfn.feature_fusion),
-        batch_size=int(tabpfn.feature_batch_size),
-        num_workers=int(tabpfn.feature_num_workers),
-        cache_path=str(tabpfn.feature_cache_path_train) if str(tabpfn.feature_cache_path_train or "").strip() else None,
-    )
-    _test_rels, X_test = extract_head_penultimate_features(
-        project_dir=project_dir_abs,
-        dataset_root=str(dataset_root),
-        cfg_train_yaml=cfg,
-        dino_weights_pt_file=str(dino_weights_file),
-        head_weights_pt_path=str(settings.head_weights_pt_path),
-        image_paths=list(unique_test_paths),
-        fusion=str(tabpfn.feature_fusion),
-        batch_size=int(tabpfn.feature_batch_size),
-        num_workers=int(tabpfn.feature_num_workers),
-        cache_path=str(tabpfn.feature_cache_path_test) if str(tabpfn.feature_cache_path_test or "").strip() else None,
-    )
+    if feature_mode == "dinov3_only":
+        _train_rels, X_train = extract_dinov3_cls_features(
+            project_dir=project_dir_abs,
+            dataset_root=str(dataset_root),
+            cfg_train_yaml=cfg,
+            dino_weights_pt_file=str(dino_weights_file),
+            image_paths=df_train["image_path"].astype(str).tolist(),
+            batch_size=int(tabpfn.feature_batch_size),
+            num_workers=int(tabpfn.feature_num_workers),
+            cache_path=str(tabpfn.feature_cache_path_train) if str(tabpfn.feature_cache_path_train or "").strip() else None,
+        )
+        _test_rels, X_test = extract_dinov3_cls_features(
+            project_dir=project_dir_abs,
+            dataset_root=str(dataset_root),
+            cfg_train_yaml=cfg,
+            dino_weights_pt_file=str(dino_weights_file),
+            image_paths=list(unique_test_paths),
+            batch_size=int(tabpfn.feature_batch_size),
+            num_workers=int(tabpfn.feature_num_workers),
+            cache_path=str(tabpfn.feature_cache_path_test) if str(tabpfn.feature_cache_path_test or "").strip() else None,
+        )
+    else:
+        _train_rels, X_train = extract_head_penultimate_features(
+            project_dir=project_dir_abs,
+            dataset_root=str(dataset_root),
+            cfg_train_yaml=cfg,
+            dino_weights_pt_file=str(dino_weights_file),
+            head_weights_pt_path=str(settings.head_weights_pt_path),
+            image_paths=df_train["image_path"].astype(str).tolist(),
+            fusion=str(tabpfn.feature_fusion),
+            batch_size=int(tabpfn.feature_batch_size),
+            num_workers=int(tabpfn.feature_num_workers),
+            cache_path=str(tabpfn.feature_cache_path_train) if str(tabpfn.feature_cache_path_train or "").strip() else None,
+        )
+        _test_rels, X_test = extract_head_penultimate_features(
+            project_dir=project_dir_abs,
+            dataset_root=str(dataset_root),
+            cfg_train_yaml=cfg,
+            dino_weights_pt_file=str(dino_weights_file),
+            head_weights_pt_path=str(settings.head_weights_pt_path),
+            image_paths=list(unique_test_paths),
+            fusion=str(tabpfn.feature_fusion),
+            batch_size=int(tabpfn.feature_batch_size),
+            num_workers=int(tabpfn.feature_num_workers),
+            cache_path=str(tabpfn.feature_cache_path_test) if str(tabpfn.feature_cache_path_test or "").strip() else None,
+        )
 
     # Fit TabPFN on FULL train.csv
     base = TabPFNRegressor(

@@ -1,5 +1,5 @@
 seed: 42
-
+version: tabpfn-2.5-tabular-v2
 # This config is for the TabPFN (2.5) demo (`tabpfn_train.py`).
 # - TabPFN input X comes from **image-model head penultimate features** (pre-final-linear),
 #   extracted using the weights defined by `image_features.train_config` + a head checkpoint.
@@ -12,8 +12,8 @@ seed: 42
 # - Then run `hf auth login` or set HF_TOKEN
 # - Or provide a local checkpoint via `tabpfn.model_path` / `--model-path`
 
-# Version tag used only for output folder naming under logging.log_dir/tabpfn/
-version: tabpfn-2.5-tabular
+# Version tag (mirrors `configs/train.yaml` semantics):
+
 
 data:
   # Keep consistent with the main project (relative to repo root).
@@ -28,7 +28,7 @@ data:
   target_order: [Dry_Total_g]
 
 kfold:
-  # `tabpfn_train.py` always runs CV; this flag is kept for consistency with train.yaml.
+  # Mirrors `configs/train.yaml` (k-fold cross-validation).
   enabled: true
 
   # Number of folds
@@ -43,13 +43,120 @@ kfold:
   # (Sampling_Date, State) group in the same fold.
   group_by_date_state: true
 
-logging:
-  # Where outputs are written:
-  # <log_dir>/tabpfn/<version>-<timestamp>/{fold_metrics.json,val_predictions.csv,summary.json,...}
-  log_dir: outputs
+trainer:
+  # Lightning Trainer settings (mirrors `configs/train.yaml`).
+  #
+  # Used by TabPFN fine-tuning when `finetune.enabled: true`.
+  # NOTE: `trainer.max_epochs` takes precedence over `finetune.max_epochs` if both are set.
+  max_epochs: 10
+  accelerator: auto
+  devices: 1
+  # Start with 32-true for stability; if you hit OOM, try 16-mixed.
+  precision: 16-mixed
+  # Control per-epoch steps. Accepts int (absolute batches) or float (fraction).
+  limit_train_batches: 1.0
+  log_every_n_steps: 1
+  accumulate_grad_batches: 1
+  # Prefer setting clip values here (train.yaml style). Falls back to finetune.gradient_clip if omitted.
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  deterministic: false
+  enable_progress_bar: true
 
-  # Kept for structural similarity to train.yaml (unused by tabpfn_train.py).
+train_all:
+  # Mirrors `configs/train.yaml`:
+  # - When enabled, additionally run a single "train_all" fit using **all** pivoted samples
+  #   and write artifacts under:
+  #     <logging.log_dir>/<version>/train_all/
+  #     <logging.ckpt_dir>/<version>/train_all/
+  #
+  # This is useful for producing a final fine-tuned TabPFN checkpoint (if finetune.enabled=true)
+  # and/or running TabPFN on the full training set after evaluating via k-fold.
+  enabled: true
+
+logging:
+  # Where logs/artifacts are written (mirrors `configs/train.yaml`).
+  log_dir: outputs
+  # Where checkpoints are written (mirrors `configs/train.yaml`).
   ckpt_dir: outputs/checkpoints
+  # Keep consistent with the rest of the repo.
+  use_loguru: true
+  tensorboard:
+    # Write TabPFN run metrics (kfold + finetune + train_all) to TensorBoard under:
+    #   <logging.log_dir>/<version>/tensorboard/
+    enabled: true
+
+# ==========================================================
+# Optional TabPFN fine-tuning (gradient-based).
+#
+# This uses TabPFN's built-in fine-tuning utilities:
+# - get_preprocessed_datasets
+# - fit_from_preprocessed + forward + backprop
+#
+# Fine-tuning runs inside each k-fold (if kfold.enabled=true) so behavior matches
+# `configs/train.yaml` k-fold semantics.
+# ==========================================================
+finetune:
+  enabled: true
+
+  # Ensemble size used *during fine-tuning* (can be smaller than tabpfn.n_estimators for speed).
+  # The fine-tuned weights can still be evaluated with a larger ensemble size afterwards.
+  # NOTE: fine-tuning with n_estimators>1 is significantly more GPU-memory hungry because it builds
+  # a larger autograd graph (multiple forward passes). Start with 1 to avoid OOM.
+  n_estimators: 1
+
+  # Precision for fine-tuning MUST be float32 for backprop (TabPFN disallows float64 in batched mode).
+  inference_precision: float32
+
+  # How many epochs to fine-tune per fold.
+  max_epochs: 10
+
+  # IMPORTANT: per-epoch evaluation can dominate wall time.
+  # By default, the fine-tune loop evaluates on the **outer fold val** every epoch, and this evaluation
+  # runs TabPFN inference 5x (one per target). If you use `tabpfn.n_estimators: 128`, evaluating with
+  # 128 estimators each epoch can easily make epochs take ~minutes.
+  #
+  # Use a small ensemble here for fast feedback; final fold metrics are still computed with `tabpfn.n_estimators`.
+  eval_n_estimators: 8
+
+  # Evaluate on the outer fold validation set every N epochs (1 => every epoch).
+  eval_every_n_epochs: 1
+
+  # Meta-learning split inside each fold's training set:
+  # - Each dataset item is split into (context/train) and (query/test) parts.
+  inner_valid_ratio: 0.3
+
+  # Meta-batch size (number of datasets per optimization step).
+  # NOTE: TabPFN fine-tuning currently only supports meta_batch_size=1 reliably.
+  meta_batch_size: 1
+
+  # Limit samples per meta-dataset (helps align fine-tuning with inference context size).
+  # - null: do not chunk; use all fold-train samples.
+  # - int : chunk each (X,y) into pieces of at most this size before sampling meta-splits.
+  # NOTE: lowering this can reduce peak GPU memory during fine-tuning.
+  max_data_size: null
+  equal_split_size: true
+
+  # Optimizer
+  optimizer:
+    name: adam
+    lr: 1.5e-6
+    weight_decay: 0.0
+
+  # Gradient clipping (like train.yaml)
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+
+  # Checkpoint saving
+  checkpoint:
+    # Save fine-tuned TabPFN foundation weights under:
+    #   <logging.ckpt_dir>/<version>/fold_<i>/tabpfn/
+    enabled: true
+    save_last: true
+    save_best: true
+    save_every_n_epochs: 0   # 0 => disabled
+    monitor: val_weighted_r2_log
 
 image_features:
   # Use the **image model config** (train.yaml) to define backbone + preprocessing.
@@ -58,8 +165,8 @@ image_features:
   # TabPFN input feature source:
   # - head_penultimate: use per-fold head penultimate (pre-final-linear) features (requires fold head weights).
   # - dinov3_only: use frozen DINOv3 CLS token (no LoRA, no head; does not require any fold-specific weights).
-  mode: head_penultimate
-  # mode: dinov3_only
+  # mode: head_penultimate
+  mode: dinov3_only
 
   # Head weights checkpoint used to compute penultimate features (z) inside the head.
   #
@@ -81,12 +188,12 @@ image_features:
 
   # Optional feature cache (speeds up repeated CV runs). When null, no caching.
   # cache_path: outputs/tabpfn_feature_cache/head_penultimate_features.pt
-  cache_path: null
+  cache_path: outputs/tabpfn_feature_cache/
 
 tabpfn:
 
   # TabPFN ensemble size (n_estimators in TabPFNRegressor).
-  n_estimators: 8
+  n_estimators: 128
 
   # Device setting for TabPFN ("auto"|"cpu"|"cuda"|"cuda:0"|...)
   device: auto
@@ -114,6 +221,29 @@ tabpfn:
 
   # REQUIRED: explicit local checkpoint path.
   # This script will NOT attempt to download weights.
-  model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_default.ckpt
+  # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_default.ckpt
+  # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real-variant.ckpt
+  model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_small-samples.ckpt
+  # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_low-skew.ckpt
+  # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_quantiles.ckpt
+  # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real.ckpt
+  # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_variant.ckpt
 
 
+#R^2 (base, n_estimators = 8)
+#default:  0.511599
+#real-variant: 0.508902
+#small-samples: 0.500425
+#low-skew: 0.516895
+#quantiles: 0.505603
+#real: 0.519799
+#variant: 0.505333
+
+#R^2 (base, n_estimators = 128)
+#default:  0.514044
+#real-variant: 0.511311
+#small-samples: 0.507878
+#low-skew: 
+#quantiles: 
+#real: 0.525890
+#variant: 

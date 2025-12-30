@@ -1,5 +1,5 @@
 seed: 42
-version: vitdet-320-detach-pair-augmix
+version: vitdet-320-start-again-detach-pair
 data:
   root: data
   train_csv: train.csv
@@ -26,7 +26,7 @@ data:
     # Augmentation policy switch:
     # - legacy: handcrafted torchvision pipeline (flip/affine/jitter/blur/noise/erasing + overlays)
     # - augmix: AugMix (single-output tensor; no JSD tuple) + optional overlays
-    policy: augmix
+    policy: legacy
     # Debug: dump the *final* images fed to the model (after CutMix) for quick sanity checks.
     # Saved under: outputs/<version>/debug/inputs/ (unless out_dir is overridden).
     debug_dump:
@@ -49,7 +49,7 @@ data:
       # Optional override (relative paths are resolved under run_log_dir):
       # out_dir: debug/inputs
     augmix:
-      enabled: true
+      enabled: false
       # AugMix knobs (reference-style):
       # - severity: 1..10 (higher => stronger ops)
       # - width   : number of augmentation chains mixed
@@ -194,24 +194,24 @@ data:
       enabled: true
       # NDVI hand-held device artifacts often look like a small *red* flare (strong core + soft halo).
       # Use flare-style blending (preserve texture) instead of the legacy flat-color composite.
-      blend_mode: screen   # one of: composite | screen | additive
+      blend_mode: composite   # one of: composite | screen | additive
       prob: 0.3
       # Size tuned for CSIRO 2:1 images (~2000x1000). Typical red hotspot core radius ~0.02-0.06 of min dim.
       radius_frac_range: [0.06, 0.18]
       # Strength (0..1). Higher => more saturated/overexposed center.
       alpha_range: [0.2, 0.6]
       # Red flare tint (roughly matches ID1963715583.jpg: (230,31,62))
-      color: [255, 30, 80]
+      color: [255, 255, 220]
       # Legacy blur_frac is still used as the halo blur fraction in flare mode (core blur is separate).
-      blur_frac: 0.6
+      blur_frac: 0.5
       core_blur_frac: 0.15
-      halo_enabled: true
+      halo_enabled: false
       halo_scale_range: [1.0, 3.5]
       halo_alpha_mult_range: [0.06, 0.20]
       # New: multi-spot grid (rows x cols) to mimic repeated device flares.
       # When enabled, the transform generates a small grid of red flares with slight jitter.
-      grid_enabled: true
-      grid_rows_range: [1, 2]
+      grid_enabled: false
+      grid_rows_range: [2, 4]
       grid_cols_range: [2, 5]
       # Spacing is sampled as a multiple of the core radius (r). Larger => more separated spots.
       grid_spacing_mul_range: [5.0, 9.0]

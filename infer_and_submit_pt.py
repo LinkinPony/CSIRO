@@ -43,7 +43,7 @@ TABPFN_PATH = "third_party/TabPFN/src"
 #  - a directory containing one or more .ckpt files (the script will auto-select one).
 #
 # REQUIRED when TABPFN_ENABLED=True: local TabPFN 2.5 regressor checkpoint (.ckpt)
-TABPFN_WEIGHTS_CKPT_PATH = "tabpfn_weights/tabpfn-v2.5-regressor-v2.5_default.ckpt"
+TABPFN_WEIGHTS_CKPT_PATH = "tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real.ckpt"
 
 # TabPFN runtime params
 TABPFN_DEVICE = "auto"  # "auto"|"cpu"|"cuda"|"cuda:0"|...
@@ -61,6 +61,11 @@ TABPFN_MODEL_CACHE_DIR = ""  # optional; e.g. "/tmp/tabpfn_cache"
 TABPFN_TRAIN_CSV_PATH = "data/train.csv"  # optional override
 
 # Penultimate feature extraction settings
+# Feature mode (matches configs/train_tabpfn.yaml):
+# - "head_penultimate": use regression head penultimate (pre-final-linear) features (default; existing behavior)
+# - "dinov3_only"     : use frozen DINOv3 CLS token features (no LoRA, no head)
+# TABPFN_FEATURE_MODE = "dinov3_only"
+TABPFN_FEATURE_MODE = "head_penultimate"
 TABPFN_FEATURE_FUSION = "mean"  # "mean" | "concat" (concat can exceed TabPFN feature limits)
 TABPFN_FEATURE_BATCH_SIZE = 8
 TABPFN_FEATURE_NUM_WORKERS = 8
@@ -222,6 +227,7 @@ def main() -> None:
             enable_telemetry=bool(TABPFN_ENABLE_TELEMETRY),
             model_cache_dir=str(TABPFN_MODEL_CACHE_DIR),
             train_csv_path=str(TABPFN_TRAIN_CSV_PATH),
+            feature_mode=str(TABPFN_FEATURE_MODE),
             feature_fusion=str(TABPFN_FEATURE_FUSION),
             feature_batch_size=int(TABPFN_FEATURE_BATCH_SIZE),
             feature_num_workers=int(TABPFN_FEATURE_NUM_WORKERS),
