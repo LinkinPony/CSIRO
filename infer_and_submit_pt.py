@@ -47,7 +47,7 @@ TABPFN_WEIGHTS_CKPT_PATH = "tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real.ckpt"
 
 # TabPFN runtime params
 TABPFN_DEVICE = "auto"  # "auto"|"cpu"|"cuda"|"cuda:0"|...
-TABPFN_N_ESTIMATORS = 8
+TABPFN_N_ESTIMATORS = 128
 TABPFN_FIT_MODE = "fit_preprocessors"
 TABPFN_INFERENCE_PRECISION = "auto"
 TABPFN_IGNORE_PRETRAINING_LIMITS = True
@@ -78,7 +78,12 @@ TABPFN_FEATURE_CACHE_PATH_TEST = ""  # optional .pt cache
 #   total_final = (total_pred + total_sum) / 2
 #   (clover, dead, green) := total_final * (component / total_sum)  (uniform when total_sum≈0)
 #   gdm := clover + green
-TABPFN_RATIO_STRICT = False
+TABPFN_RATIO_STRICT = True
+
+# When TABPFN_ENABLED=True and POST_TRAIN_ENABLED=True:
+# - If true, TabPFN feature extraction will use the post-trained head/LoRA weights.
+# - If false, TabPFN will use the original (pre-adaptation) weights even if post-train is enabled.
+TABPFN_USE_POST_TRAINED_HEAD = False
 
 # ===== Multi-GPU model-parallel inference (Scheme B) =====
 # When running the VERY large dinov3_vit7b16 backbone on 2x16GB GPUs (e.g., Kaggle T4),
@@ -111,6 +116,13 @@ TTA_VFLIP = True
 # Typical options: [1.0] (off), or [0.9, 1.0, 1.1] (heavier).
 TTA_SCALES = [1.0]
 # =======================================
+
+# ===== Post-training / Test-Time Training (TTT) on unlabeled test images =====
+# Single switch only:
+# - When True, enable post-train in inference (rules must allow transductive learning).
+# - All post-train hyperparameters are read from the packaged configs/train.yaml (post_train: ...).
+POST_TRAIN_ENABLED = True
+# ======================================================================
 
 
 import os
@@ -218,6 +230,9 @@ def main() -> None:
         mc_dropout_enabled=bool(MC_DROPOUT_ENABLED),
         mc_dropout_samples=int(MC_DROPOUT_SAMPLES),
         mc_dropout_seed=int(MC_DROPOUT_SEED),
+        post_train_enabled=bool(POST_TRAIN_ENABLED),
+        # Force-disable post-train when the single switch is off, even if YAML enables it.
+        post_train_force_disable=(not bool(POST_TRAIN_ENABLED)),
     )
 
     if bool(TABPFN_ENABLED):
@@ -242,6 +257,7 @@ def main() -> None:
             feature_cache_path_train=str(TABPFN_FEATURE_CACHE_PATH_TRAIN),
             feature_cache_path_test=str(TABPFN_FEATURE_CACHE_PATH_TEST),
             ratio_strict=bool(TABPFN_RATIO_STRICT),
+            use_post_train_head=bool(TABPFN_USE_POST_TRAINED_HEAD),
         )
         run_tabpfn_submission(settings=settings, tabpfn=tabpfn_settings)
         return

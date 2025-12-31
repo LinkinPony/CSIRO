@@ -202,6 +202,21 @@ def main():
         except Exception as e:
             logger.warning(f"SWA k-fold evaluation failed (non-fatal): {e}")
 
+        # 4) Optional: pseudo-test post-train evaluation on each fold's val split.
+        # This runs post-train (LoRA+head) on unlabeled val images, then evaluates against
+        # the val labels to quantify adaptation benefit without using test labels.
+        try:
+            post_cfg = dict(cfg.get("post_train", {}) or {})
+            eval_cfg = dict(post_cfg.get("eval_kfold_val", {}) or {})
+            if bool(eval_cfg.get("enabled", False)):
+                from swa_eval_kfold import run_post_train_eval_on_kfold_val_cfg
+
+                out_name = "kfold_swa_post_train_val_metrics.json"
+                logger.info(f"Running k-fold val pseudo-test post-train evaluation -> {out_name}")
+                run_post_train_eval_on_kfold_val_cfg(cfg, device="auto", output_name=out_name)
+        except Exception as e:
+            logger.warning(f"Post-train k-fold val evaluation failed (non-fatal): {e}")
+
 
 if __name__ == "__main__":
     main()

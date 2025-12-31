@@ -500,3 +500,67 @@ irish_glass_clover:
   # Augmentation config is reused from `data.augment`.
   # You can adjust this to match the native resolution of the Irish images.
   image_size: [800, 800]
+
+# ----------------------------------------------------------
+# Post-training / Test-Time Training (TTT) on unlabeled images
+#
+# This is the "A4" transductive adaptation stage:
+#   - trains LoRA + head (backbone base weights remain frozen)
+#   - uses ONLY images (no labels), typically the test set
+#   - adapts reg3 + ratio logits via weak(clean) -> strong(AugMix) consistency
+#
+# IMPORTANT: enable ONLY if the competition rules allow transductive learning.
+# ----------------------------------------------------------
+post_train:
+  enabled: true
+  # When true, always re-run post-train even if cached adapted weights exist.
+  force: false
+  seed: 42
+  steps: 500
+  batch_size: 1
+  num_workers: 8
+  # Optimizer
+  lr_head: 1.0e-4
+  lr_lora: 5.0e-5
+  weight_decay_head: 0.0
+  weight_decay_lora: 0.0
+  max_grad_norm: 1.0
+  # Loss weights
+  loss:
+    weight_reg3: 1.0
+    weight_ratio: 1.0
+  # EMA teacher over trainable params (recommended)
+  ema:
+    enabled: true
+    decay: 0.99
+  # Optional anchor to prevent drift (set small, e.g. 1e-4 .. 1e-3)
+  anchor:
+    weight: 1e-4
+  # Augment config (same schema as data.augment)
+  # Default: AugMix multi-view (clean + 1 strong view)
+  augment:
+    policy: augmix
+    augmix:
+      enabled: true
+      severity: 2
+      width: 2
+      depth: -1
+      alpha: 0.5
+      all_ops: true
+      consistency:
+        enabled: true
+        num_aug: 1
+    horizontal_flip_prob: 0.5
+    no_augment_prob: 0.0
+
+  # ----------------------------------------------------------
+  # K-fold "val as pseudo test" evaluation (recommended for selecting post-train settings)
+  #
+  # For each fold:
+  # - export an SWA-packed head from fold_i/last.ckpt (head_swa_eval/infer_head.pt)
+  # - run post-train on the fold's *val images only* (as unlabeled)
+  # - evaluate on fold val labels
+  # - write a comparison JSON (base vs post-train vs delta)
+  # ----------------------------------------------------------
+  eval_kfold_val:
+    enabled: true

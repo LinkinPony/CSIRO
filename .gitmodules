@@ -52,3 +52,9 @@
 [submodule "third_party/uda"]
 	path = third_party/uda
 	url = git@github.com:google-research/uda.git
+[submodule "third_party/DARE-GRAM"]
+	path = third_party/DARE-GRAM
+	url = git@github.com:ismailnejjar/DARE-GRAM.git
+[submodule "third_party/Heteroscedastic-Pseudo-Labels"]
+	path = third_party/Heteroscedastic-Pseudo-Labels
+	url = git@github.com:sxq11/Heteroscedastic-Pseudo-Labels.git

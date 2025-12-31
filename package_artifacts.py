@@ -1136,6 +1136,68 @@ def main():
         except Exception as e:
             print(f"[ENSEMBLE] Failed to write packaged manifest: {e}")
 
+    # ----------------------------------------------------------
+    # Optional: package post-trained (TTT) heads under weights/head_post/
+    #
+    # Expected training-time output layout (not enforced by this script):
+    #   - single-run:  outputs/checkpoints/<version>/post_train/head/infer_head.pt
+    #   - train_all :  outputs/checkpoints/<version>/train_all/post_train/head/infer_head.pt
+    #   - k-fold    :  outputs/checkpoints/<version>/fold_i/post_train/head/infer_head.pt
+    #
+    # We only copy if the files exist; otherwise this is a no-op.
+    # ----------------------------------------------------------
+    try:
+        def _copy_post_head_dir(src_head_dir: Path, dst_head_dir: Path, *, zsrc: Path | None = None) -> bool:
+            if not (src_head_dir.exists() and src_head_dir.is_dir()):
+                return False
+            # Prefer the stable name used by inference
+            src_pt = src_head_dir / "infer_head.pt"
+            if not src_pt.is_file():
+                # Fallback: any .pt (prefer latest mtime)
+                pts = [p for p in src_head_dir.glob("*.pt") if p.is_file()]
+                pts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                if not pts:
+                    return False
+                src_pt = pts[0]
+            if dst_head_dir.exists() and dst_head_dir.is_dir():
+                shutil.rmtree(dst_head_dir)
+            dst_head_dir.mkdir(parents=True, exist_ok=True)
+            dst_pt = dst_head_dir / "infer_head.pt"
+            shutil.copyfile(str(src_pt), str(dst_pt))
+            # Copy z_score.json when provided (best-effort)
+            if zsrc is not None and zsrc.is_file():
+                try:
+                    shutil.copyfile(str(zsrc), str(dst_head_dir / "z_score.json"))
+                except Exception:
+                    pass
+            print(f"[POST_TRAIN] Packaged post-trained head: {src_pt} -> {dst_pt}")
+            return True
+
+        post_root_dst = weights_dir / "head_post"
+        # 1) Per-fold post-trained heads (k-fold), regardless of whether train_all is enabled.
+        if kfold_enabled:
+            k = int(kfold_cfg.get("k", 5))
+            for fold_idx in range(k):
+                fold_root_ckpt_dir = ckpt_dir / f"fold_{fold_idx}"
+                src_post_dir = fold_root_ckpt_dir / "post_train" / "head"
+                dst_dir = post_root_dst / f"fold_{fold_idx}"
+                zsrc = (log_dir / f"fold_{fold_idx}" / "z_score.json") if (log_dir / f"fold_{fold_idx}").exists() else None
+                _copy_post_head_dir(src_post_dir, dst_dir, zsrc=zsrc)
+
+        # 2) train_all post-trained head -> weights/head_post/infer_head.pt (preferred)
+        if train_all_enabled:
+            src_post_dir = (ckpt_dir / "train_all" / "post_train" / "head")
+            zsrc = log_dir / "train_all" / "z_score.json"
+            _copy_post_head_dir(src_post_dir, post_root_dst, zsrc=zsrc)
+
+        # 3) single-run post-trained head -> weights/head_post/infer_head.pt (fallback)
+        if (not kfold_enabled) and (not train_all_enabled):
+            src_post_dir = ckpt_dir / "post_train" / "head"
+            zsrc = log_dir / "z_score.json"
+            _copy_post_head_dir(src_post_dir, post_root_dst, zsrc=zsrc)
+    except Exception as e:
+        print(f"[POST_TRAIN] Skipping post-trained head packaging (non-fatal): {e}")
+
     # Copy configs and src into weights/
     copy_tree(repo_root / "configs", weights_dir / "configs")
     # For single-version packaging, prefer snapshot from this cfg.version if available

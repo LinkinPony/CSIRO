@@ -54,6 +54,13 @@ class TabPFNSubmissionSettings:
     # Post-processing constraint for 5D outputs (see `src.tabular.ratio_strict.apply_ratio_strict_5d`).
     ratio_strict: bool = False
 
+    # When true, and when settings.post_train_enabled is also true, TabPFN feature extraction
+    # will use the post-trained (TTT) head/LoRA weights (transductive).
+    #
+    # This is useful when the head features themselves are improved by test-time adaptation,
+    # but it is also higher-risk and higher-compute.
+    use_post_train_head: bool = False
+
 
 def _add_import_root(path: str, *, package_name: str | None = None) -> None:
     """
@@ -856,12 +863,165 @@ def run_tabpfn_submission(
     if feature_mode not in ("head_penultimate", "dinov3_only"):
         raise ValueError(f"Unsupported TabPFN feature_mode: {feature_mode!r} (expected 'head_penultimate' or 'dinov3_only')")
 
+    # Optional: run post-train (TTT) once up-front so TabPFN feature extraction can
+    # use the adapted head/LoRA weights.
+    head_weights_for_features = str(settings.head_weights_pt_path)
+    if (
+        feature_mode == "head_penultimate"
+        and bool(getattr(tabpfn, "use_post_train_head", False))
+        and bool(getattr(settings, "post_train_enabled", False))
+    ):
+        try:
+            from src.inference.pipeline import discover_head_weight_paths
+            from src.post_train.ttt import parse_post_train_config, post_train_single_head
+            import shutil as _shutil
+
+            base_abs = resolve_path_best_effort(project_dir_abs, head_weights_for_features)
+
+            # Choose output dir: explicit setting > derive mirror of head dir.
+            out_base_cfg_raw = getattr(settings, "post_train_output_head_dir", None)
+            out_base_cfg = str(out_base_cfg_raw).strip() if isinstance(out_base_cfg_raw, str) else ""
+            if out_base_cfg:
+                out_base_abs = resolve_path_best_effort(project_dir_abs, out_base_cfg)
+            else:
+                hb = os.path.abspath(base_abs)
+                if f"{os.sep}weights{os.sep}head{os.sep}" in hb or hb.endswith(f"{os.sep}weights{os.sep}head"):
+                    out_base_abs = hb.replace(f"{os.sep}weights{os.sep}head", f"{os.sep}weights{os.sep}head_post", 1)
+                elif f"{os.sep}head{os.sep}" in hb or hb.endswith(f"{os.sep}head"):
+                    out_base_abs = hb.replace(f"{os.sep}head", f"{os.sep}head_post", 1)
+                else:
+                    out_base_abs = resolve_path_best_effort(project_dir_abs, "weights/head_post")
+            os.makedirs(out_base_abs, exist_ok=True)
+
+            # Merge YAML config with InferenceSettings overrides (same as inference pipeline).
+            post_cfg_obj = dict(cfg.get("post_train", {}) or {})
+            merged = dict(post_cfg_obj)
+            merged["enabled"] = True
+            v_force = getattr(settings, "post_train_force", None)
+            if v_force is not None:
+                merged["force"] = bool(v_force)
+            v_steps = getattr(settings, "post_train_steps", None)
+            if v_steps is not None:
+                merged["steps"] = int(v_steps)
+            v_bsz = getattr(settings, "post_train_batch_size", None)
+            if v_bsz is not None:
+                merged["batch_size"] = int(v_bsz)
+            v_nw = getattr(settings, "post_train_num_workers", None)
+            if v_nw is not None:
+                merged["num_workers"] = int(v_nw)
+            v_lr_h = getattr(settings, "post_train_lr_head", None)
+            if v_lr_h is not None:
+                merged["lr_head"] = float(v_lr_h)
+            v_lr_l = getattr(settings, "post_train_lr_lora", None)
+            if v_lr_l is not None:
+                merged["lr_lora"] = float(v_lr_l)
+            v_seed = getattr(settings, "post_train_seed", None)
+            if v_seed is not None:
+                merged["seed"] = int(v_seed)
+            v_log = getattr(settings, "post_train_log_every", None)
+            if v_log is not None:
+                merged["log_every"] = int(v_log)
+            loss_obj = dict(merged.get("loss", {}) or {})
+            v_wr = getattr(settings, "post_train_weight_reg3", None)
+            if v_wr is not None:
+                loss_obj["weight_reg3"] = float(v_wr)
+            v_wq = getattr(settings, "post_train_weight_ratio", None)
+            if v_wq is not None:
+                loss_obj["weight_ratio"] = float(v_wq)
+            merged["loss"] = loss_obj
+            ema_obj = dict(merged.get("ema", {}) or {})
+            v_ema_en = getattr(settings, "post_train_ema_enabled", None)
+            if v_ema_en is not None:
+                ema_obj["enabled"] = bool(v_ema_en)
+            v_ema_d = getattr(settings, "post_train_ema_decay", None)
+            if v_ema_d is not None:
+                ema_obj["decay"] = float(v_ema_d)
+            merged["ema"] = ema_obj
+            anchor_obj = dict(merged.get("anchor", {}) or {})
+            v_aw = getattr(settings, "post_train_anchor_weight", None)
+            if v_aw is not None:
+                anchor_obj["weight"] = float(v_aw)
+            merged["anchor"] = anchor_obj
+            aug_override = getattr(settings, "post_train_augment", None)
+            if isinstance(aug_override, dict) and len(aug_override) > 0:
+                merged["augment"] = dict(aug_override)
+            if not isinstance(merged.get("augment", None), dict) or len(dict(merged.get("augment", {}) or {})) == 0:
+                merged["augment"] = {
+                    "policy": "augmix",
+                    "augmix": {
+                        "enabled": True,
+                        "severity": 2,
+                        "width": 2,
+                        "depth": -1,
+                        "alpha": 0.5,
+                        "all_ops": False,
+                        "consistency": {"enabled": True, "num_aug": 1},
+                    },
+                    "horizontal_flip_prob": 0.5,
+                    "no_augment_prob": 0.0,
+                }
+
+            post_cfg = parse_post_train_config(merged)
+
+            # Best-effort copy z_score.json (not strictly required for TabPFN)
+            def _copy_zscore_json(src_head_pt: str, dst_dir: str) -> None:
+                try:
+                    os.makedirs(dst_dir, exist_ok=True)
+                except Exception:
+                    return
+                candidates: List[str] = []
+                d0 = os.path.dirname(src_head_pt)
+                candidates.append(os.path.join(d0, "z_score.json"))
+                d1 = os.path.dirname(d0)
+                if d1 and d1 != d0:
+                    candidates.append(os.path.join(d1, "z_score.json"))
+                src = next((c for c in candidates if os.path.isfile(c)), None)
+                if not src:
+                    return
+                dst = os.path.join(dst_dir, "z_score.json")
+                if os.path.isfile(dst):
+                    return
+                try:
+                    _shutil.copyfile(src, dst)
+                except Exception:
+                    pass
+
+            head_paths = discover_head_weight_paths(base_abs)
+            for p in head_paths:
+                p_abs = os.path.abspath(str(p))
+                base = os.path.basename(p_abs)
+                fold_name = ""
+                try:
+                    parent = os.path.basename(os.path.dirname(p_abs))
+                    if parent.startswith("fold_"):
+                        fold_name = parent
+                except Exception:
+                    fold_name = ""
+                out_dir = os.path.join(out_base_abs, fold_name) if fold_name else out_base_abs
+                os.makedirs(out_dir, exist_ok=True)
+                out_pt = os.path.join(out_dir, base)
+                _copy_zscore_json(p_abs, out_dir)
+                post_train_single_head(
+                    cfg_train_yaml=cfg,
+                    dino_weights_pt_file=str(dino_weights_file),
+                    head_in_pt=p_abs,
+                    dataset_root=str(dataset_root),
+                    image_paths=list(unique_test_paths),
+                    out_head_pt=out_pt,
+                    cfg=post_cfg,
+                )
+
+            head_weights_for_features = out_base_abs
+            print(f"[TABPFN][POST_TRAIN] Using post-trained head weights for features: {head_weights_for_features}")
+        except Exception as e:
+            print(f"[TABPFN][POST_TRAIN][WARN] Post-train failed; using original head weights. Reason: {e}")
+
     if feature_mode == "dinov3_only":
         print("[TABPFN] Feature mode: dinov3_only (CLS token; no head)")
         print("[TABPFN] Head weights: (unused for dinov3_only)")
     else:
         print("[TABPFN] Feature mode: head_penultimate (pre-final-linear)")
-        print("[TABPFN] Head weights:", str(settings.head_weights_pt_path))
+        print("[TABPFN] Head weights:", str(head_weights_for_features))
     print("[TABPFN] TabPFN ckpt (local):", ckpt_path)
 
     # Extract features (train + test)
@@ -892,7 +1052,7 @@ def run_tabpfn_submission(
             dataset_root=str(dataset_root),
             cfg_train_yaml=cfg,
             dino_weights_pt_file=str(dino_weights_file),
-            head_weights_pt_path=str(settings.head_weights_pt_path),
+            head_weights_pt_path=str(head_weights_for_features),
             image_paths=df_train["image_path"].astype(str).tolist(),
             fusion=str(tabpfn.feature_fusion),
             batch_size=int(tabpfn.feature_batch_size),
@@ -904,7 +1064,7 @@ def run_tabpfn_submission(
             dataset_root=str(dataset_root),
             cfg_train_yaml=cfg,
             dino_weights_pt_file=str(dino_weights_file),
-            head_weights_pt_path=str(settings.head_weights_pt_path),
+            head_weights_pt_path=str(head_weights_for_features),
             image_paths=list(unique_test_paths),
             fusion=str(tabpfn.feature_fusion),
             batch_size=int(tabpfn.feature_batch_size),

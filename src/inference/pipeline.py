@@ -425,6 +425,210 @@ def infer_components_5d_for_model(
     if not head_weight_paths:
         raise RuntimeError(f"No head weights found under: {head_base_abs}")
 
+    # ----------------------------------------------------------
+    # Optional: post-train / TTT on unlabeled images BEFORE inference
+    # ----------------------------------------------------------
+    post_cfg_obj = dict(cfg.get("post_train", {}) or {})
+    post_enabled_cfg = bool(post_cfg_obj.get("enabled", False))
+    # Allow callers (e.g., evaluation scripts) to force-disable post-train regardless of YAML.
+    post_force_disable = bool(getattr(settings, "post_train_force_disable", False))
+    post_enabled = (bool(getattr(settings, "post_train_enabled", False)) or post_enabled_cfg) and (not post_force_disable)
+    if post_enabled:
+        try:
+            from src.post_train.ttt import parse_post_train_config, post_train_single_head
+            import shutil as _shutil
+
+            # Decide where to write adapted heads.
+            # Priority:
+            #  1) InferenceSettings.post_train_output_head_dir (explicit)
+            #  2) cfg.post_train.output_head_dir (yaml)
+            #  3) derive by mirroring the input head_base path (weights/head -> weights/head_post)
+            #  4) fallback: weights/head_post
+            out_base_cfg_raw = getattr(settings, "post_train_output_head_dir", None)
+            out_base_cfg = str(out_base_cfg_raw).strip() if isinstance(out_base_cfg_raw, str) else ""
+            if not out_base_cfg:
+                out_base_cfg = str(post_cfg_obj.get("output_head_dir", "") or "").strip()
+            if out_base_cfg:
+                out_base_abs = resolve_path_best_effort(project_dir, out_base_cfg)
+            else:
+                hb = os.path.abspath(str(head_base_abs))
+                # Mirror common layouts:
+                # - repo root: <...>/weights/head[/<ver>]
+                # - packaged weights dir: <...>/head[/<ver>]
+                if f"{os.sep}weights{os.sep}head{os.sep}" in hb or hb.endswith(f"{os.sep}weights{os.sep}head"):
+                    out_base_abs = hb.replace(f"{os.sep}weights{os.sep}head", f"{os.sep}weights{os.sep}head_post", 1)
+                elif f"{os.sep}head{os.sep}" in hb or hb.endswith(f"{os.sep}head"):
+                    out_base_abs = hb.replace(f"{os.sep}head", f"{os.sep}head_post", 1)
+                else:
+                    out_base_abs = resolve_path_best_effort(project_dir, "weights/head_post")
+            os.makedirs(out_base_abs, exist_ok=True)
+
+            # Merge YAML post_train config with entrypoint overrides (InferenceSettings wins).
+            merged = dict(post_cfg_obj)
+            merged["enabled"] = True
+            # Optional overrides (when InferenceSettings provides them); otherwise rely on YAML / defaults.
+            v_force = getattr(settings, "post_train_force", None)
+            if v_force is not None:
+                merged["force"] = bool(v_force)
+            v_steps = getattr(settings, "post_train_steps", None)
+            if v_steps is not None:
+                merged["steps"] = int(v_steps)
+            v_bsz = getattr(settings, "post_train_batch_size", None)
+            if v_bsz is not None:
+                merged["batch_size"] = int(v_bsz)
+            v_nw = getattr(settings, "post_train_num_workers", None)
+            if v_nw is not None:
+                merged["num_workers"] = int(v_nw)
+            v_lr_h = getattr(settings, "post_train_lr_head", None)
+            if v_lr_h is not None:
+                merged["lr_head"] = float(v_lr_h)
+            v_lr_l = getattr(settings, "post_train_lr_lora", None)
+            if v_lr_l is not None:
+                merged["lr_lora"] = float(v_lr_l)
+            v_seed = getattr(settings, "post_train_seed", None)
+            if v_seed is not None:
+                merged["seed"] = int(v_seed)
+            v_log = getattr(settings, "post_train_log_every", None)
+            if v_log is not None:
+                merged["log_every"] = int(v_log)
+            # (optional) max_grad_norm may be present in YAML; keep it if present, otherwise let post_train defaults apply.
+            if "max_grad_norm" in merged:
+                try:
+                    merged["max_grad_norm"] = float(merged.get("max_grad_norm", 1.0))
+                except Exception:
+                    pass
+
+            # Loss weights
+            loss_obj = dict(merged.get("loss", {}) or {})
+            v_wr = getattr(settings, "post_train_weight_reg3", None)
+            if v_wr is not None:
+                loss_obj["weight_reg3"] = float(v_wr)
+            v_wq = getattr(settings, "post_train_weight_ratio", None)
+            if v_wq is not None:
+                loss_obj["weight_ratio"] = float(v_wq)
+            merged["loss"] = loss_obj
+
+            # EMA
+            ema_obj = dict(merged.get("ema", {}) or {})
+            v_ema_en = getattr(settings, "post_train_ema_enabled", None)
+            if v_ema_en is not None:
+                ema_obj["enabled"] = bool(v_ema_en)
+            v_ema_d = getattr(settings, "post_train_ema_decay", None)
+            if v_ema_d is not None:
+                ema_obj["decay"] = float(v_ema_d)
+            merged["ema"] = ema_obj
+
+            # Anchor
+            anchor_obj = dict(merged.get("anchor", {}) or {})
+            v_aw = getattr(settings, "post_train_anchor_weight", None)
+            if v_aw is not None:
+                anchor_obj["weight"] = float(v_aw)
+            merged["anchor"] = anchor_obj
+
+            # Augment config: prefer entrypoint override when provided, else YAML, else safe default (AugMix 2-view).
+            aug_override = getattr(settings, "post_train_augment", None)
+            if isinstance(aug_override, dict) and len(aug_override) > 0:
+                merged["augment"] = dict(aug_override)
+            elif "augment" not in merged:
+                merged["augment"] = dict(merged.get("augment_cfg", {}) or {})
+            if not isinstance(merged.get("augment", None), dict) or len(dict(merged.get("augment", {}) or {})) == 0:
+                merged["augment"] = {
+                    "policy": "augmix",
+                    "augmix": {
+                        "enabled": True,
+                        "severity": 2,
+                        "width": 2,
+                        "depth": -1,
+                        "alpha": 0.5,
+                        "all_ops": False,
+                        "consistency": {"enabled": True, "num_aug": 1},
+                    },
+                    # Conservative geometric augmentation for CSIRO-style images
+                    "horizontal_flip_prob": 0.5,
+                    "no_augment_prob": 0.0,
+                }
+
+            post_cfg = parse_post_train_config(merged)
+
+            # Helper: copy z_score.json so post-trained head dir is self-contained for inference.
+            def _copy_zscore_json(src_head_pt: str, dst_dir: str) -> None:
+                src_head_pt = str(src_head_pt)
+                dst_dir = str(dst_dir)
+                try:
+                    os.makedirs(dst_dir, exist_ok=True)
+                except Exception:
+                    return
+                # Same search order as _load_zscore_json_for_head
+                candidates: List[str] = []
+                d0 = os.path.dirname(src_head_pt)
+                candidates.append(os.path.join(d0, "z_score.json"))
+                d1 = os.path.dirname(d0)
+                if d1 and d1 != d0:
+                    candidates.append(os.path.join(d1, "z_score.json"))
+                    d2 = os.path.dirname(d1)
+                    if d2 and d2 not in (d1, d0):
+                        candidates.append(os.path.join(d2, "z_score.json"))
+                src = next((c for c in candidates if os.path.isfile(c)), None)
+                if not src:
+                    return
+                dst = os.path.join(dst_dir, "z_score.json")
+                if os.path.isfile(dst):
+                    return
+                try:
+                    _shutil.copyfile(src, dst)
+                except Exception:
+                    pass
+
+            # Resolve DINO weights path once (post-train runner accepts explicit file)
+            dino_abs = resolve_path_best_effort(project_dir, dino_weights_pt_path)
+            if os.path.isdir(dino_abs):
+                dino_abs = find_dino_weights_in_dir(dino_abs, str(cfg.get("model", {}).get("backbone", "") or ""))
+            if not (dino_abs and os.path.isfile(dino_abs)):
+                raise FileNotFoundError(f"[POST_TRAIN] DINO weights not found: {dino_weights_pt_path}")
+
+            # Adapt each head file independently; preserve fold subdirs when present.
+            adapted_paths: List[str] = []
+            orig_to_adapted: Dict[str, str] = {}
+            for p in head_weight_paths:
+                p_abs = os.path.abspath(str(p))
+                base = os.path.basename(p_abs)
+                fold_name = ""
+                try:
+                    parent = os.path.basename(os.path.dirname(p_abs))
+                    if parent.startswith("fold_"):
+                        fold_name = parent
+                except Exception:
+                    fold_name = ""
+                out_dir = os.path.join(out_base_abs, fold_name) if fold_name else out_base_abs
+                os.makedirs(out_dir, exist_ok=True)
+                out_pt = os.path.join(out_dir, base)
+                # Most packaged heads are named infer_head.pt; keep that stable.
+                if base.startswith("head-epoch") or (base.endswith(".pt") and base != "infer_head.pt"):
+                    # Keep basename for transparency; users can point HEAD_WEIGHTS_PT_PATH directly to out_base_abs.
+                    pass
+                _copy_zscore_json(p_abs, out_dir)
+                # Also copy to root of out_base_abs to support non-fold resolution.
+                if fold_name:
+                    _copy_zscore_json(p_abs, out_base_abs)
+
+                out_written = post_train_single_head(
+                    cfg_train_yaml=cfg,
+                    dino_weights_pt_file=dino_abs,
+                    head_in_pt=p_abs,
+                    dataset_root=dataset_root,
+                    image_paths=image_paths,
+                    out_head_pt=out_pt,
+                    cfg=post_cfg,
+                )
+                adapted_paths.append(out_written)
+                orig_to_adapted[p] = out_written
+
+            # Update head weights + weights map to point at adapted files
+            head_weight_paths = adapted_paths
+            weight_map = {orig_to_adapted.get(p, p): float(weight_map.get(p, 1.0)) for p in weight_map.keys()}
+        except Exception as e:
+            print(f"[POST_TRAIN][WARN] Post-train failed; falling back to original weights. Reason: {e}")
+
     # Inspect first head file to infer defaults
     _first_state, first_meta, _ = load_head_state(head_weight_paths[0])
     if not isinstance(first_meta, dict):
