@@ -46,3 +46,9 @@
 [submodule "third_party/TabPFN"]
 	path = third_party/TabPFN
 	url = git@github.com:PriorLabs/TabPFN.git
+[submodule "third_party/fixmatch"]
+	path = third_party/fixmatch
+	url = git@github.com:google-research/fixmatch.git
+[submodule "third_party/uda"]
+	path = third_party/uda
+	url = git@github.com:google-research/uda.git

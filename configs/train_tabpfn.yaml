@@ -97,7 +97,7 @@ logging:
 # `configs/train.yaml` k-fold semantics.
 # ==========================================================
 finetune:
-  enabled: true
+  enabled: false
 
   # Ensemble size used *during fine-tuning* (can be smaller than tabpfn.n_estimators for speed).
   # The fine-tuned weights can still be evaluated with a larger ensemble size afterwards.
@@ -165,8 +165,8 @@ image_features:
   # TabPFN input feature source:
   # - head_penultimate: use per-fold head penultimate (pre-final-linear) features (requires fold head weights).
   # - dinov3_only: use frozen DINOv3 CLS token (no LoRA, no head; does not require any fold-specific weights).
-  # mode: head_penultimate
-  mode: dinov3_only
+  mode: head_penultimate
+  # mode: dinov3_only
 
   # Head weights checkpoint used to compute penultimate features (z) inside the head.
   #
@@ -204,6 +204,14 @@ tabpfn:
   # Inference precision: auto|autocast|float16|bfloat16|float32
   inference_precision: auto
 
+  # Post-process constraint for 5D predictions (ratio_strict):
+  # 1) total = predicted Dry_Total_g
+  # 2) total_sum = Dry_Clover_g + Dry_Dead_g + Dry_Green_g
+  # 3) total_final = (total + total_sum) / 2
+  # 4) Recompute (clover, dead, green) by preserving proportions and scaling to total_final
+  # 5) gdm = clover + green
+  ratio_strict: true
+
   # TabPFN has official limits on feature count (e.g. <=2000). Using DINO features can exceed this
   # (e.g. cls_patch_mean for vith16plus is 2*1280=2560), so we enable this override by default.
   ignore_pretraining_limits: true
@@ -223,10 +231,10 @@ tabpfn:
   # This script will NOT attempt to download weights.
   # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_default.ckpt
   # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real-variant.ckpt
-  model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_small-samples.ckpt
+  # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_small-samples.ckpt
   # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_low-skew.ckpt
   # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_quantiles.ckpt
-  # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real.ckpt
+  model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real.ckpt
   # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_variant.ckpt
 
 

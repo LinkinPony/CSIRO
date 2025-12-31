@@ -1,3 +1,5 @@
+- IMPORTANT: DO NOT MODIFY ANYTHING IN thrid_party/
+
 ## Weights Management (Backbone vs Head)
 
 - DINOv3 backbone is fully frozen during training. A single shared file is used for all runs:
@@ -16,3 +18,4 @@
 `last.ckpt` continues to be saved unchanged by Lightning for backward compatibility.
 
 
+- IMPORTANT: DO NOT MODIFY ANYTHING IN thrid_party/

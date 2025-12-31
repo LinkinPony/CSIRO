@@ -32,7 +32,7 @@ PROJECT_DIR = "."
 # IMPORTANT:
 # - TabPFN weights are loaded **LOCAL-ONLY** from TABPFN_WEIGHTS_CKPT_PATH.
 # - No HuggingFace download / auth is attempted in this script.
-TABPFN_ENABLED = True
+TABPFN_ENABLED = False
 
 # Optional: path to TabPFN python package source (offline-friendly).
 # If you have tabpfn installed in the environment, you can ignore this.
@@ -71,6 +71,14 @@ TABPFN_FEATURE_BATCH_SIZE = 8
 TABPFN_FEATURE_NUM_WORKERS = 8
 TABPFN_FEATURE_CACHE_PATH_TRAIN = ""  # optional .pt cache
 TABPFN_FEATURE_CACHE_PATH_TEST = ""  # optional .pt cache
+
+# TabPFN output constraint (postprocess):
+# When enabled, enforce a strict coupling between Dry_Total_g and (Clover/Dead/Green) via:
+#   total_sum = clover + dead + green
+#   total_final = (total_pred + total_sum) / 2
+#   (clover, dead, green) := total_final * (component / total_sum)  (uniform when total_sum≈0)
+#   gdm := clover + green
+TABPFN_RATIO_STRICT = False
 
 # ===== Multi-GPU model-parallel inference (Scheme B) =====
 # When running the VERY large dinov3_vit7b16 backbone on 2x16GB GPUs (e.g., Kaggle T4),
@@ -233,6 +241,7 @@ def main() -> None:
             feature_num_workers=int(TABPFN_FEATURE_NUM_WORKERS),
             feature_cache_path_train=str(TABPFN_FEATURE_CACHE_PATH_TRAIN),
             feature_cache_path_test=str(TABPFN_FEATURE_CACHE_PATH_TEST),
+            ratio_strict=bool(TABPFN_RATIO_STRICT),
         )
         run_tabpfn_submission(settings=settings, tabpfn=tabpfn_settings)
         return

@@ -11,6 +11,58 @@ from loguru import logger
 from src.tabular.tabpfn_utils import parse_image_size_hw, resolve_under_repo
 
 
+def _pick_ckpt_for_swa(ckpt_root: Path) -> Optional[Path]:
+    """
+    Pick a Lightning `.ckpt` file to use as the source for SWA head export.
+
+    Priority:
+      1) <ckpt_root>/last.ckpt
+      2) newest *.ckpt under <ckpt_root>/
+    """
+    last_ckpt = (ckpt_root / "last.ckpt").resolve()
+    if last_ckpt.is_file():
+        return last_ckpt
+    ckpt_candidates = [p for p in ckpt_root.glob("*.ckpt") if p.is_file()]
+    ckpt_candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return ckpt_candidates[0] if ckpt_candidates else None
+
+
+def _try_export_swa_head_from_ckpt(
+    *,
+    ckpt_root: Path,
+    dst_dir: Path,
+) -> Optional[Path]:
+    """
+    Best-effort export a packed SWA head weights file (infer_head.pt) from a Lightning checkpoint.
+
+    This reuses the same implementation used by `package_artifacts.py` (which itself mirrors
+    how `kfold_swa_metrics.json` is evaluated via `swa_eval_kfold.py`).
+
+    The destination directory MUST be safe to overwrite (the exporter clears it).
+    """
+    ckpt_for_swa = _pick_ckpt_for_swa(ckpt_root)
+    if ckpt_for_swa is None:
+        return None
+    try:
+        from package_artifacts import _export_swa_head_from_checkpoint  # type: ignore
+    except Exception:
+        return None
+    try:
+        res = _export_swa_head_from_checkpoint(ckpt_for_swa, dst_dir)
+    except Exception as e:
+        logger.warning(
+            "SWA head export failed (ckpt_root={} -> dst_dir={}): {}",
+            str(ckpt_root),
+            str(dst_dir),
+            str(e),
+        )
+        return None
+    if res is None:
+        return None
+    _src_ckpt, dst_path = res
+    return Path(dst_path).resolve()
+
+
 def resolve_fold_head_weights_path(
     *,
     repo_root: Path,
@@ -26,8 +78,9 @@ def resolve_fold_head_weights_path(
     Search order (best-effort):
       1) weights/head/fold_<i>/infer_head.pt
       2) weights/head/<version>/fold_<i>/infer_head.pt                (ensemble packaging layout)
-      3) outputs/checkpoints/<version>/fold_<i>/head/head-epoch*.pt   (latest loadable)
-      4) outputs/checkpoints/<version>/fold_<i>/head/infer_head.pt
+      3) outputs/checkpoints/<version>/fold_<i>/head_swa/infer_head.pt (auto-exported SWA head)
+      4) outputs/checkpoints/<version>/fold_<i>/head/head-epoch*.pt    (latest loadable; raw weights)
+      5) outputs/checkpoints/<version>/fold_<i>/head/infer_head.pt
     """
     from src.inference.torch_load import load_head_state
 
@@ -43,6 +96,20 @@ def resolve_fold_head_weights_path(
 
     # Training outputs (per-fold heads are stored here)
     if ver:
+        fold_root = (repo_root / "outputs" / "checkpoints" / ver / fold_name).resolve()
+
+        # Prefer (and optionally auto-generate) an SWA-exported head that matches
+        # the kfold_swa_metrics.json evaluation behaviour.
+        head_swa_dir = (fold_root / "head_swa").resolve()
+        head_swa_path = (head_swa_dir / "infer_head.pt").resolve()
+        if head_swa_path.is_file():
+            candidates.append(head_swa_path)
+        else:
+            if fold_root.is_dir():
+                exported = _try_export_swa_head_from_ckpt(ckpt_root=fold_root, dst_dir=head_swa_dir)
+                if exported is not None and exported.is_file():
+                    candidates.append(exported)
+
         head_dir = (repo_root / "outputs" / "checkpoints" / ver / fold_name / "head").resolve()
         if head_dir.is_dir():
             # Prefer epoch checkpoints (choose latest *loadable*).
@@ -102,10 +169,12 @@ def resolve_train_all_head_weights_path(
     Search order (best-effort):
       1) weights/head/infer_head.pt
       2) weights/head/<version>/train_all/infer_head.pt                (ensemble packaging layout)
-      3) outputs/checkpoints/<version>/train_all/head/head-epoch*.pt   (latest loadable)
-      4) outputs/checkpoints/<version>/train_all/head/infer_head.pt
-      5) outputs/checkpoints/<version>/head/head-epoch*.pt             (legacy single-run layout)
-      6) outputs/checkpoints/<version>/head/infer_head.pt
+      3) outputs/checkpoints/<version>/train_all/head_swa/infer_head.pt (auto-exported SWA head)
+      4) outputs/checkpoints/<version>/train_all/head/head-epoch*.pt    (latest loadable; raw weights)
+      5) outputs/checkpoints/<version>/train_all/head/infer_head.pt
+      6) outputs/checkpoints/<version>/head_swa/infer_head.pt           (auto-exported SWA head; legacy single-run)
+      7) outputs/checkpoints/<version>/head/head-epoch*.pt              (legacy single-run layout)
+      8) outputs/checkpoints/<version>/head/infer_head.pt
     """
     from src.inference.torch_load import load_head_state
 
@@ -149,8 +218,30 @@ def resolve_train_all_head_weights_path(
 
     # Training outputs
     if ver:
+        # train_all SWA head (preferred)
+        train_all_root = (repo_root / "outputs" / "checkpoints" / ver / "train_all").resolve()
+        train_all_swa_dir = (train_all_root / "head_swa").resolve()
+        train_all_swa_path = (train_all_swa_dir / "infer_head.pt").resolve()
+        if train_all_swa_path.is_file():
+            candidates.append(train_all_swa_path)
+        else:
+            if train_all_root.is_dir():
+                exported = _try_export_swa_head_from_ckpt(ckpt_root=train_all_root, dst_dir=train_all_swa_dir)
+                if exported is not None and exported.is_file():
+                    candidates.append(exported)
+
         _append_latest_epoch_ckpt((repo_root / "outputs" / "checkpoints" / ver / "train_all" / "head").resolve())
         # Legacy single-run layout (non-train_all)
+        legacy_root = (repo_root / "outputs" / "checkpoints" / ver).resolve()
+        legacy_swa_dir = (legacy_root / "head_swa").resolve()
+        legacy_swa_path = (legacy_swa_dir / "infer_head.pt").resolve()
+        if legacy_swa_path.is_file():
+            candidates.append(legacy_swa_path)
+        else:
+            if legacy_root.is_dir():
+                exported = _try_export_swa_head_from_ckpt(ckpt_root=legacy_root, dst_dir=legacy_swa_dir)
+                if exported is not None and exported.is_file():
+                    candidates.append(exported)
         _append_latest_epoch_ckpt((repo_root / "outputs" / "checkpoints" / ver / "head").resolve())
 
     for cand in candidates:

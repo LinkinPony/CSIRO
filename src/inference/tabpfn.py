@@ -51,6 +51,9 @@ class TabPFNSubmissionSettings:
     feature_cache_path_train: str = ""  # optional .pt cache
     feature_cache_path_test: str = ""  # optional .pt cache
 
+    # Post-processing constraint for 5D outputs (see `src.tabular.ratio_strict.apply_ratio_strict_5d`).
+    ratio_strict: bool = False
+
 
 def _add_import_root(path: str, *, package_name: str | None = None) -> None:
     """
@@ -940,6 +943,10 @@ def run_tabpfn_submission(
         raise
 
     y_pred = model.predict(X_test)
+    if bool(getattr(tabpfn, "ratio_strict", False)):
+        from src.tabular.ratio_strict import apply_ratio_strict_5d
+
+        y_pred = apply_ratio_strict_5d(y_pred)
 
     # Map predictions to per-image components dict
     image_to_components: dict[str, dict[str, float]] = {}

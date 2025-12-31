@@ -13,7 +13,7 @@ from loguru import logger
 import shutil
 
 from src.data.csiro_pivot import read_and_pivot_csiro_train_csv
-from src.metrics import TARGETS_5D_ORDER, weighted_r2_logspace
+from src.metrics import BIOMASS_5D_WEIGHTS, TARGETS_5D_ORDER, weighted_r2_logspace
 from src.tabular.features import build_y_5d
 from src.tabular.tabpfn_image_features import (
     extract_dinov3_cls_features_as_tabular,
@@ -49,6 +49,8 @@ class TabPFNRunParams:
     enable_telemetry: bool
     model_cache_dir: Optional[str]
     model_path: str
+    # Post-processing constraint for predicted 5D outputs.
+    ratio_strict: bool
 
 
 def parse_args(repo_root: Path, argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -168,6 +170,25 @@ def parse_args(repo_root: Path, argv: Optional[list[str]] = None) -> argparse.Na
         default=None,
         help="Parallelism for multi-output wrapper (overrides config tabpfn.n_jobs).",
     )
+
+    g_rs = p.add_mutually_exclusive_group()
+    g_rs.add_argument(
+        "--ratio-strict",
+        dest="ratio_strict",
+        action="store_true",
+        help=(
+            "Enable ratio_strict post-processing on 5D predictions. "
+            "Uses total_final=(total + (clover+dead+green))/2, rescales (clover,dead,green) by their proportions, "
+            "and recomputes gdm=clover+green."
+        ),
+    )
+    g_rs.add_argument(
+        "--no-ratio-strict",
+        dest="ratio_strict",
+        action="store_false",
+        help="Disable ratio_strict post-processing (use raw TabPFN outputs).",
+    )
+    p.set_defaults(ratio_strict=None)
     p.add_argument(
         "--max-folds",
         type=int,
@@ -235,6 +256,10 @@ def _resolve_tabpfn_params(
     # Cache dir
     model_cache_dir = args.model_cache_dir if args.model_cache_dir is not None else tabpfn_cfg.get("model_cache_dir", None)
 
+    # Prediction postprocess (config key: tabpfn.ratio_strict)
+    ratio_strict_cfg = bool(tabpfn_cfg.get("ratio_strict", False))
+    ratio_strict = ratio_strict_cfg if getattr(args, "ratio_strict", None) is None else bool(getattr(args, "ratio_strict"))
+
     # Model checkpoint path (MUST be local; do not fall back to downloading).
     model_path_raw = args.model_path if args.model_path is not None else tabpfn_cfg.get("model_path", None)
     if model_path_raw is None or (isinstance(model_path_raw, str) and not model_path_raw.strip()):
@@ -258,7 +283,104 @@ def _resolve_tabpfn_params(
         enable_telemetry=bool(enable_telemetry),
         model_cache_dir=str(model_cache_dir) if model_cache_dir is not None else None,
         model_path=str(model_path_p),
+        ratio_strict=bool(ratio_strict),
     )
+
+
+def _weighted_r2_logspace_global_baseline(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    global_targets: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    eps: float = 1e-8,
+    return_per_target: bool = False,
+) -> float | tuple[float, np.ndarray]:
+    """
+    Weighted R^2 in log-space using a **global-dataset mean baseline**, matching the
+    metric definition used by `kfold_swa_metrics.json` (see `swa_eval_kfold.py` /
+    `sanity_check.compute_metrics`).
+
+    Notes:
+    - Evaluate on `log1p(clamp(x, min=0))`, per target dimension.
+    - Baseline mean is computed in grams over `global_targets`, then mapped to log space
+      via `log1p(mean_grams)` (NOT mean(log1p(x))).
+    """
+    yt = np.asarray(y_true, dtype=np.float64)
+    yp = np.asarray(y_pred, dtype=np.float64)
+    yg = np.asarray(global_targets, dtype=np.float64)
+
+    if yt.shape != yp.shape:
+        raise ValueError(f"Shape mismatch: y_true={yt.shape} vs y_pred={yp.shape}")
+    if yt.ndim != 2:
+        raise ValueError(f"Expected 2D arrays (N, D), got shape: {yt.shape}")
+    if yg.ndim != 2 or yg.shape[1] != yt.shape[1]:
+        raise ValueError(f"Invalid global_targets shape: {yg.shape} for D={yt.shape[1]}")
+
+    w = BIOMASS_5D_WEIGHTS if weights is None else np.asarray(weights, dtype=np.float64)
+    if w.ndim != 1 or w.shape[0] != yt.shape[1]:
+        raise ValueError(f"Invalid weights shape: {w.shape} for D={yt.shape[1]}")
+
+    yt = np.maximum(yt, 0.0)
+    yp = np.maximum(yp, 0.0)
+    yg = np.maximum(yg, 0.0)
+
+    yt_log = np.log1p(yt)
+    yp_log = np.log1p(yp)
+
+    mean_grams = np.mean(yg, axis=0)
+    mean_log = np.log1p(mean_grams)
+
+    ss_res = np.sum((yt_log - yp_log) ** 2, axis=0)
+    ss_tot = np.sum((yt_log - mean_log) ** 2, axis=0)
+    r2_per = 1.0 - (ss_res / (ss_tot + float(eps)))
+
+    valid = np.isfinite(r2_per)
+    w_eff = w * valid.astype(np.float64)
+    denom = max(float(np.sum(w_eff)), float(eps))
+    r2_weighted = float(np.sum(w_eff * r2_per) / denom)
+
+    if return_per_target:
+        return r2_weighted, r2_per
+    return r2_weighted
+
+
+def _try_load_kfold_swa_metrics(
+    *,
+    repo_root: Path,
+    cfg_img: Dict[str, Any],
+) -> tuple[Optional[Path], dict[int, dict[str, Any]]]:
+    """
+    Best-effort load `outputs/<image_version>/kfold_swa_metrics.json` produced by `swa_eval_kfold.py`.
+    Returns: (metrics_path_or_none, per_fold_record_by_fold_idx).
+    """
+    ver = str(cfg_img.get("version", "") or "").strip()
+    logging_cfg = dict(cfg_img.get("logging", {}) or {})
+    base_log_dir = resolve_under_repo(repo_root, logging_cfg.get("log_dir", "outputs"))
+    img_log_dir = (base_log_dir / ver) if ver else base_log_dir
+    metrics_path = (img_log_dir / "kfold_swa_metrics.json").resolve()
+    if not metrics_path.is_file():
+        return metrics_path, {}
+
+    try:
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return metrics_path, {}
+
+    per_fold = obj.get("per_fold", []) if isinstance(obj, dict) else []
+    by_fold: dict[int, dict[str, Any]] = {}
+    if isinstance(per_fold, list):
+        for rec in per_fold:
+            if not isinstance(rec, dict):
+                continue
+            fold_raw = rec.get("fold", None)
+            try:
+                fold_idx = int(float(fold_raw))
+            except Exception:
+                continue
+            by_fold[fold_idx] = rec
+    return metrics_path, by_fold
 
 
 def _resolve_versioned_dirs(
@@ -480,6 +602,7 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
         str(tabpfn_params.inference_precision),
         int(tabpfn_params.n_jobs),
     )
+    logger.info("TabPFN postprocess: ratio_strict={}", bool(tabpfn_params.ratio_strict))
     logger.info("TabPFN model_path (local): {}", tabpfn_params.model_path)
 
     finetune_cfg = parse_finetune_config(finetune_cfg_raw)
@@ -494,6 +617,24 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
         logger.info("TabPFN finetune: enabled=false")
 
     fold_feature_meta: list[dict[str, Any]] = []
+
+    # Load image-model SWA k-fold baseline metrics for easy side-by-side comparison.
+    # This is produced by `swa_eval_kfold.py` and should correspond to SWA-averaged
+    # weights stored in each fold's Lightning `last.ckpt`.
+    swa_metrics_path, swa_by_fold = _try_load_kfold_swa_metrics(repo_root=repo_root, cfg_img=cfg_img)
+    if swa_metrics_path is not None and swa_metrics_path.is_file() and swa_by_fold:
+        logger.info(
+            "Loaded image-model SWA k-fold baseline metrics: {} (folds={})",
+            str(swa_metrics_path),
+            len(swa_by_fold),
+        )
+    else:
+        if swa_metrics_path is not None:
+            logger.warning(
+                "Image-model SWA k-fold baseline metrics not found (or empty): {}. "
+                "Will still run TabPFN, but fold logs won't include the SWA baseline r^2.",
+                str(swa_metrics_path),
+            )
 
     # Pre-extract global features once when they are fold-invariant (dinov3_only).
     X_all_global: Optional[np.ndarray] = None
@@ -653,8 +794,37 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
                 raise SystemExit(2) from e
             raise
         y_pred = model.predict(X_val)
+        if bool(tabpfn_params.ratio_strict):
+            from src.tabular.ratio_strict import apply_ratio_strict_5d
 
+            y_pred = apply_ratio_strict_5d(y_pred)
+
+        # Two compatible R^2 variants:
+        # - fold-mean baseline (legacy TabPFN script behaviour)
+        # - global-mean baseline (matches kfold_swa_metrics.json)
         r2, r2_per = weighted_r2_logspace(y_val, y_pred, return_per_target=True)
+        r2_global, r2_per_global = _weighted_r2_logspace_global_baseline(
+            y_val,
+            y_pred,
+            global_targets=y_true_full,
+            return_per_target=True,
+        )
+
+        # Best-effort: pull the SWA baseline fold metric from kfold_swa_metrics.json
+        swa_rec = swa_by_fold.get(int(fold_idx), None)
+        swa_r2: Optional[float] = None
+        swa_used: Optional[bool] = None
+        swa_ckpt: Optional[str] = None
+        try:
+            if isinstance(swa_rec, dict):
+                if swa_rec.get("r2", None) is not None:
+                    swa_r2 = float(swa_rec["r2"])
+                if swa_rec.get("used_swa", None) is not None:
+                    swa_used = bool(swa_rec["used_swa"])
+                if swa_rec.get("ckpt_path", None) is not None:
+                    swa_ckpt = str(swa_rec["ckpt_path"])
+        except Exception:
+            swa_r2 = None
         m = {
             "fold": int(fold_idx),
             "feature_mode": str(image_features_mode),
@@ -662,23 +832,52 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
             "num_train": int(len(train_df)),
             "num_val": int(len(val_df)),
             "r2_weighted": float(r2),
+            "r2_weighted_global": float(r2_global),
             "r2_per_target_logspace": {name: float(r2_per[i]) for i, name in enumerate(TARGETS_5D_ORDER)},
+            "r2_per_target_logspace_global": {name: float(r2_per_global[i]) for i, name in enumerate(TARGETS_5D_ORDER)},
             "tabpfn_model_path_used": str(model_path_for_fold),
             "finetune": finetune_summary,
+            "baseline_image_swa_r2": (None if swa_r2 is None else float(swa_r2)),
+            "baseline_image_swa_used": swa_used,
+            "baseline_image_swa_ckpt_path": swa_ckpt,
         }
         fold_metrics.append(m)
-        logger.info(
-            "Fold {}: train={} val={} weighted_r2(log)={:.6f}",
-            fold_idx,
-            len(train_df),
-            len(val_df),
-            float(r2),
-        )
+        if swa_r2 is not None and np.isfinite(float(swa_r2)):
+            logger.info(
+                "Fold {}: train={} val={}  image(SWA) r2(log,global)={:.6f}  tabpfn r2(log,global)={:.6f}  Δ={:+.6f}",
+                fold_idx,
+                len(train_df),
+                len(val_df),
+                float(swa_r2),
+                float(r2_global),
+                float(r2_global - float(swa_r2)),
+            )
+        else:
+            logger.info(
+                "Fold {}: train={} val={}  tabpfn r2(log,global)={:.6f}",
+                fold_idx,
+                len(train_df),
+                len(val_df),
+                float(r2_global),
+            )
         if tb_writer is not None:
             try:
                 tb_writer.add_scalar("kfold/val/weighted_r2_log", float(r2), int(fold_idx))
+                tb_writer.add_scalar("kfold/val/weighted_r2_log_global", float(r2_global), int(fold_idx))
+                if swa_r2 is not None and np.isfinite(float(swa_r2)):
+                    tb_writer.add_scalar("kfold/val/baseline_image_swa_r2_log_global", float(swa_r2), int(fold_idx))
+                    tb_writer.add_scalar(
+                        "kfold/val/delta_tabpfn_minus_swa_r2_log_global",
+                        float(r2_global - float(swa_r2)),
+                        int(fold_idx),
+                    )
                 for j, name in enumerate(TARGETS_5D_ORDER):
                     tb_writer.add_scalar(f"kfold/val/r2_logspace/{name}", float(r2_per[j]), int(fold_idx))
+                    tb_writer.add_scalar(
+                        f"kfold/val/r2_logspace_global/{name}",
+                        float(r2_per_global[j]),
+                        int(fold_idx),
+                    )
             except Exception:
                 pass
 
@@ -732,6 +931,7 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
             "model_path": str(tabpfn_params.model_path),
             "model_cache_dir": str(tabpfn_params.model_cache_dir) if tabpfn_params.model_cache_dir is not None else None,
             "enable_telemetry": bool(tabpfn_params.enable_telemetry),
+            "ratio_strict": bool(tabpfn_params.ratio_strict),
         },
         "finetune": finetune_cfg_raw,
     }
@@ -757,8 +957,35 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
         kfold_summary = {
             "folds_r2_weighted_mean": float(np.mean([m["r2_weighted"] for m in fold_metrics])) if fold_metrics else None,
             "folds_r2_weighted_std": float(np.std([m["r2_weighted"] for m in fold_metrics])) if fold_metrics else None,
+            "folds_r2_weighted_global_mean": float(np.mean([m["r2_weighted_global"] for m in fold_metrics]))
+            if fold_metrics
+            else None,
+            "folds_r2_weighted_global_std": float(np.std([m["r2_weighted_global"] for m in fold_metrics]))
+            if fold_metrics
+            else None,
             "coverage": coverage,
         }
+        # Optional: also summarize the image-model SWA baseline from kfold_swa_metrics.json (if present).
+        try:
+            baseline_vals = [
+                float(m["baseline_image_swa_r2"])
+                for m in fold_metrics
+                if m.get("baseline_image_swa_r2", None) is not None and np.isfinite(float(m["baseline_image_swa_r2"]))
+            ]
+            delta_vals = [
+                float(m["r2_weighted_global"]) - float(m["baseline_image_swa_r2"])
+                for m in fold_metrics
+                if m.get("baseline_image_swa_r2", None) is not None and np.isfinite(float(m["baseline_image_swa_r2"]))
+            ]
+            kfold_summary["baseline_image_swa_r2_mean"] = float(np.mean(baseline_vals)) if baseline_vals else None
+            kfold_summary["baseline_image_swa_r2_std"] = float(np.std(baseline_vals)) if baseline_vals else None
+            kfold_summary["delta_tabpfn_minus_swa_r2_mean"] = float(np.mean(delta_vals)) if delta_vals else None
+            kfold_summary["delta_tabpfn_minus_swa_r2_std"] = float(np.std(delta_vals)) if delta_vals else None
+        except Exception:
+            kfold_summary["baseline_image_swa_r2_mean"] = None
+            kfold_summary["baseline_image_swa_r2_std"] = None
+            kfold_summary["delta_tabpfn_minus_swa_r2_mean"] = None
+            kfold_summary["delta_tabpfn_minus_swa_r2_std"] = None
 
         if oof_pred is not None:
             ok = np.isfinite(oof_pred).all(axis=1)
@@ -781,6 +1008,23 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
                 "Mean weighted R2 across folds (log-space): {:.6f}",
                 float(kfold_summary["folds_r2_weighted_mean"])
                 if kfold_summary.get("folds_r2_weighted_mean") is not None
+                else float("nan"),
+            )
+        # Global-baseline (matches kfold_swa_metrics.json)
+        if kfold_summary.get("folds_r2_weighted_global_mean", None) is not None:
+            logger.info(
+                "Mean TabPFN weighted R2 across folds (log-space, global baseline): {:.6f}",
+                float(kfold_summary["folds_r2_weighted_global_mean"]),
+            )
+        if kfold_summary.get("baseline_image_swa_r2_mean", None) is not None:
+            logger.info(
+                "Mean image(SWA) vs TabPFN (log-space, global baseline): image={:.6f} tabpfn={:.6f} Δ={:+.6f}",
+                float(kfold_summary["baseline_image_swa_r2_mean"]),
+                float(kfold_summary["folds_r2_weighted_global_mean"])
+                if kfold_summary.get("folds_r2_weighted_global_mean") is not None
+                else float("nan"),
+                float(kfold_summary["delta_tabpfn_minus_swa_r2_mean"])
+                if kfold_summary.get("delta_tabpfn_minus_swa_r2_mean") is not None
                 else float("nan"),
             )
         summary_cfg["kfold"]["artifacts"] = {
@@ -902,6 +1146,10 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
         model = MultiOutputRegressor(base, n_jobs=int(tabpfn_params.n_jobs))
         model.fit(X_train_all, y_train_all)
         y_pred_dummy = model.predict(X_val_dummy)
+        if bool(tabpfn_params.ratio_strict):
+            from src.tabular.ratio_strict import apply_ratio_strict_5d
+
+            y_pred_dummy = apply_ratio_strict_5d(y_pred_dummy)
 
         r2_dummy = float(weighted_r2_logspace(y_val_dummy, y_pred_dummy))
         if not np.isfinite(r2_dummy):

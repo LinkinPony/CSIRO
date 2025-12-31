@@ -1,5 +1,5 @@
 seed: 42
-version: vitdet-320-start-again-detach-pair
+version: vitdet-640-start-again-detach-pair
 data:
   root: data
   train_csv: train.csv
@@ -12,7 +12,7 @@ data:
   # NOTE: `image_size` in this YAML is [W, H] (width, height). The code parses it to (H, W)
   # for torchvision transforms (Resize/RandomResizedCrop), which expect (H, W).
   image_size: [960, 480]
-  batch_size: 8
+  batch_size: 4
   val_batch_size: 1
   num_workers: 20
   prefetch_factor: 4
@@ -306,7 +306,7 @@ model:
     #           and averages the final outputs)
     type: vitdet
     # ViTDet settings (SimpleFeaturePyramid-style):
-    vitdet_dim: 320
+    vitdet_dim: 640
     vitdet_patch_size: 16
     # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
     vitdet_scale_factors: [4.0, 2.0, 1.0, 0.5]
