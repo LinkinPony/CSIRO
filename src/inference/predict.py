@@ -286,85 +286,129 @@ def predict_from_features(
     layer_weights: Optional[torch.Tensor] = None,
     mc_dropout_enabled: bool = False,
     mc_dropout_samples: int = 1,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     # For model-parallel backbone inference, prefer placing the head on stage1.
     mp_devs = mp_get_devices_from_backbone(head) if isinstance(head, nn.Module) else None
     device = mp_devs[1] if mp_devs is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     head = head.eval().to(device)
-    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
         _enable_dropout_only_train_mode(head, enabled=True)
     N = features_cpu.shape[0]
-    preds_list: List[torch.Tensor] = []
+    preds_main_list: List[torch.Tensor] = []
+    preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
     head_dtype = module_param_dtype(head, default=torch.float32)
     with torch.inference_mode():
         for i in range(0, N, max(1, batch_size)):
             chunk = features_cpu[i : i + max(1, batch_size)].to(device, non_blocking=True, dtype=head_dtype)
             k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
-            out_sum = None
+            B = int(chunk.shape[0])
+            has_ratio = bool(head_num_ratio > 0 and head_total == head_num_main + head_num_ratio)
+            use_layers = bool(use_layerwise_heads) and int(num_layers) > 1
+
+            # Normalize layer fusion weights (float32 for stable var accumulation).
+            w = (
+                _normalize_layer_weights(
+                    layer_weights,
+                    num_layers=int(num_layers),
+                    device=torch.device(device) if not isinstance(device, torch.device) else device,
+                    dtype=torch.float32,
+                )
+                if use_layers
+                else None
+            )
+
+            main_sum = None
+            main_sq_sum = None
+            ratio_sum = None
+            ratio_sq_sum = None
+
             for _ in range(k):
                 out_k = head(chunk)
-                out_sum = out_k if out_sum is None else (out_sum + out_k)
-            out_mean = out_sum / float(k)  # type: ignore[operator]
-            preds_list.append(out_mean.detach().cpu().float())
-    if not preds_list:
+                out_f = out_k.float()
+
+                if not use_layers:
+                    # Legacy single-layer outputs.
+                    if has_ratio:
+                        main_k = out_f[:, :head_num_main]
+                        ratio_k = out_f[:, head_num_main : head_num_main + head_num_ratio]
+                    else:
+                        main_k = out_f
+                        ratio_k = None
+                else:
+                    # Layer-wise packed outputs: fuse per-sample so MC var reflects the fused prediction.
+                    if has_ratio:
+                        expected_dim = head_total * num_layers
+                        if out_f.shape[1] != expected_dim:
+                            raise RuntimeError(
+                                f"Unexpected packed head dimension: got {out_f.shape[1]}, expected {expected_dim}"
+                            )
+                        out_L = out_f.view(B, num_layers, head_total)
+                        main_layers = out_L[:, :, :head_num_main]
+                        ratio_layers = out_L[:, :, head_num_main : head_num_main + head_num_ratio]
+                        if w is None:
+                            main_k = main_layers.mean(dim=1)
+                            ratio_k = ratio_layers.mean(dim=1)
+                        else:
+                            main_k = (main_layers * w.view(1, num_layers, 1)).sum(dim=1)
+                            ratio_k = (ratio_layers * w.view(1, num_layers, 1)).sum(dim=1)
+                    else:
+                        expected_dim = head_num_main * num_layers
+                        if out_f.shape[1] != expected_dim:
+                            raise RuntimeError(
+                                f"Unexpected packed head dimension (no-ratio): got {out_f.shape[1]}, expected {expected_dim}"
+                            )
+                        out_L = out_f.view(B, num_layers, head_num_main)
+                        if w is None:
+                            main_k = out_L.mean(dim=1)
+                        else:
+                            main_k = (out_L * w.view(1, num_layers, 1)).sum(dim=1)
+                        ratio_k = None
+
+                main_sum = main_k if main_sum is None else (main_sum + main_k)
+                if compute_var:
+                    main_sq = main_k * main_k
+                    main_sq_sum = main_sq if main_sq_sum is None else (main_sq_sum + main_sq)
+
+                if ratio_k is not None:
+                    ratio_sum = ratio_k if ratio_sum is None else (ratio_sum + ratio_k)
+                    if compute_var:
+                        ratio_sq = ratio_k * ratio_k
+                        ratio_sq_sum = ratio_sq if ratio_sq_sum is None else (ratio_sq_sum + ratio_sq)
+
+            main_mean = main_sum / float(k)  # type: ignore[operator]
+            preds_main_list.append(main_mean.detach().cpu().float())
+            if compute_var and main_sq_sum is not None:
+                main_var = (main_sq_sum / float(k)) - (main_mean * main_mean)
+                preds_main_var_list.append(main_var.clamp_min(0.0).detach().cpu().float())
+
+            if ratio_sum is not None:
+                ratio_mean = ratio_sum / float(k)
+                preds_ratio_list.append(ratio_mean.detach().cpu().float())
+                if compute_var and ratio_sq_sum is not None:
+                    ratio_var = (ratio_sq_sum / float(k)) - (ratio_mean * ratio_mean)
+                    preds_ratio_var_list.append(ratio_var.clamp_min(0.0).detach().cpu().float())
+
+    if not preds_main_list:
         empty_main = torch.empty((0, head_num_main), dtype=torch.float32)
         empty_ratio = torch.empty((0, head_num_ratio), dtype=torch.float32) if head_num_ratio > 0 else None
-        return empty_main, empty_ratio
+        return empty_main, empty_ratio, None, None
 
-    preds_all = torch.cat(preds_list, dim=0)  # (N, D)
+    preds_main = torch.cat(preds_main_list, dim=0)
+    preds_ratio: Optional[torch.Tensor] = None
+    if head_num_ratio > 0 and preds_ratio_list:
+        preds_ratio = torch.cat(preds_ratio_list, dim=0)
 
-    # Legacy_single-layer: interpret outputs directly.
-    if not use_layerwise_heads or num_layers <= 1:
-        if head_num_ratio > 0 and head_total == head_num_main + head_num_ratio:
-            preds_main = preds_all[:, :head_num_main]
-            preds_ratio = preds_all[:, head_num_main : head_num_main + head_num_ratio]
-        else:
-            preds_main = preds_all
-            preds_ratio = None
-        return preds_main, preds_ratio
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
 
-    # Layer-wise packed outputs: final linear layer concatenates per-layer
-    # [main, ratio] predictions along the feature dimension.
-    if head_num_ratio > 0 and head_total == head_num_main + head_num_ratio:
-        # preds_all: (N, head_total * num_layers)
-        if preds_all.shape[1] != head_total * num_layers:
-            raise RuntimeError(
-                f"Unexpected packed head dimension: got {preds_all.shape[1]}, "
-                f"expected {head_total * num_layers}"
-            )
-        preds_all_L = preds_all.view(N, num_layers, head_total)
-        main_layers = preds_all_L[:, :, :head_num_main]  # (N, L, head_num_main)
-        ratio_layers = preds_all_L[:, :, head_num_main : head_num_main + head_num_ratio]  # (N, L, head_num_ratio)
-        w = _normalize_layer_weights(
-            layer_weights,
-            num_layers=num_layers,
-            device=main_layers.device,
-            dtype=main_layers.dtype,
-        )
-        if w is None:
-            preds_main = main_layers.mean(dim=1)  # (N, head_num_main)
-            preds_ratio = ratio_layers.mean(dim=1)  # (N, head_num_ratio)
-        else:
-            preds_main = (main_layers * w.view(1, num_layers, 1)).sum(dim=1)
-            preds_ratio = (ratio_layers * w.view(1, num_layers, 1)).sum(dim=1)
-    else:
-        # No dedicated ratio outputs: only main predictions are packed.
-        if preds_all.shape[1] != head_num_main * num_layers:
-            raise RuntimeError(
-                f"Unexpected packed head dimension (no-ratio): got {preds_all.shape[1]}, "
-                f"expected {head_num_main * num_layers}"
-            )
-        preds_all_L = preds_all.view(N, num_layers, head_num_main)
-        w = _normalize_layer_weights(
-            layer_weights,
-            num_layers=num_layers,
-            device=preds_all_L.device,
-            dtype=preds_all_L.dtype,
-        )
-        preds_main = preds_all_L.mean(dim=1) if w is None else (preds_all_L * w.view(1, num_layers, 1)).sum(dim=1)
-        preds_ratio = None
-
-    return preds_main, preds_ratio
+    return preds_main, preds_ratio, preds_main_var, preds_ratio_var
 
 
 def predict_main_and_ratio_patch_mode(
@@ -390,7 +434,7 @@ def predict_main_and_ratio_patch_mode(
     mc_dropout_samples: int = 1,
     hflip: bool = False,
     vflip: bool = False,
-) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Patch-mode inference for a single head:
       - For each image, obtain CLS and patch tokens from the DINO backbone.
@@ -429,13 +473,16 @@ def predict_main_and_ratio_patch_mode(
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     # Place head on stage1 to avoid copying patch tokens back to cuda:0.
     head = head.eval().to(device1)
-    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
         _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
     preds_main_list: List[torch.Tensor] = []
     preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
 
     with torch.inference_mode():
         for images, rel_paths in dl:
@@ -449,6 +496,8 @@ def predict_main_and_ratio_patch_mode(
 
                 main_layers_batch: List[torch.Tensor] = []
                 ratio_layers_batch: List[torch.Tensor] = []
+                main_layers_var_batch: List[torch.Tensor] = []
+                ratio_layers_var_batch: List[torch.Tensor] = []
 
                 for l_idx, (cls_l, pt_l) in enumerate(zip(cls_list, pt_list)):
                     _ = cls_l  # CLS not used in patch-mode
@@ -460,14 +509,30 @@ def predict_main_and_ratio_patch_mode(
                         pt_l = pt_l.to(device1, non_blocking=True, dtype=head_dtype)
                         k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
                         main_sum = None
+                        main_sq_sum = None
                         ratio_sum = None
+                        ratio_sq_sum = None
                         for _ in range(k):
                             layer_main_k, layer_ratio_k = head.forward_patch_layer(pt_l, l_idx)
-                            main_sum = layer_main_k if main_sum is None else (main_sum + layer_main_k)
-                            if layer_ratio_k is not None:
-                                ratio_sum = layer_ratio_k if ratio_sum is None else (ratio_sum + layer_ratio_k)
+                            mk = layer_main_k.float()
+                            main_sum = mk if main_sum is None else (main_sum + mk)
+                            if compute_var:
+                                msq = mk * mk
+                                main_sq_sum = msq if main_sq_sum is None else (main_sq_sum + msq)
+                            if head_num_ratio > 0 and layer_ratio_k is not None:
+                                rk = layer_ratio_k.float()
+                                ratio_sum = rk if ratio_sum is None else (ratio_sum + rk)
+                                if compute_var:
+                                    rsq = rk * rk
+                                    ratio_sq_sum = rsq if ratio_sq_sum is None else (ratio_sq_sum + rsq)
                         layer_main = main_sum / float(k)  # type: ignore[operator]
+                        layer_main_var = None
+                        if compute_var and main_sq_sum is not None:
+                            layer_main_var = ((main_sq_sum / float(k)) - (layer_main * layer_main)).clamp_min(0.0)
                         layer_ratio = (ratio_sum / float(k)) if ratio_sum is not None else None
+                        layer_ratio_var = None
+                        if compute_var and ratio_sq_sum is not None and layer_ratio is not None:
+                            layer_ratio_var = ((ratio_sq_sum / float(k)) - (layer_ratio * layer_ratio)).clamp_min(0.0)
                     else:
                         expected_dim = head_total * num_layers
                         offset = l_idx * head_total
@@ -475,42 +540,64 @@ def predict_main_and_ratio_patch_mode(
                         if head_num_main > 0:
                             patch_features_flat = pt_l.reshape(B * N, C).to(device1, non_blocking=True, dtype=head_dtype)  # (B*N, C)
                             k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
-                            out_sum = None
+                            main_sum = None
+                            main_sq_sum = None
                             for _ in range(k):
                                 out_k = head(patch_features_flat)  # (B*N, head_total * L)
-                                out_sum = out_k if out_sum is None else (out_sum + out_k)
-                            out_all_patch = out_sum / float(k)  # type: ignore[operator]
-                            if out_all_patch.shape[1] != expected_dim:
-                                raise RuntimeError(
-                                    f"Unexpected packed head dimension in patch-mode multi-layer: got {out_all_patch.shape[1]}, "
-                                    f"expected {expected_dim}"
-                                )
-                            layer_slice = out_all_patch[:, offset : offset + head_total]  # (B*N, head_total)
-                            layer_main = layer_slice[:, :head_num_main].view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+                                out_f = out_k.float()
+                                if out_f.shape[1] != expected_dim:
+                                    raise RuntimeError(
+                                        f"Unexpected packed head dimension in patch-mode multi-layer: got {out_f.shape[1]}, "
+                                        f"expected {expected_dim}"
+                                    )
+                                layer_slice = out_f[:, offset : offset + head_total]  # (B*N, head_total)
+                                main_k = layer_slice[:, :head_num_main].view(B, N, head_num_main).mean(dim=1)  # (B, head_num_main)
+                                main_sum = main_k if main_sum is None else (main_sum + main_k)
+                                if compute_var:
+                                    msq = main_k * main_k
+                                    main_sq_sum = msq if main_sq_sum is None else (main_sq_sum + msq)
+                            layer_main = main_sum / float(k)  # type: ignore[operator]
+                            layer_main_var = None
+                            if compute_var and main_sq_sum is not None:
+                                layer_main_var = ((main_sq_sum / float(k)) - (layer_main * layer_main)).clamp_min(0.0)
                         else:
                             layer_main = torch.empty((B, 0), dtype=torch.float32, device=device)
+                            layer_main_var = torch.empty((B, 0), dtype=torch.float32, device=device) if compute_var else None
 
                         if head_num_ratio > 0:
                             patch_mean_l = pt_l.mean(dim=1).to(device1, non_blocking=True, dtype=head_dtype)  # (B, C)
                             k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
-                            out_sum_g = None
+                            ratio_sum = None
+                            ratio_sq_sum = None
                             for _ in range(k):
                                 out_k_g = head(patch_mean_l)  # (B, head_total * L)
-                                out_sum_g = out_k_g if out_sum_g is None else (out_sum_g + out_k_g)
-                            out_all_global = out_sum_g / float(k)  # type: ignore[operator]
-                            if out_all_global.shape[1] != expected_dim:
-                                raise RuntimeError(
-                                    f"Unexpected packed head dimension for ratio logits in patch-mode multi-layer: got {out_all_global.shape[1]}, "
-                                    f"expected {expected_dim}"
-                                )
-                            layer_slice_g = out_all_global[:, offset : offset + head_total]  # (B, head_total)
-                            layer_ratio = layer_slice_g[:, head_num_main : head_num_main + head_num_ratio]
+                                out_f_g = out_k_g.float()
+                                if out_f_g.shape[1] != expected_dim:
+                                    raise RuntimeError(
+                                        f"Unexpected packed head dimension for ratio logits in patch-mode multi-layer: got {out_f_g.shape[1]}, "
+                                        f"expected {expected_dim}"
+                                    )
+                                layer_slice_g = out_f_g[:, offset : offset + head_total]  # (B, head_total)
+                                ratio_k = layer_slice_g[:, head_num_main : head_num_main + head_num_ratio]
+                                ratio_sum = ratio_k if ratio_sum is None else (ratio_sum + ratio_k)
+                                if compute_var:
+                                    rsq = ratio_k * ratio_k
+                                    ratio_sq_sum = rsq if ratio_sq_sum is None else (ratio_sq_sum + rsq)
+                            layer_ratio = ratio_sum / float(k)  # type: ignore[operator]
+                            layer_ratio_var = None
+                            if compute_var and ratio_sq_sum is not None:
+                                layer_ratio_var = ((ratio_sq_sum / float(k)) - (layer_ratio * layer_ratio)).clamp_min(0.0)
                         else:
                             layer_ratio = None
+                            layer_ratio_var = None
 
                     main_layers_batch.append(layer_main)
+                    if compute_var and layer_main_var is not None:
+                        main_layers_var_batch.append(layer_main_var)
                     if layer_ratio is not None:
                         ratio_layers_batch.append(layer_ratio)
+                        if compute_var and layer_ratio_var is not None:
+                            ratio_layers_var_batch.append(layer_ratio_var)
 
                 # Average over layers
                 if len(main_layers_batch) > 0:
@@ -524,6 +611,16 @@ def predict_main_and_ratio_patch_mode(
                     out_main_patch = main_stack.mean(dim=0) if w is None else (main_stack * w.view(-1, 1, 1)).sum(dim=0)
                 else:
                     out_main_patch = torch.empty((images.size(0), 0), dtype=torch.float32, device=device)
+                    w = None
+
+                out_main_var = None
+                if compute_var and len(main_layers_var_batch) == len(main_layers_batch) and len(main_layers_var_batch) > 0:
+                    main_var_stack = torch.stack(main_layers_var_batch, dim=0)  # (L,B,D)
+                    L = int(main_var_stack.shape[0])
+                    if w is None:
+                        out_main_var = main_var_stack.mean(dim=0) / float(max(1, L))
+                    else:
+                        out_main_var = (main_var_stack * (w.view(-1, 1, 1) ** 2)).sum(dim=0)
 
                 if head_num_ratio > 0 and len(ratio_layers_batch) > 0:
                     ratio_stack = torch.stack(ratio_layers_batch, dim=0)  # (K,B,R)
@@ -536,6 +633,21 @@ def predict_main_and_ratio_patch_mode(
                     out_ratio = ratio_stack.mean(dim=0) if w is None else (ratio_stack * w.view(-1, 1, 1)).sum(dim=0)
                 else:
                     out_ratio = None
+                    w = None
+
+                out_ratio_var = None
+                if (
+                    compute_var
+                    and out_ratio is not None
+                    and len(ratio_layers_var_batch) == len(ratio_layers_batch)
+                    and len(ratio_layers_var_batch) > 0
+                ):
+                    ratio_var_stack = torch.stack(ratio_layers_var_batch, dim=0)  # (L,B,R)
+                    Lr = int(ratio_var_stack.shape[0])
+                    if w is None:
+                        out_ratio_var = ratio_var_stack.mean(dim=0) / float(max(1, Lr))
+                    else:
+                        out_ratio_var = (ratio_var_stack * (w.view(-1, 1, 1) ** 2)).sum(dim=0)
 
             else:
                 # Legacy single-layer path: use last-layer patch tokens only.
@@ -547,31 +659,53 @@ def predict_main_and_ratio_patch_mode(
                 if head_num_main > 0:
                     patch_features_flat = pt.reshape(B * N, C).to(device1, non_blocking=True, dtype=head_dtype)  # (B*N, C)
                     k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
-                    out_sum = None
+                    main_sum = None
+                    main_sq_sum = None
                     for _ in range(k):
                         out_k = head(patch_features_flat)  # (B*N, head_total)
-                        out_sum = out_k if out_sum is None else (out_sum + out_k)
-                    out_all_patch = out_sum / float(k)  # type: ignore[operator]
-                    out_main_patch = out_all_patch[:, :head_num_main].view(B, N, head_num_main).mean(dim=1)
+                        out_f = out_k.float()
+                        main_k = out_f[:, :head_num_main].view(B, N, head_num_main).mean(dim=1)
+                        main_sum = main_k if main_sum is None else (main_sum + main_k)
+                        if compute_var:
+                            msq = main_k * main_k
+                            main_sq_sum = msq if main_sq_sum is None else (main_sq_sum + msq)
+                    out_main_patch = main_sum / float(k)  # type: ignore[operator]
+                    out_main_var = None
+                    if compute_var and main_sq_sum is not None:
+                        out_main_var = ((main_sq_sum / float(k)) - (out_main_patch * out_main_patch)).clamp_min(0.0)
                 else:
                     out_main_patch = torch.empty((B, 0), dtype=torch.float32, device=device)
+                    out_main_var = torch.empty((B, 0), dtype=torch.float32, device=device) if compute_var else None
 
                 # Ratio logits from global patch-mean
                 if head_num_ratio > 0:
                     patch_mean = pt.mean(dim=1).to(device1, non_blocking=True, dtype=head_dtype)  # (B, C)
                     k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
-                    out_sum_g = None
+                    ratio_sum = None
+                    ratio_sq_sum = None
                     for _ in range(k):
                         out_k_g = head(patch_mean)  # (B, head_total)
-                        out_sum_g = out_k_g if out_sum_g is None else (out_sum_g + out_k_g)
-                    out_all_global = out_sum_g / float(k)  # type: ignore[operator]
-                    out_ratio = out_all_global[:, head_num_main : head_num_main + head_num_ratio]
+                        out_f_g = out_k_g.float()
+                        ratio_k = out_f_g[:, head_num_main : head_num_main + head_num_ratio]
+                        ratio_sum = ratio_k if ratio_sum is None else (ratio_sum + ratio_k)
+                        if compute_var:
+                            rsq = ratio_k * ratio_k
+                            ratio_sq_sum = rsq if ratio_sq_sum is None else (ratio_sq_sum + rsq)
+                    out_ratio = ratio_sum / float(k)  # type: ignore[operator]
+                    out_ratio_var = None
+                    if compute_var and ratio_sq_sum is not None:
+                        out_ratio_var = ((ratio_sq_sum / float(k)) - (out_ratio * out_ratio)).clamp_min(0.0)
                 else:
                     out_ratio = None
+                    out_ratio_var = None
 
             preds_main_list.append(out_main_patch.detach().cpu().float())
+            if compute_var and out_main_var is not None:
+                preds_main_var_list.append(out_main_var.detach().cpu().float())
             if out_ratio is not None:
                 preds_ratio_list.append(out_ratio.detach().cpu().float())
+                if compute_var and out_ratio_var is not None:
+                    preds_ratio_var_list.append(out_ratio_var.detach().cpu().float())
             rels.extend(list(rel_paths))
 
     preds_main = torch.cat(preds_main_list, dim=0) if preds_main_list else torch.empty((0, head_num_main), dtype=torch.float32)
@@ -580,7 +714,250 @@ def predict_main_and_ratio_patch_mode(
         preds_ratio = torch.cat(preds_ratio_list, dim=0)
     else:
         preds_ratio = None
-    return rels, preds_main, preds_ratio
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
+    return rels, preds_main, preds_ratio, preds_main_var, preds_ratio_var
+
+
+def predict_main_and_ratio_dual_branch(
+    backbone: nn.Module,
+    head: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: Tuple[int, int],
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+    head_num_main: int,
+    head_num_ratio: int,
+    *,
+    use_layerwise_heads: bool,
+    num_layers: int,
+    layer_indices: Optional[List[int]] = None,
+    layer_weights: Optional[torch.Tensor] = None,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
+    hflip: bool = False,
+    vflip: bool = False,
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Dual-branch inference (MLP patch-mode + global CLS+mean(patch) branch) for a single head:
+      - Patch branch : per-patch predictions averaged over patches
+      - Global branch: prediction from CLS+mean(patch)
+      - Fusion       : y = a*y_global + (1-a)*y_patch (alpha lives inside the head module)
+
+    Notes:
+      - Requires an exported head that implements `forward_fused_layer(cls, pt, layer_idx)`.
+      - Supports multi-layer backbones by fusing layer outputs using `layer_weights` when provided.
+    """
+    mp_devs = mp_get_devices_from_backbone(backbone) if isinstance(backbone, nn.Module) else None
+    device0 = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device1 = mp_devs[1] if mp_devs is not None else device0
+    device = device1
+
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    feature_extractor = DinoV3FeatureExtractor(backbone)
+    feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
+    head = head.eval().to(device1)
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
+        _enable_dropout_only_train_mode(head, enabled=True)
+    head_dtype = module_param_dtype(head, default=torch.float32)
+
+    rels: List[str] = []
+    preds_main_list: List[torch.Tensor] = []
+    preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
+
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device0, non_blocking=True)
+
+            if bool(use_layerwise_heads) and int(num_layers) > 1 and layer_indices is not None and len(layer_indices) > 0:
+                cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
+                if len(cls_list) != len(pt_list) or len(cls_list) != int(num_layers):
+                    raise RuntimeError("Mismatch between CLS/patch token lists and num_layers in dual-branch inference")
+
+                main_layers_batch: List[torch.Tensor] = []
+                ratio_layers_batch: List[torch.Tensor] = []
+                main_layers_var_batch: List[torch.Tensor] = []
+                ratio_layers_var_batch: List[torch.Tensor] = []
+
+                for l_idx, (cls_l, pt_l) in enumerate(zip(cls_list, pt_list)):
+                    if pt_l.dim() != 3:
+                        raise RuntimeError(f"Unexpected patch tokens shape in dual-branch inference: {tuple(pt_l.shape)}")
+
+                    cls_l = cls_l.to(device1, non_blocking=True, dtype=head_dtype)
+                    pt_l = pt_l.to(device1, non_blocking=True, dtype=head_dtype)
+
+                    k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                    main_sum = None
+                    main_sq_sum = None
+                    ratio_sum = None
+                    ratio_sq_sum = None
+
+                    for _ in range(k):
+                        main_k, ratio_k = head.forward_fused_layer(cls_l, pt_l, int(l_idx))  # type: ignore[attr-defined]
+                        mk = main_k.float()
+                        main_sum = mk if main_sum is None else (main_sum + mk)
+                        if compute_var:
+                            msq = mk * mk
+                            main_sq_sum = msq if main_sq_sum is None else (main_sq_sum + msq)
+                        if head_num_ratio > 0 and ratio_k is not None:
+                            rk = ratio_k.float()
+                            ratio_sum = rk if ratio_sum is None else (ratio_sum + rk)
+                            if compute_var:
+                                rsq = rk * rk
+                                ratio_sq_sum = rsq if ratio_sq_sum is None else (ratio_sq_sum + rsq)
+
+                    layer_main = main_sum / float(k)  # type: ignore[operator]
+                    layer_main_var = None
+                    if compute_var and main_sq_sum is not None:
+                        layer_main_var = ((main_sq_sum / float(k)) - (layer_main * layer_main)).clamp_min(0.0)
+
+                    layer_ratio = (ratio_sum / float(k)) if ratio_sum is not None else None
+                    layer_ratio_var = None
+                    if compute_var and ratio_sq_sum is not None and layer_ratio is not None:
+                        layer_ratio_var = ((ratio_sq_sum / float(k)) - (layer_ratio * layer_ratio)).clamp_min(0.0)
+
+                    main_layers_batch.append(layer_main)
+                    if compute_var and layer_main_var is not None:
+                        main_layers_var_batch.append(layer_main_var)
+                    if layer_ratio is not None:
+                        ratio_layers_batch.append(layer_ratio)
+                        if compute_var and layer_ratio_var is not None:
+                            ratio_layers_var_batch.append(layer_ratio_var)
+
+                # Fuse across layers
+                if main_layers_batch:
+                    main_stack = torch.stack(main_layers_batch, dim=0)  # (L,B,D)
+                    w = _normalize_layer_weights(
+                        layer_weights,
+                        num_layers=int(main_stack.shape[0]),
+                        device=main_stack.device,
+                        dtype=main_stack.dtype,
+                    )
+                    out_main = main_stack.mean(dim=0) if w is None else (main_stack * w.view(-1, 1, 1)).sum(dim=0)
+                else:
+                    out_main = torch.empty((images.size(0), 0), dtype=torch.float32, device=device)
+                    w = None
+
+                out_main_var = None
+                if compute_var and len(main_layers_var_batch) == len(main_layers_batch) and main_layers_var_batch:
+                    main_var_stack = torch.stack(main_layers_var_batch, dim=0)  # (L,B,D)
+                    L = int(main_var_stack.shape[0])
+                    if w is None:
+                        out_main_var = main_var_stack.mean(dim=0) / float(max(1, L))
+                    else:
+                        out_main_var = (main_var_stack * (w.view(-1, 1, 1) ** 2)).sum(dim=0)
+
+                if head_num_ratio > 0 and ratio_layers_batch:
+                    ratio_stack = torch.stack(ratio_layers_batch, dim=0)  # (K,B,R)
+                    w_r = _normalize_layer_weights(
+                        layer_weights,
+                        num_layers=int(ratio_stack.shape[0]),
+                        device=ratio_stack.device,
+                        dtype=ratio_stack.dtype,
+                    )
+                    out_ratio = ratio_stack.mean(dim=0) if w_r is None else (ratio_stack * w_r.view(-1, 1, 1)).sum(dim=0)
+                else:
+                    out_ratio = None
+                    w_r = None
+
+                out_ratio_var = None
+                if (
+                    compute_var
+                    and out_ratio is not None
+                    and len(ratio_layers_var_batch) == len(ratio_layers_batch)
+                    and ratio_layers_var_batch
+                ):
+                    ratio_var_stack = torch.stack(ratio_layers_var_batch, dim=0)  # (L,B,R)
+                    Lr = int(ratio_var_stack.shape[0])
+                    if w_r is None:
+                        out_ratio_var = ratio_var_stack.mean(dim=0) / float(max(1, Lr))
+                    else:
+                        out_ratio_var = (ratio_var_stack * (w_r.view(-1, 1, 1) ** 2)).sum(dim=0)
+
+            else:
+                # Single-layer path
+                cls, pt = feature_extractor.forward_cls_and_tokens(images)
+                if pt.dim() != 3:
+                    raise RuntimeError(f"Unexpected patch tokens shape in dual-branch inference: {tuple(pt.shape)}")
+                cls = cls.to(device1, non_blocking=True, dtype=head_dtype)
+                pt = pt.to(device1, non_blocking=True, dtype=head_dtype)
+
+                k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+                main_sum = None
+                main_sq_sum = None
+                ratio_sum = None
+                ratio_sq_sum = None
+                for _ in range(k):
+                    main_k, ratio_k = head.forward_fused_layer(cls, pt, 0)  # type: ignore[attr-defined]
+                    mk = main_k.float()
+                    main_sum = mk if main_sum is None else (main_sum + mk)
+                    if compute_var:
+                        msq = mk * mk
+                        main_sq_sum = msq if main_sq_sum is None else (main_sq_sum + msq)
+                    if head_num_ratio > 0 and ratio_k is not None:
+                        rk = ratio_k.float()
+                        ratio_sum = rk if ratio_sum is None else (ratio_sum + rk)
+                        if compute_var:
+                            rsq = rk * rk
+                            ratio_sq_sum = rsq if ratio_sq_sum is None else (ratio_sq_sum + rsq)
+
+                out_main = main_sum / float(k)  # type: ignore[operator]
+                out_main_var = None
+                if compute_var and main_sq_sum is not None:
+                    out_main_var = ((main_sq_sum / float(k)) - (out_main * out_main)).clamp_min(0.0)
+
+                out_ratio = (ratio_sum / float(k)) if ratio_sum is not None else None
+                out_ratio_var = None
+                if compute_var and ratio_sq_sum is not None and out_ratio is not None:
+                    out_ratio_var = ((ratio_sq_sum / float(k)) - (out_ratio * out_ratio)).clamp_min(0.0)
+
+            preds_main_list.append(out_main.detach().cpu().float())
+            if compute_var and out_main_var is not None:
+                preds_main_var_list.append(out_main_var.detach().cpu().float())
+            if out_ratio is not None:
+                preds_ratio_list.append(out_ratio.detach().cpu().float())
+                if compute_var and out_ratio_var is not None:
+                    preds_ratio_var_list.append(out_ratio_var.detach().cpu().float())
+            rels.extend(list(rel_paths))
+
+    preds_main = torch.cat(preds_main_list, dim=0) if preds_main_list else torch.empty((0, head_num_main), dtype=torch.float32)
+    preds_ratio: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_list:
+        preds_ratio = torch.cat(preds_ratio_list, dim=0)
+    else:
+        preds_ratio = None
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
+    return rels, preds_main, preds_ratio, preds_main_var, preds_ratio_var
 
 
 def predict_main_and_ratio_fpn(
@@ -602,7 +979,7 @@ def predict_main_and_ratio_fpn(
     mc_dropout_samples: int = 1,
     hflip: bool = False,
     vflip: bool = False,
-) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     FPN-head inference (Phase A).
     """
@@ -630,13 +1007,16 @@ def predict_main_and_ratio_fpn(
     feature_extractor = DinoV3FeatureExtractor(backbone)
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     head = head.eval().to(device1)
-    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
         _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
     preds_main_list: List[torch.Tensor] = []
     preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
 
     with torch.inference_mode():
         for images, rel_paths in dl:
@@ -656,7 +1036,9 @@ def predict_main_and_ratio_fpn(
 
             k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
             reg3_sum = None
+            reg3_sq_sum = None
             ratio_sum = None
+            ratio_sq_sum = None
             for _ in range(k):
                 if head_in[0] == "list":
                     out = head(head_in[1], image_hw=(H, W))  # type: ignore[call-arg]
@@ -668,15 +1050,29 @@ def predict_main_and_ratio_fpn(
                 ratio = out.get("ratio", None)
                 if reg3 is None:
                     raise RuntimeError("FPN head did not return 'reg3'")
-                reg3_sum = reg3 if reg3_sum is None else (reg3_sum + reg3)
+                reg3_f = reg3.float()
+                reg3_sum = reg3_f if reg3_sum is None else (reg3_sum + reg3_f)
+                if compute_var:
+                    reg3_sq = reg3_f * reg3_f
+                    reg3_sq_sum = reg3_sq if reg3_sq_sum is None else (reg3_sq_sum + reg3_sq)
                 if head_num_ratio > 0 and ratio is not None:
-                    ratio_sum = ratio if ratio_sum is None else (ratio_sum + ratio)
+                    ratio_f = ratio.float()
+                    ratio_sum = ratio_f if ratio_sum is None else (ratio_sum + ratio_f)
+                    if compute_var:
+                        ratio_sq = ratio_f * ratio_f
+                        ratio_sq_sum = ratio_sq if ratio_sq_sum is None else (ratio_sq_sum + ratio_sq)
 
             reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
             preds_main_list.append(reg3_mean.detach().cpu().float())
+            if compute_var and reg3_sq_sum is not None:
+                reg3_var = (reg3_sq_sum / float(k)) - (reg3_mean * reg3_mean)
+                preds_main_var_list.append(reg3_var.clamp_min(0.0).detach().cpu().float())
             if head_num_ratio > 0 and ratio_sum is not None:
                 ratio_mean = ratio_sum / float(k)
                 preds_ratio_list.append(ratio_mean.detach().cpu().float())
+                if compute_var and ratio_sq_sum is not None:
+                    ratio_var = (ratio_sq_sum / float(k)) - (ratio_mean * ratio_mean)
+                    preds_ratio_var_list.append(ratio_var.clamp_min(0.0).detach().cpu().float())
 
             rels.extend(list(rel_paths))
 
@@ -686,7 +1082,13 @@ def predict_main_and_ratio_fpn(
         preds_ratio = torch.cat(preds_ratio_list, dim=0)
     else:
         preds_ratio = None
-    return rels, preds_main, preds_ratio
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
+    return rels, preds_main, preds_ratio, preds_main_var, preds_ratio_var
 
 
 def predict_main_and_ratio_vitdet(
@@ -711,6 +1113,8 @@ def predict_main_and_ratio_vitdet(
 ) -> Tuple[
     List[str],
     torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
@@ -742,13 +1146,16 @@ def predict_main_and_ratio_vitdet(
     feature_extractor = DinoV3FeatureExtractor(backbone)
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     head = head.eval().to(device1)
-    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
         _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
     preds_main_list: List[torch.Tensor] = []
     preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
     preds_main_layers_list: List[torch.Tensor] = []
     preds_ratio_layers_list: List[torch.Tensor] = []
 
@@ -770,7 +1177,9 @@ def predict_main_and_ratio_vitdet(
 
             k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
             reg3_sum = None
+            reg3_sq_sum = None
             ratio_sum = None
+            ratio_sq_sum = None
             reg3_layers_sum = None
             ratio_layers_sum = None
             for _ in range(k):
@@ -786,9 +1195,17 @@ def predict_main_and_ratio_vitdet(
                 ratio_layers = out.get("ratio_layers", None)
                 if reg3 is None:
                     raise RuntimeError("ViTDet head did not return 'reg3'")
-                reg3_sum = reg3 if reg3_sum is None else (reg3_sum + reg3)
+                reg3_f = reg3.float()
+                reg3_sum = reg3_f if reg3_sum is None else (reg3_sum + reg3_f)
+                if compute_var:
+                    reg3_sq = reg3_f * reg3_f
+                    reg3_sq_sum = reg3_sq if reg3_sq_sum is None else (reg3_sq_sum + reg3_sq)
                 if head_num_ratio > 0 and ratio is not None:
-                    ratio_sum = ratio if ratio_sum is None else (ratio_sum + ratio)
+                    ratio_f = ratio.float()
+                    ratio_sum = ratio_f if ratio_sum is None else (ratio_sum + ratio_f)
+                    if compute_var:
+                        ratio_sq = ratio_f * ratio_f
+                        ratio_sq_sum = ratio_sq if ratio_sq_sum is None else (ratio_sq_sum + ratio_sq)
                 # Optional per-layer outputs (multi-layer ViTDet): keep as (B, L, D).
                 if isinstance(reg3_layers, list) and len(reg3_layers) > 0:
                     try:
@@ -817,9 +1234,15 @@ def predict_main_and_ratio_vitdet(
 
             reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
             preds_main_list.append(reg3_mean.detach().cpu().float())
+            if compute_var and reg3_sq_sum is not None:
+                reg3_var = (reg3_sq_sum / float(k)) - (reg3_mean * reg3_mean)
+                preds_main_var_list.append(reg3_var.clamp_min(0.0).detach().cpu().float())
             if head_num_ratio > 0 and ratio_sum is not None:
                 ratio_mean = ratio_sum / float(k)
                 preds_ratio_list.append(ratio_mean.detach().cpu().float())
+                if compute_var and ratio_sq_sum is not None:
+                    ratio_var = (ratio_sq_sum / float(k)) - (ratio_mean * ratio_mean)
+                    preds_ratio_var_list.append(ratio_var.clamp_min(0.0).detach().cpu().float())
             if reg3_layers_sum is not None:
                 reg3_layers_mean = reg3_layers_sum / float(k)
                 preds_main_layers_list.append(reg3_layers_mean.detach().cpu().float())
@@ -849,7 +1272,13 @@ def predict_main_and_ratio_vitdet(
         preds_ratio_layers = torch.cat(preds_ratio_layers_list, dim=0)
     else:
         preds_ratio_layers = None
-    return rels, preds_main, preds_ratio, preds_main_layers, preds_ratio_layers
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
+    return rels, preds_main, preds_ratio, preds_main_layers, preds_ratio_layers, preds_main_var, preds_ratio_var
 
 
 def predict_main_and_ratio_dpt(
@@ -871,7 +1300,7 @@ def predict_main_and_ratio_dpt(
     mc_dropout_samples: int = 1,
     hflip: bool = False,
     vflip: bool = False,
-) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     DPT-head inference.
     """
@@ -898,13 +1327,16 @@ def predict_main_and_ratio_dpt(
     feature_extractor = DinoV3FeatureExtractor(backbone)
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     head = head.eval().to(device1)
-    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
         _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
     rels: List[str] = []
     preds_main_list: List[torch.Tensor] = []
     preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
 
     with torch.inference_mode():
         for images, rel_paths in dl:
@@ -926,7 +1358,9 @@ def predict_main_and_ratio_dpt(
 
             k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
             reg3_sum = None
+            reg3_sq_sum = None
             ratio_sum = None
+            ratio_sq_sum = None
             for _ in range(k):
                 if head_in[0] == "list":
                     cls_list_i, pt_list_i = head_in[1]
@@ -940,15 +1374,29 @@ def predict_main_and_ratio_dpt(
                 ratio = out.get("ratio", None)
                 if reg3 is None:
                     raise RuntimeError("DPT head did not return 'reg3'")
-                reg3_sum = reg3 if reg3_sum is None else (reg3_sum + reg3)
+                reg3_f = reg3.float()
+                reg3_sum = reg3_f if reg3_sum is None else (reg3_sum + reg3_f)
+                if compute_var:
+                    reg3_sq = reg3_f * reg3_f
+                    reg3_sq_sum = reg3_sq if reg3_sq_sum is None else (reg3_sq_sum + reg3_sq)
                 if head_num_ratio > 0 and ratio is not None:
-                    ratio_sum = ratio if ratio_sum is None else (ratio_sum + ratio)
+                    ratio_f = ratio.float()
+                    ratio_sum = ratio_f if ratio_sum is None else (ratio_sum + ratio_f)
+                    if compute_var:
+                        ratio_sq = ratio_f * ratio_f
+                        ratio_sq_sum = ratio_sq if ratio_sq_sum is None else (ratio_sq_sum + ratio_sq)
 
             reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
             preds_main_list.append(reg3_mean.detach().cpu().float())
+            if compute_var and reg3_sq_sum is not None:
+                reg3_var = (reg3_sq_sum / float(k)) - (reg3_mean * reg3_mean)
+                preds_main_var_list.append(reg3_var.clamp_min(0.0).detach().cpu().float())
             if head_num_ratio > 0 and ratio_sum is not None:
                 ratio_mean = ratio_sum / float(k)  # type: ignore[operator]
                 preds_ratio_list.append(ratio_mean.detach().cpu().float())
+                if compute_var and ratio_sq_sum is not None:
+                    ratio_var = (ratio_sq_sum / float(k)) - (ratio_mean * ratio_mean)
+                    preds_ratio_var_list.append(ratio_var.clamp_min(0.0).detach().cpu().float())
 
             rels.extend(list(rel_paths))
 
@@ -958,7 +1406,13 @@ def predict_main_and_ratio_dpt(
         preds_ratio = torch.cat(preds_ratio_list, dim=0)
     else:
         preds_ratio = None
-    return rels, preds_main, preds_ratio
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
+    return rels, preds_main, preds_ratio, preds_main_var, preds_ratio_var
 
 
 def predict_main_and_ratio_global_multilayer(
@@ -983,7 +1437,7 @@ def predict_main_and_ratio_global_multilayer(
     mc_dropout_samples: int = 1,
     hflip: bool = False,
     vflip: bool = False,
-) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Global multi-layer inference for a single head.
     """
@@ -1010,7 +1464,8 @@ def predict_main_and_ratio_global_multilayer(
     feature_extractor = DinoV3FeatureExtractor(backbone)
     feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
     head = head.eval().to(device1)
-    if bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1:
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
         _enable_dropout_only_train_mode(head, enabled=True)
     head_dtype = module_param_dtype(head, default=torch.float32)
 
@@ -1021,6 +1476,8 @@ def predict_main_and_ratio_global_multilayer(
     rels: List[str] = []
     preds_main_list: List[torch.Tensor] = []
     preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
 
     with torch.inference_mode():
         for images, rel_paths in dl:
@@ -1031,6 +1488,8 @@ def predict_main_and_ratio_global_multilayer(
 
             main_layers_batch: List[torch.Tensor] = []
             ratio_layers_batch: List[torch.Tensor] = []
+            main_layers_var_batch: List[torch.Tensor] = []
+            ratio_layers_var_batch: List[torch.Tensor] = []
 
             for l_idx, (cls_l, pt_l) in enumerate(zip(cls_list, pt_list)):
                 if pt_l.dim() != 3:
@@ -1041,46 +1500,88 @@ def predict_main_and_ratio_global_multilayer(
                 if use_separate_bottlenecks and isinstance(head, MultiLayerHeadExport):
                     k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
                     main_sum = None
+                    main_sq_sum = None
                     ratio_sum = None
+                    ratio_sq_sum = None
                     for _ in range(k):
                         layer_main_k, layer_ratio_k = head.forward_global_layer(cls_l, patch_mean_l, l_idx)
-                        main_sum = layer_main_k if main_sum is None else (main_sum + layer_main_k)
-                        if layer_ratio_k is not None:
-                            ratio_sum = layer_ratio_k if ratio_sum is None else (ratio_sum + layer_ratio_k)
+                        mk = layer_main_k.float()
+                        main_sum = mk if main_sum is None else (main_sum + mk)
+                        if compute_var:
+                            msq = mk * mk
+                            main_sq_sum = msq if main_sq_sum is None else (main_sq_sum + msq)
+                        if head_num_ratio > 0 and layer_ratio_k is not None:
+                            rk = layer_ratio_k.float()
+                            ratio_sum = rk if ratio_sum is None else (ratio_sum + rk)
+                            if compute_var:
+                                rsq = rk * rk
+                                ratio_sq_sum = rsq if ratio_sq_sum is None else (ratio_sq_sum + rsq)
                     layer_main = main_sum / float(k)  # type: ignore[operator]
+                    layer_main_var = None
+                    if compute_var and main_sq_sum is not None:
+                        layer_main_var = ((main_sq_sum / float(k)) - (layer_main * layer_main)).clamp_min(0.0)
                     layer_ratio = (ratio_sum / float(k)) if ratio_sum is not None else None
+                    layer_ratio_var = None
+                    if compute_var and ratio_sq_sum is not None and layer_ratio is not None:
+                        layer_ratio_var = ((ratio_sq_sum / float(k)) - (layer_ratio * layer_ratio)).clamp_min(0.0)
                 else:
                     feats_l = torch.cat([cls_l, patch_mean_l], dim=-1) if use_cls_token else patch_mean_l
                     feats_l = feats_l.to(device1, non_blocking=True, dtype=head_dtype)
 
                     k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
-                    out_sum = None
+                    expected_dim = head_total * num_layers
+                    offset = l_idx * head_total
+                    main_sum = None
+                    main_sq_sum = None
+                    ratio_sum = None
+                    ratio_sq_sum = None
                     for _ in range(k):
                         out_k = head(feats_l)  # (B, head_total * num_layers)
-                        out_sum = out_k if out_sum is None else (out_sum + out_k)
-                    out_all = out_sum / float(k)  # type: ignore[operator]
-                    expected_dim = head_total * num_layers
-                    if out_all.shape[1] != expected_dim:
-                        raise RuntimeError(
-                            f"Unexpected packed head dimension in global multi-layer: got {out_all.shape[1]}, "
-                            f"expected {expected_dim}"
-                        )
-                    offset = l_idx * head_total
-                    layer_slice = out_all[:, offset : offset + head_total]  # (B, head_total)
+                        out_f = out_k.float()
+                        if out_f.shape[1] != expected_dim:
+                            raise RuntimeError(
+                                f"Unexpected packed head dimension in global multi-layer: got {out_f.shape[1]}, "
+                                f"expected {expected_dim}"
+                            )
+                        layer_slice = out_f[:, offset : offset + head_total]  # (B, head_total)
+                        if head_num_main > 0:
+                            main_k = layer_slice[:, :head_num_main]
+                            main_sum = main_k if main_sum is None else (main_sum + main_k)
+                            if compute_var:
+                                msq = main_k * main_k
+                                main_sq_sum = msq if main_sq_sum is None else (main_sq_sum + msq)
+                        if head_num_ratio > 0:
+                            ratio_k = layer_slice[:, head_num_main : head_num_main + head_num_ratio]
+                            ratio_sum = ratio_k if ratio_sum is None else (ratio_sum + ratio_k)
+                            if compute_var:
+                                rsq = ratio_k * ratio_k
+                                ratio_sq_sum = rsq if ratio_sq_sum is None else (ratio_sq_sum + rsq)
 
-                    if head_num_main > 0:
-                        layer_main = layer_slice[:, :head_num_main]  # (B, head_num_main)
+                    if head_num_main > 0 and main_sum is not None:
+                        layer_main = main_sum / float(k)  # type: ignore[operator]
+                        layer_main_var = None
+                        if compute_var and main_sq_sum is not None:
+                            layer_main_var = ((main_sq_sum / float(k)) - (layer_main * layer_main)).clamp_min(0.0)
                     else:
                         layer_main = torch.empty((B, 0), dtype=torch.float32, device=device)
+                        layer_main_var = torch.empty((B, 0), dtype=torch.float32, device=device) if compute_var else None
 
-                    if head_num_ratio > 0:
-                        layer_ratio = layer_slice[:, head_num_main : head_num_main + head_num_ratio]
+                    if head_num_ratio > 0 and ratio_sum is not None:
+                        layer_ratio = ratio_sum / float(k)  # type: ignore[operator]
+                        layer_ratio_var = None
+                        if compute_var and ratio_sq_sum is not None:
+                            layer_ratio_var = ((ratio_sq_sum / float(k)) - (layer_ratio * layer_ratio)).clamp_min(0.0)
                     else:
                         layer_ratio = None
+                        layer_ratio_var = None
 
                 main_layers_batch.append(layer_main)
+                if compute_var and layer_main_var is not None:
+                    main_layers_var_batch.append(layer_main_var)
                 if layer_ratio is not None:
                     ratio_layers_batch.append(layer_ratio)
+                    if compute_var and layer_ratio_var is not None:
+                        ratio_layers_var_batch.append(layer_ratio_var)
 
             B = images.size(0)
             if len(main_layers_batch) > 0:
@@ -1094,6 +1595,16 @@ def predict_main_and_ratio_global_multilayer(
                 preds_main_batch = main_stack.mean(dim=0) if w is None else (main_stack * w.view(-1, 1, 1)).sum(dim=0)
             else:
                 preds_main_batch = torch.empty((B, 0), dtype=torch.float32, device=device)
+                w = None
+
+            preds_main_var_batch = None
+            if compute_var and len(main_layers_var_batch) == len(main_layers_batch) and len(main_layers_var_batch) > 0:
+                main_var_stack = torch.stack(main_layers_var_batch, dim=0)  # (L,B,D)
+                L = int(main_var_stack.shape[0])
+                if w is None:
+                    preds_main_var_batch = main_var_stack.mean(dim=0) / float(max(1, L))
+                else:
+                    preds_main_var_batch = (main_var_stack * (w.view(-1, 1, 1) ** 2)).sum(dim=0)
 
             if head_num_ratio > 0 and len(ratio_layers_batch) > 0:
                 ratio_stack = torch.stack(ratio_layers_batch, dim=0)  # (K,B,R)
@@ -1106,10 +1617,29 @@ def predict_main_and_ratio_global_multilayer(
                 preds_ratio_batch = ratio_stack.mean(dim=0) if w is None else (ratio_stack * w.view(-1, 1, 1)).sum(dim=0)
             else:
                 preds_ratio_batch = None
+                w = None
+
+            preds_ratio_var_batch = None
+            if (
+                compute_var
+                and preds_ratio_batch is not None
+                and len(ratio_layers_var_batch) == len(ratio_layers_batch)
+                and len(ratio_layers_var_batch) > 0
+            ):
+                ratio_var_stack = torch.stack(ratio_layers_var_batch, dim=0)  # (L,B,R)
+                Lr = int(ratio_var_stack.shape[0])
+                if w is None:
+                    preds_ratio_var_batch = ratio_var_stack.mean(dim=0) / float(max(1, Lr))
+                else:
+                    preds_ratio_var_batch = (ratio_var_stack * (w.view(-1, 1, 1) ** 2)).sum(dim=0)
 
             preds_main_list.append(preds_main_batch.detach().cpu().float())
+            if compute_var and preds_main_var_batch is not None:
+                preds_main_var_list.append(preds_main_var_batch.detach().cpu().float())
             if preds_ratio_batch is not None:
                 preds_ratio_list.append(preds_ratio_batch.detach().cpu().float())
+                if compute_var and preds_ratio_var_batch is not None:
+                    preds_ratio_var_list.append(preds_ratio_var_batch.detach().cpu().float())
             rels.extend(list(rel_paths))
 
     preds_main = torch.cat(preds_main_list, dim=0) if preds_main_list else torch.empty((0, head_num_main), dtype=torch.float32)
@@ -1119,6 +1649,13 @@ def predict_main_and_ratio_global_multilayer(
     else:
         preds_ratio = None
 
-    return rels, preds_main, preds_ratio
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
+
+    return rels, preds_main, preds_ratio, preds_main_var, preds_ratio_var
 
 

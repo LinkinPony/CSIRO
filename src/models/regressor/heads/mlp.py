@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 from typing import List
 
+import torch
 from torch import nn
 
 from ...head_builder import SwiGLU
@@ -85,6 +87,33 @@ def init_mlp_head(
     )
     model.shared_bottleneck = bottleneck  # type: ignore[assignment]
 
+    # Optional dual-branch fusion (MLP patch-mode): create a separate global bottleneck
+    # that consumes CLS+mean(patch) (or mean(patch) when use_cls_token=False) and a learnable
+    # fusion weight alpha (stored as a logit).
+    dual_enabled = bool(getattr(model, "dual_branch_enabled", False))
+    if dual_enabled:
+        model.shared_bottleneck_global = _build_mlp_bottleneck(
+            embedding_dim=int(embedding_dim),
+            use_patch_reg3=False,
+            use_cls_token=bool(getattr(model, "use_cls_token", True)),
+            hidden_dims=list(hidden_dims),
+            act_name=str(head_activation or "relu").lower(),
+            dropout=float(dropout or 0.0),
+        )  # type: ignore[assignment]
+        # Create learnable alpha logit (scalar). Clamp init away from {0,1} for numerical safety.
+        try:
+            a0 = float(getattr(model, "dual_branch_alpha_init", 0.2))
+        except Exception:
+            a0 = 0.2
+        a0 = float(max(0.0, min(1.0, a0)))
+        eps = 1e-4
+        a0 = float(min(1.0 - eps, max(eps, a0)))
+        logit = math.log(a0 / (1.0 - a0))
+        model.dual_branch_alpha_logit = nn.Parameter(torch.tensor([logit], dtype=torch.float32))  # type: ignore[assignment]
+    else:
+        model.shared_bottleneck_global = None  # type: ignore[assignment]
+        model.dual_branch_alpha_logit = None  # type: ignore[assignment]
+
     bottleneck_dim = int(hidden_dims[-1]) if len(hidden_dims) > 0 else int(embedding_dim)
     num_outputs = int(getattr(model, "num_outputs", 1))
     model.reg3_heads = nn.ModuleList([nn.Linear(bottleneck_dim, 1) for _ in range(num_outputs)])  # type: ignore[assignment]
@@ -106,8 +135,26 @@ def init_mlp_head(
                 for _ in range(num_layers)
             ]
         )
+        # Optional per-layer global bottlenecks for dual-branch fusion.
+        if dual_enabled:
+            model.layer_bottlenecks_global = nn.ModuleList(  # type: ignore[assignment]
+                [
+                    _build_mlp_bottleneck(
+                        embedding_dim=int(embedding_dim),
+                        use_patch_reg3=False,
+                        use_cls_token=bool(getattr(model, "use_cls_token", True)),
+                        hidden_dims=list(hidden_dims),
+                        act_name=str(head_activation or "relu").lower(),
+                        dropout=float(dropout or 0.0),
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+        else:
+            model.layer_bottlenecks_global = None  # type: ignore[assignment]
     else:
         model.layer_bottlenecks = None  # type: ignore[assignment]
+        model.layer_bottlenecks_global = None  # type: ignore[assignment]
 
     return bottleneck_dim
 

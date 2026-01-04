@@ -59,6 +59,13 @@ class BiomassRegressor(
         use_cls_token: bool = True,
         # Optional patch-based main regression path (per-patch prediction then average)
         use_patch_reg3: bool = False,
+        # Optional dual-branch fusion for MLP patch-mode:
+        # fuse patch-based main prediction with a global prediction from CLS+mean(patch).
+        dual_branch_enabled: bool = False,
+        # Initial weight for the global branch in fusion:
+        #   y = a*y_global + (1-a)*y_patch
+        # Stored as a learnable logit parameter when dual_branch_enabled=True.
+        dual_branch_alpha_init: float = 0.2,
         # Ratio head coupling mode (preferred). When provided, it overrides the legacy
         # boolean flags below. Supported values: "shared" | "separate_mlp" | "separate_spatial".
         ratio_head_mode: Optional[str] = None,
@@ -249,6 +256,22 @@ class BiomassRegressor(
         # - mlp head: same meaning as before
         # - fpn head: always consumes patch tokens (effectively True)
         self.use_patch_reg3: bool = bool(use_patch_reg3) if self._head_type == "mlp" else True
+
+        # Optional dual-branch fusion is supported only for MLP patch-mode.
+        try:
+            dual_on = bool(dual_branch_enabled)
+        except Exception:
+            dual_on = False
+        try:
+            alpha_init = float(dual_branch_alpha_init)
+        except Exception:
+            alpha_init = 0.2
+        self.dual_branch_enabled: bool = bool(
+            dual_on and self._head_type == "mlp" and bool(self.use_patch_reg3)
+        )
+        # Persist init value for export/debug; the learnable logit is created in head init.
+        self.dual_branch_alpha_init: float = float(alpha_init)
+
         # Ratio head coupling mode (resolved from enum or legacy flags).
         try:
             from .heads.ratio_mode import resolve_ratio_head_mode, flags_from_ratio_head_mode

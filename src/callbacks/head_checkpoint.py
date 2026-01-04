@@ -7,20 +7,58 @@ import torch
 from lightning.pytorch.callbacks import Callback
 from torch import nn
 
-from src.models.head_builder import build_head_layer, MultiLayerHeadExport
+from src.models.head_builder import build_head_layer, DualBranchHeadExport, MultiLayerHeadExport
 from src.models.spatial_fpn import FPNHeadConfig, FPNScalarHead
 from src.models.dpt_scalar_head import DPTHeadConfig, DPTScalarHead
 from src.models.peft_integration import export_lora_payload_if_any
 
 
 class HeadCheckpoint(Callback):
-    def __init__(self, output_dir: str) -> None:
+    def __init__(self, output_dir: str, save_only_last_epoch: bool = True) -> None:
         super().__init__()
         self.output_dir = os.path.abspath(output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
+        # New saving policy: by default, only persist the final epoch's head weights.
+        self.save_only_last_epoch = bool(save_only_last_epoch)
+        self._saved: bool = False
+
+    def _is_last_epoch(self, trainer) -> bool:  # type: ignore[no-untyped-def]
+        try:
+            if bool(getattr(trainer, "sanity_checking", False)):
+                return False
+        except Exception:
+            pass
+
+        try:
+            max_epochs = getattr(trainer, "max_epochs", None)
+            cur_epoch = int(getattr(trainer, "current_epoch", 0))
+            if isinstance(max_epochs, int) and max_epochs > 0:
+                if cur_epoch >= (max_epochs - 1):
+                    return True
+        except Exception:
+            pass
+
+        # Early stopping (or other termination conditions) typically flip should_stop at/after validation.
+        try:
+            if bool(getattr(trainer, "should_stop", False)):
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _save(self, state: Dict[str, Any], out_path: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        torch.save(state, out_path)
+        self._saved = True
 
     def on_validation_epoch_end(self, trainer, pl_module) -> None:  # type: ignore[override]
         epoch = trainer.current_epoch
+        if self.save_only_last_epoch:
+            if self._saved:
+                return
+            if not self._is_last_epoch(trainer):
+                return
         # Collect metrics for filename suffix if available
         metrics = getattr(trainer, "callback_metrics", {}) or {}
         def _get_float(name: str):
@@ -139,7 +177,7 @@ class HeadCheckpoint(Callback):
                     suffix_parts.append(f"val_r2{val_r2:.6f}")
                 metrics_suffix = ("-" + "-".join(suffix_parts)) if suffix_parts else ""
                 out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}{metrics_suffix}.pt")
-                torch.save(state, out_path)
+                self._save(state, out_path)
                 return
 
             if head_type in ("vitdet", "vitdet_scalar", "vitdet_head", "simple_feature_pyramid"):
@@ -234,7 +272,7 @@ class HeadCheckpoint(Callback):
                     suffix_parts.append(f"val_r2{val_r2:.6f}")
                 metrics_suffix = ("-" + "-".join(suffix_parts)) if suffix_parts else ""
                 out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}{metrics_suffix}.pt")
-                torch.save(state, out_path)
+                self._save(state, out_path)
                 return
 
             if head_type in ("dpt", "dpt_scalar", "dpt_head", "dense_dpt", "dpt_dense"):
@@ -320,7 +358,7 @@ class HeadCheckpoint(Callback):
                     suffix_parts.append(f"val_r2{val_r2:.6f}")
                 metrics_suffix = ("-" + "-".join(suffix_parts)) if suffix_parts else ""
                 out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}{metrics_suffix}.pt")
-                torch.save(state, out_path)
+                self._save(state, out_path)
                 return
 
             # Prefer composing a fresh head module to ensure compatibility with inference script.
@@ -341,6 +379,8 @@ class HeadCheckpoint(Callback):
             use_patch_reg3 = bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False
             # Whether the global feature includes CLS token (2C) or uses patch-mean only (C).
             use_cls_token = bool(getattr(pl_module.hparams, "use_cls_token", True)) if hasattr(pl_module, "hparams") else True
+            # Optional dual-branch fusion (MLP patch-mode): patch + global prediction fused by alpha.
+            dual_branch_enabled = bool(getattr(pl_module, "dual_branch_enabled", False))
             use_layerwise_heads = bool(getattr(pl_module.hparams, "use_layerwise_heads", False)) if hasattr(pl_module, "hparams") else False
             backbone_layer_indices = list(getattr(pl_module.hparams, "backbone_layer_indices", [])) if hasattr(pl_module, "hparams") else []
             use_separate_bottlenecks = bool(
@@ -353,7 +393,110 @@ class HeadCheckpoint(Callback):
             # packed MLP head whose final Linear contains concatenated per-layer weights.
             # When both layer-wise heads and separate bottlenecks are enabled, we export
             # a dedicated MultiLayerHeadExport that mirrors the training-time structure.
-            if use_layerwise_heads and use_separate_bottlenecks and hasattr(pl_module, "layer_bottlenecks"):
+            if bool(dual_branch_enabled) and bool(use_patch_reg3):
+                # Dual-branch export: always use an explicit per-layer module (even for single-layer),
+                # so inference can reproduce training-time fusion behavior.
+                embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024))
+                head_hidden_dims = list(getattr(pl_module.hparams, "head_hidden_dims", []))
+                head_activation = str(getattr(pl_module.hparams, "head_activation", "relu"))
+                dropout = float(getattr(pl_module.hparams, "dropout", 0.0))
+                num_layers_eff = max(1, len(backbone_layer_indices)) if use_layerwise_heads else 1
+                try:
+                    alpha_init = float(getattr(pl_module, "dual_branch_alpha_init", 0.2))
+                except Exception:
+                    alpha_init = 0.2
+
+                head_module = DualBranchHeadExport(
+                    embedding_dim=embedding_dim,
+                    num_outputs_main=num_outputs_main,
+                    num_outputs_ratio=num_ratio_outputs,
+                    head_hidden_dims=head_hidden_dims,
+                    head_activation=head_activation,
+                    dropout=dropout,
+                    use_cls_token=bool(use_cls_token),
+                    num_layers=int(num_layers_eff),
+                    alpha_init=float(alpha_init),
+                )
+
+                # Copy weights from training module into export module.
+                with torch.no_grad():
+                    # Alpha logit
+                    try:
+                        src_alpha = getattr(pl_module, "dual_branch_alpha_logit", None)
+                        if isinstance(src_alpha, torch.Tensor) and isinstance(head_module.alpha_logit, torch.Tensor):
+                            head_module.alpha_logit.copy_(src_alpha.detach().to(dtype=head_module.alpha_logit.dtype))
+                    except Exception:
+                        pass
+
+                    # Per-layer bottlenecks
+                    for li in range(int(num_layers_eff)):
+                        # Patch bottleneck: prefer per-layer when available; otherwise reuse shared.
+                        src_patch = None
+                        try:
+                            lbs = getattr(pl_module, "layer_bottlenecks", None)
+                            if isinstance(lbs, (list, torch.nn.ModuleList)) and li < len(lbs):
+                                src_patch = lbs[li]
+                        except Exception:
+                            src_patch = None
+                        if src_patch is None:
+                            src_patch = getattr(pl_module, "shared_bottleneck", None)
+                        if isinstance(src_patch, nn.Module):
+                            head_module.layer_bottlenecks_patch[li].load_state_dict(src_patch.state_dict())
+
+                        # Global bottleneck: prefer per-layer when available; otherwise reuse shared.
+                        src_global = None
+                        try:
+                            lbg = getattr(pl_module, "layer_bottlenecks_global", None)
+                            if isinstance(lbg, (list, torch.nn.ModuleList)) and li < len(lbg):
+                                src_global = lbg[li]
+                        except Exception:
+                            src_global = None
+                        if src_global is None:
+                            src_global = getattr(pl_module, "shared_bottleneck_global", None)
+                        if isinstance(src_global, nn.Module):
+                            head_module.layer_bottlenecks_global[li].load_state_dict(src_global.state_dict())
+
+                        # reg3 heads: per-layer when present, else shared reg3_heads
+                        src_reg3_list = None
+                        try:
+                            lrh = getattr(pl_module, "layer_reg3_heads", None)
+                            if isinstance(lrh, (list, torch.nn.ModuleList)) and li < len(lrh):
+                                src_reg3_list = list(lrh[li])
+                        except Exception:
+                            src_reg3_list = None
+                        if src_reg3_list is None:
+                            src_reg3_list = list(getattr(pl_module, "reg3_heads"))
+                        dst_reg3_list = list(head_module.layer_reg3_heads[li])
+                        if len(src_reg3_list) != len(dst_reg3_list):
+                            raise RuntimeError("Mismatch in number of reg3 heads per layer during dual-branch export")
+                        for s, t in zip(src_reg3_list, dst_reg3_list):
+                            if not isinstance(s, nn.Linear) or not isinstance(t, nn.Linear):
+                                raise RuntimeError("Expected Linear reg3 heads during dual-branch export")
+                            t.weight.copy_(s.weight.data)
+                            if t.bias is not None and s.bias is not None:
+                                t.bias.copy_(s.bias.data)
+
+                        # ratio heads (optional)
+                        if num_ratio_outputs > 0 and head_module.layer_ratio_heads is not None:
+                            src_r = None
+                            try:
+                                lrr = getattr(pl_module, "layer_ratio_heads", None)
+                                if isinstance(lrr, (list, torch.nn.ModuleList)) and li < len(lrr):
+                                    src_r = lrr[li]
+                            except Exception:
+                                src_r = None
+                            if src_r is None:
+                                src_r = getattr(pl_module, "ratio_head", None)
+                            if not isinstance(src_r, nn.Linear):
+                                raise RuntimeError("Missing ratio head for dual-branch export")
+                            dst_r = head_module.layer_ratio_heads[li]
+                            dst_r.weight.copy_(src_r.weight.data)
+                            if dst_r.bias is not None and src_r.bias is not None:
+                                dst_r.bias.copy_(src_r.bias.data)
+
+                state_dict_to_save = head_module.state_dict()
+
+            elif use_layerwise_heads and use_separate_bottlenecks and hasattr(pl_module, "layer_bottlenecks"):
                 # Multi-layer + per-layer bottlenecks: export explicit per-layer MLPs.
                 embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024))
                 head_hidden_dims = list(getattr(pl_module.hparams, "head_hidden_dims", []))
@@ -573,6 +716,9 @@ class HeadCheckpoint(Callback):
                 # Whether the main regression head was trained using per-patch predictions
                 # averaged over patches (scheme A), or using a single CLS+mean(patch) feature.
                 "use_patch_reg3": bool(getattr(pl_module.hparams, "use_patch_reg3", False)) if hasattr(pl_module, "hparams") else False,
+                # Optional dual-branch fusion (MLP patch-mode): patch + global prediction fused by alpha.
+                "dual_branch_enabled": bool(getattr(pl_module, "dual_branch_enabled", False)),
+                "dual_branch_alpha_init": float(getattr(pl_module, "dual_branch_alpha_init", 0.2)),
                 # Whether global features included CLS token during training.
                 "use_cls_token": bool(getattr(pl_module.hparams, "use_cls_token", True)) if hasattr(pl_module, "hparams") else True,
                 # Multi-layer configuration: whether layer-wise heads were used and which
@@ -619,7 +765,7 @@ class HeadCheckpoint(Callback):
             suffix_parts.append(f"val_r2{val_r2:.6f}")
         metrics_suffix = ("-" + "-".join(suffix_parts)) if suffix_parts else ""
         out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}{metrics_suffix}.pt")
-        torch.save(state, out_path)
+        self._save(state, out_path)
 
         # Save NDVI dense head separately if present
         try:
@@ -643,7 +789,7 @@ class HeadCheckpoint(Callback):
                 except Exception:
                     pass
                 ndvi_path = os.path.join(self.output_dir, f"head-ndvi-epoch{epoch:03d}.pt")
-                torch.save(ndvi_state, ndvi_path)
+                self._save(ndvi_state, ndvi_path)
         except Exception:
             pass
 

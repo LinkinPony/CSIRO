@@ -6,8 +6,9 @@
   - Path: `dinov3_weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pt`
   - Purpose: Loaded as the backbone weights across all experiments and inference.
 
-- Regression head weights are saved separately every epoch (small, backbone excluded):
-  - Training save path pattern: `outputs/checkpoints/<version>/head/head-epochXXX.pt`
+- Regression head weights are saved separately (small, backbone excluded):
+  - Training saves **only the final epoch** head checkpoint:
+    - Path pattern: `outputs/checkpoints/<version>/head/head-epochXXX.pt` (only one file per run)
   - Packaged for inference at: `weights/head/infer_head.pt`
   - Contents: `state_dict` for `model.head` and minimal `meta` (embedding_dim, num_outputs, head config).
 

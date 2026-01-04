@@ -45,11 +45,12 @@ from src.inference.predict import (
     predict_main_and_ratio_vitdet,
     predict_main_and_ratio_global_multilayer,
     predict_main_and_ratio_patch_mode,
+    predict_main_and_ratio_dual_branch,
 )
 from src.inference.settings import InferenceSettings
 from src.inference.torch_load import load_head_state, torch_load_cpu
 from src.models.dpt_scalar_head import DPTHeadConfig, DPTScalarHead
-from src.models.head_builder import MultiLayerHeadExport, build_head_layer
+from src.models.head_builder import DualBranchHeadExport, MultiLayerHeadExport, build_head_layer
 from src.models.peft_integration import _import_peft
 from src.models.spatial_fpn import FPNHeadConfig, FPNScalarHead
 from src.models.vitdet_head import ViTDetHeadConfig, ViTDetMultiLayerScalarHead, ViTDetScalarHead
@@ -361,7 +362,13 @@ def infer_components_5d_for_model(
     dataset_root: str,
     image_paths: List[str],
     prefer_packaged_head_manifest: bool = True,
-) -> Tuple[List[str], torch.Tensor, dict]:
+    compute_mc_var: bool = False,
+    mc_dropout_samples_override: Optional[int] = None,
+    mc_var_mode: str = "relative",
+    mc_include_ratio: bool = False,
+    mc_ratio_weight: float = 1.0,
+    mc_eps: float = 1e-8,
+ ) -> Tuple[List[str], torch.Tensor, dict, Optional[torch.Tensor]]:
     """
     Run inference for a *single model* (one backbone + one or more head weights) and return:
       - rels_in_order: list of image paths (same order as image_paths argument)
@@ -455,6 +462,10 @@ def infer_components_5d_for_model(
     rels_in_order_ref: Optional[List[str]] = None
     comps_sum: Optional[torch.Tensor] = None
     weight_sum: float = 0.0
+    # Optional: accumulate per-head MC-dropout variance scalars for per-model uncertainty.
+    # Stored as weighted variance of the weighted-mean prediction (assumes independence).
+    mc_var_total_w2_sum: Optional[torch.Tensor] = None
+    mc_var_ratio_w2_sum: Optional[torch.Tensor] = None
 
     for head_i, head_pt in enumerate(head_weight_paths):
         # NOTE: keep head ensemble weight separate from any internal per-layer fusion weights.
@@ -548,6 +559,7 @@ def infer_components_5d_for_model(
         use_layerwise_heads_head = bool(meta.get("use_layerwise_heads", use_layerwise_heads_default))
         backbone_layer_indices_head = list(meta.get("backbone_layer_indices", backbone_layer_indices_default))
         use_separate_bottlenecks_head = bool(meta.get("use_separate_bottlenecks", use_separate_bottlenecks_default))
+        dual_branch_enabled_head = bool(meta.get("dual_branch_enabled", first_meta.get("dual_branch_enabled", False)))
         head_is_ratio = bool(head_num_ratio > 0 and head_total == (head_num_main + head_num_ratio))
 
         # Multi-layer fusion mode (mean or learned). For MLP multi-layer inference the learned
@@ -676,6 +688,24 @@ def infer_components_5d_for_model(
                     dropout=head_dropout,
                 )
             )
+        elif dual_branch_enabled_head and use_patch_reg3_head:
+            # Dual-branch MLP patch-mode head: patch + global prediction fused by alpha.
+            num_layers_eff = max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1
+            try:
+                alpha_init_meta = float(meta.get("dual_branch_alpha_init", first_meta.get("dual_branch_alpha_init", 0.2)))
+            except Exception:
+                alpha_init_meta = 0.2
+            head_module = DualBranchHeadExport(
+                embedding_dim=head_embedding_dim,
+                num_outputs_main=head_num_main,
+                num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
+                head_hidden_dims=head_hidden_dims,
+                head_activation=head_activation,
+                dropout=head_dropout,
+                use_cls_token=use_cls_token_head,
+                num_layers=int(num_layers_eff),
+                alpha_init=float(alpha_init_meta),
+            )
         elif use_layerwise_heads_head and use_separate_bottlenecks_head:
             num_layers_eff = max(1, len(backbone_layer_indices_head))
             head_module = MultiLayerHeadExport(
@@ -712,7 +742,19 @@ def infer_components_5d_for_model(
                     pass
 
         # --- Run inference for this head ---
-        mc_enabled = bool(getattr(settings, "mc_dropout_enabled", False)) and int(getattr(settings, "mc_dropout_samples", 1)) > 1
+        try:
+            mc_samples_eff = (
+                int(mc_dropout_samples_override)
+                if mc_dropout_samples_override is not None
+                else int(getattr(settings, "mc_dropout_samples", 1))
+            )
+        except Exception:
+            mc_samples_eff = int(getattr(settings, "mc_dropout_samples", 1) or 1)
+        mc_samples_eff = max(1, int(mc_samples_eff))
+        if bool(compute_mc_var) and mc_samples_eff < 2:
+            # Sensible default if user requested uncertainty but did not provide samples.
+            mc_samples_eff = 8
+        mc_enabled = (bool(getattr(settings, "mc_dropout_enabled", False)) or bool(compute_mc_var)) and mc_samples_eff > 1
         if mc_enabled:
             # Optional deterministic seeding (per-head) for reproducible MC dropout.
             try:
@@ -739,6 +781,8 @@ def infer_components_5d_for_model(
         rels_view_ref: Optional[List[str]] = None
         preds_main_sum: Optional[torch.Tensor] = None
         preds_ratio_sum: Optional[torch.Tensor] = None
+        preds_main_var_sum: Optional[torch.Tensor] = None
+        preds_ratio_var_sum: Optional[torch.Tensor] = None
         preds_main_layers_sum: Optional[torch.Tensor] = None
         preds_ratio_layers_sum: Optional[torch.Tensor] = None
         n_views: int = 0
@@ -746,9 +790,11 @@ def infer_components_5d_for_model(
         for _view_idx, (image_size_view, hflip_view, vflip_view) in enumerate(tta_views):
             preds_main_layers_v: Optional[torch.Tensor] = None
             preds_ratio_layers_v: Optional[torch.Tensor] = None
+            preds_main_var_v: Optional[torch.Tensor] = None
+            preds_ratio_var_v: Optional[torch.Tensor] = None
 
             if head_type_meta == "fpn":
-                rels_v, preds_main_v, preds_ratio_v = predict_main_and_ratio_fpn(
+                rels_v, preds_main_v, preds_ratio_v, preds_main_var_v, preds_ratio_var_v = predict_main_and_ratio_fpn(
                     backbone=backbone,
                     head=head_module,
                     dataset_root=dataset_root,
@@ -763,7 +809,7 @@ def infer_components_5d_for_model(
                     use_layerwise_heads=use_layerwise_heads_head,
                     layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
                     mc_dropout_enabled=mc_enabled,
-                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    mc_dropout_samples=int(mc_samples_eff),
                     hflip=bool(hflip_view),
                     vflip=bool(vflip_view),
                 )
@@ -774,6 +820,8 @@ def infer_components_5d_for_model(
                     preds_ratio_v,
                     preds_main_layers_v,
                     preds_ratio_layers_v,
+                    preds_main_var_v,
+                    preds_ratio_var_v,
                 ) = predict_main_and_ratio_vitdet(
                     backbone=backbone,
                     head=head_module,
@@ -789,12 +837,12 @@ def infer_components_5d_for_model(
                     use_layerwise_heads=use_layerwise_heads_head,
                     layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
                     mc_dropout_enabled=mc_enabled,
-                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    mc_dropout_samples=int(mc_samples_eff),
                     hflip=bool(hflip_view),
                     vflip=bool(vflip_view),
                 )
             elif head_type_meta == "dpt":
-                rels_v, preds_main_v, preds_ratio_v = predict_main_and_ratio_dpt(
+                rels_v, preds_main_v, preds_ratio_v, preds_main_var_v, preds_ratio_var_v = predict_main_and_ratio_dpt(
                     backbone=backbone,
                     head=head_module,
                     dataset_root=dataset_root,
@@ -809,12 +857,34 @@ def infer_components_5d_for_model(
                     use_layerwise_heads=use_layerwise_heads_head,
                     layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
                     mc_dropout_enabled=mc_enabled,
-                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    mc_dropout_samples=int(mc_samples_eff),
+                    hflip=bool(hflip_view),
+                    vflip=bool(vflip_view),
+                )
+            elif dual_branch_enabled_head and use_patch_reg3_head:
+                rels_v, preds_main_v, preds_ratio_v, preds_main_var_v, preds_ratio_var_v = predict_main_and_ratio_dual_branch(
+                    backbone=backbone,
+                    head=head_module,
+                    dataset_root=dataset_root,
+                    image_paths=image_paths,
+                    image_size=image_size_view,
+                    mean=mean,
+                    std=std,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    head_num_main=head_num_main,
+                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                    use_layerwise_heads=use_layerwise_heads_head,
+                    num_layers=max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1,
+                    layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                    layer_weights=layer_weights_head,
+                    mc_dropout_enabled=mc_enabled,
+                    mc_dropout_samples=int(mc_samples_eff),
                     hflip=bool(hflip_view),
                     vflip=bool(vflip_view),
                 )
             elif use_patch_reg3_head:
-                rels_v, preds_main_v, preds_ratio_v = predict_main_and_ratio_patch_mode(
+                rels_v, preds_main_v, preds_ratio_v, preds_main_var_v, preds_ratio_var_v = predict_main_and_ratio_patch_mode(
                     backbone=backbone,
                     head=head_module,
                     dataset_root=dataset_root,
@@ -833,13 +903,13 @@ def infer_components_5d_for_model(
                     layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
                     layer_weights=layer_weights_head,
                     mc_dropout_enabled=mc_enabled,
-                    mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                    mc_dropout_samples=int(mc_samples_eff),
                     hflip=bool(hflip_view),
                     vflip=bool(vflip_view),
                 )
             else:
                 if use_layerwise_heads_head and len(backbone_layer_indices_head) > 0:
-                    rels_v, preds_main_v, preds_ratio_v = predict_main_and_ratio_global_multilayer(
+                    rels_v, preds_main_v, preds_ratio_v, preds_main_var_v, preds_ratio_var_v = predict_main_and_ratio_global_multilayer(
                         backbone=backbone,
                         head=head_module,
                         dataset_root=dataset_root,
@@ -857,7 +927,7 @@ def infer_components_5d_for_model(
                         use_cls_token=use_cls_token_head,
                         layer_weights=layer_weights_head,
                         mc_dropout_enabled=mc_enabled,
-                        mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                        mc_dropout_samples=int(mc_samples_eff),
                         hflip=bool(hflip_view),
                         vflip=bool(vflip_view),
                     )
@@ -876,7 +946,7 @@ def infer_components_5d_for_model(
                         hflip=bool(hflip_view),
                         vflip=bool(vflip_view),
                     )
-                    preds_main_v, preds_ratio_v = predict_from_features(
+                    preds_main_v, preds_ratio_v, preds_main_var_v, preds_ratio_var_v = predict_from_features(
                         features_cpu=features_cpu,
                         head=head_module,
                         batch_size=batch_size,
@@ -886,7 +956,7 @@ def infer_components_5d_for_model(
                         use_layerwise_heads=False,
                         num_layers=1,
                         mc_dropout_enabled=mc_enabled,
-                        mc_dropout_samples=int(getattr(settings, "mc_dropout_samples", 1)),
+                        mc_dropout_samples=int(mc_samples_eff),
                     )
 
             if rels_view_ref is None:
@@ -897,6 +967,14 @@ def infer_components_5d_for_model(
             preds_main_sum = preds_main_v if preds_main_sum is None else (preds_main_sum + preds_main_v)
             if head_is_ratio and head_num_ratio > 0 and preds_ratio_v is not None:
                 preds_ratio_sum = preds_ratio_v if preds_ratio_sum is None else (preds_ratio_sum + preds_ratio_v)
+            if preds_main_var_v is not None:
+                preds_main_var_sum = (
+                    preds_main_var_v if preds_main_var_sum is None else (preds_main_var_sum + preds_main_var_v)
+                )
+            if preds_ratio_var_v is not None:
+                preds_ratio_var_sum = (
+                    preds_ratio_var_v if preds_ratio_var_sum is None else (preds_ratio_var_sum + preds_ratio_var_v)
+                )
 
             if preds_main_layers_v is not None:
                 preds_main_layers_sum = (
@@ -919,6 +997,12 @@ def infer_components_5d_for_model(
         rels_in_order = rels_view_ref
         preds_main = preds_main_sum / float(n_views)
         preds_ratio = (preds_ratio_sum / float(n_views)) if preds_ratio_sum is not None else None
+        preds_main_var = (
+            (preds_main_var_sum / float(n_views * n_views)) if preds_main_var_sum is not None else None
+        )
+        preds_ratio_var = (
+            (preds_ratio_var_sum / float(n_views * n_views)) if preds_ratio_var_sum is not None else None
+        )
         preds_main_layers = (preds_main_layers_sum / float(n_views)) if preds_main_layers_sum is not None else None
         preds_ratio_layers = (preds_ratio_layers_sum / float(n_views)) if preds_ratio_layers_sum is not None else None
 
@@ -941,26 +1025,44 @@ def infer_components_5d_for_model(
                 reg3_mean, reg3_std = None, None
         zscore_enabled = reg3_mean is not None and reg3_std is not None
 
+        # Optional MC-dropout variance propagation for main outputs:
+        # preds_main_var is variance in the *raw head output space* after TTA averaging.
+        preds_main_var_eff: Optional[torch.Tensor] = preds_main_var
+
         # Optional Softplus on main outputs (matches training behavior):
         use_output_softplus_cfg = bool(cfg.get("model", {}).get("head", {}).get("use_output_softplus", True))
         if use_output_softplus_cfg and (not log_scale_meta) and (not zscore_enabled):
+            if preds_main_var_eff is not None:
+                # Delta-method approximation: Var(softplus(x)) ≈ (sigmoid(E[x])^2) * Var(x)
+                sig = torch.sigmoid(preds_main)
+                preds_main_var_eff = preds_main_var_eff * (sig * sig)
             preds_main = F.softplus(preds_main)
             if preds_main_layers is not None:
                 preds_main_layers = F.softplus(preds_main_layers)
 
         if zscore_enabled:
+            if preds_main_var_eff is not None:
+                s = reg3_std[:head_num_main]  # type: ignore[index]
+                preds_main_var_eff = preds_main_var_eff * (s * s)
             preds_main = preds_main * reg3_std[:head_num_main] + reg3_mean[:head_num_main]  # type: ignore[index]
             if preds_main_layers is not None:
                 m = reg3_mean[:head_num_main].view(1, 1, -1)  # type: ignore[index]
                 s = reg3_std[:head_num_main].view(1, 1, -1)  # type: ignore[index]
                 preds_main_layers = preds_main_layers * s + m
         if log_scale_meta:
+            if preds_main_var_eff is not None:
+                # Delta-method approximation: Var(expm1(x)) ≈ (exp(E[x])^2) * Var(x)
+                d = torch.exp(preds_main)
+                preds_main_var_eff = preds_main_var_eff * (d * d)
             preds_main = torch.expm1(preds_main).clamp_min(0.0)
             if preds_main_layers is not None:
                 preds_main_layers = torch.expm1(preds_main_layers).clamp_min(0.0)
 
         # Convert from g/m^2 to grams
         preds_main_g = preds_main * float(area_m2)
+        preds_main_g_var: Optional[torch.Tensor] = None
+        if preds_main_var_eff is not None:
+            preds_main_g_var = preds_main_var_eff * float(area_m2) * float(area_m2)
         preds_main_layers_g = (preds_main_layers * float(area_m2)) if preds_main_layers is not None else None
 
         # Build this head's 5D components in grams
@@ -1040,6 +1142,34 @@ def infer_components_5d_for_model(
                 comps_list.append(torch.tensor([clover, dead, green, gdm_val, total], dtype=torch.float32))
             comps_5d = torch.stack(comps_list, dim=0) if comps_list else torch.zeros((0, 5), dtype=torch.float32)
 
+        # --- Per-head MC-dropout uncertainty scalar (optional) ---
+        #
+        # We store a single per-image scalar to drive per-sample weighting across ensemble models.
+        # By default this is the predictive variance of Dry_Total_g (in grams) for this head.
+        if bool(compute_mc_var) and isinstance(preds_main_g_var, torch.Tensor) and preds_main_g_var.numel() > 0:
+            try:
+                idx_total = 0 if bool(head_is_ratio) else int(target_bases.index("Dry_Total_g"))
+            except Exception:
+                idx_total = 0
+            var_total_head: Optional[torch.Tensor] = None
+            try:
+                if preds_main_g_var.dim() == 2 and preds_main_g_var.shape[1] > 0:
+                    if 0 <= int(idx_total) < int(preds_main_g_var.shape[1]):
+                        var_total_head = preds_main_g_var[:, int(idx_total)].view(-1)
+                    else:
+                        var_total_head = preds_main_g_var.mean(dim=-1)
+            except Exception:
+                var_total_head = None
+            if var_total_head is not None:
+                contrib = var_total_head.detach().cpu().float() * float(head_w * head_w)
+                mc_var_total_w2_sum = contrib if mc_var_total_w2_sum is None else (mc_var_total_w2_sum + contrib)
+
+        if bool(compute_mc_var) and bool(mc_include_ratio) and isinstance(preds_ratio_var, torch.Tensor):
+            # Ratio variance is in logits space (dimensionless); treated as an auxiliary uncertainty term.
+            ratio_var_scalar = preds_ratio_var.detach().cpu().float().mean(dim=-1)
+            contrib = ratio_var_scalar * float(head_w * head_w)
+            mc_var_ratio_w2_sum = contrib if mc_var_ratio_w2_sum is None else (mc_var_ratio_w2_sum + contrib)
+
         comps_5d = comps_5d.detach().cpu().float()
         if comps_sum is None:
             comps_sum = comps_5d * head_w
@@ -1071,7 +1201,25 @@ def infer_components_5d_for_model(
         "area_m2": float(area_m2),
         "image_size": list(image_size) if isinstance(image_size, (list, tuple)) else image_size,
     }
-    return rels_in_order_ref, comps_avg, meta_out
+    mc_var_out: Optional[torch.Tensor] = None
+    if bool(compute_mc_var) and mc_var_total_w2_sum is not None and float(weight_sum) > 0.0:
+        var_total_model = mc_var_total_w2_sum / float(weight_sum * weight_sum)
+        mode = str(mc_var_mode or "").strip().lower()
+        if mode in ("relative", "rel", "cv2", "relative_total"):
+            denom = comps_avg[:, 4].clamp_min(0.0).pow(2) + float(mc_eps)
+            mc_var_out = var_total_model / denom
+        else:
+            mc_var_out = var_total_model
+        if bool(mc_include_ratio) and mc_var_ratio_w2_sum is not None:
+            ratio_var_model = mc_var_ratio_w2_sum / float(weight_sum * weight_sum)
+            mc_var_out = mc_var_out + float(mc_ratio_weight) * ratio_var_model
+
+    if mc_var_out is not None:
+        meta_out["mc_var_mode"] = str(mc_var_mode)
+        meta_out["mc_include_ratio"] = bool(mc_include_ratio)
+        meta_out["mc_ratio_weight"] = float(mc_ratio_weight)
+
+    return rels_in_order_ref, comps_avg, meta_out, mc_var_out
 
 
 def _write_submission(df: pd.DataFrame, image_to_components: Dict[str, Dict[str, float]], output_path: str) -> None:
@@ -1125,6 +1273,44 @@ def run(settings: InferenceSettings) -> None:
         ensemble_obj = read_ensemble_cfg_obj(project_dir_abs) or {}
         cache_dir_cfg = ensemble_obj.get("cache_dir", None)
         cache_dir = resolve_cache_dir(project_dir_abs, cache_dir_cfg)
+
+        # Optional: per-sample dynamic weighting across ensemble models.
+        agg = str(ensemble_obj.get("aggregation", "") or "").strip().lower()
+        psw = ensemble_obj.get("per_sample_weighting", None)
+        psw = psw if isinstance(psw, dict) else {}
+        psw_enabled = bool(psw.get("enabled", False)) or agg in (
+            "per_sample_weighted_mean",
+            "dynamic_weighted_mean",
+            "dynamic",
+        )
+        psw_method = str(psw.get("method", "mc_and_disagreement") or "mc_and_disagreement").strip().lower()
+
+        mc_cfg = psw.get("mc_dropout", None)
+        mc_cfg = mc_cfg if isinstance(mc_cfg, dict) else {}
+        dis_cfg = psw.get("disagreement", None)
+        dis_cfg = dis_cfg if isinstance(dis_cfg, dict) else {}
+
+        use_mc = psw_enabled and (psw_method in ("mc_dropout", "mc_and_disagreement")) and bool(mc_cfg.get("enabled", True))
+        use_dis = psw_enabled and (psw_method in ("disagreement", "mc_and_disagreement")) and bool(dis_cfg.get("enabled", True))
+
+        # MC-dropout config (used during model inference to estimate uncertainty).
+        mc_samples_override = None
+        try:
+            v = mc_cfg.get("samples", mc_cfg.get("mc_dropout_samples", None))
+            if v is not None:
+                mc_samples_override = int(v)
+        except Exception:
+            mc_samples_override = None
+        mc_var_mode = str(mc_cfg.get("var_mode", "relative") or "relative").strip().lower()
+        mc_include_ratio = bool(mc_cfg.get("include_ratio", False))
+        try:
+            mc_ratio_weight = float(mc_cfg.get("ratio_weight", 1.0))
+        except Exception:
+            mc_ratio_weight = 1.0
+        try:
+            mc_eps = float(mc_cfg.get("eps", 1e-8))
+        except Exception:
+            mc_eps = 1e-8
 
         cache_items: List[Tuple[str, float]] = []
         used_models: List[str] = []
@@ -1204,7 +1390,7 @@ def run(settings: InferenceSettings) -> None:
             cache_path = os.path.join(cache_dir, f"{cache_name}.pt")
 
             print(f"[ENSEMBLE] Running model '{model_id}' (version={version}) -> cache: {cache_path}")
-            rels_in_order, comps_5d_g, meta = infer_components_5d_for_model(
+            rels_in_order, comps_5d_g, meta, mc_var = infer_components_5d_for_model(
                 settings=settings,
                 project_dir=project_dir_abs,
                 cfg=cfg_model,
@@ -1213,6 +1399,12 @@ def run(settings: InferenceSettings) -> None:
                 dataset_root=dataset_root,
                 image_paths=unique_image_paths,
                 prefer_packaged_head_manifest=True,
+                compute_mc_var=bool(use_mc),
+                mc_dropout_samples_override=mc_samples_override,
+                mc_var_mode=str(mc_var_mode),
+                mc_include_ratio=bool(mc_include_ratio),
+                mc_ratio_weight=float(mc_ratio_weight),
+                mc_eps=float(mc_eps),
             )
             meta = dict(meta or {})
             meta.update(
@@ -1229,6 +1421,7 @@ def run(settings: InferenceSettings) -> None:
                 model_weight=model_weight,
                 rels_in_order=rels_in_order,
                 comps_5d_g=comps_5d_g,
+                mc_var=mc_var,
                 meta=meta,
             )
             cache_items.append((cache_path, float(model_weight)))
@@ -1250,23 +1443,133 @@ def run(settings: InferenceSettings) -> None:
 
         # Load cached predictions and ensemble
         rels_ref: Optional[List[str]] = None
-        comps_sum: Optional[torch.Tensor] = None
-        w_sum: float = 0.0
+        comps_list: List[torch.Tensor] = []
+        mc_var_list: List[Optional[torch.Tensor]] = []
+        w_list: List[float] = []
         for cache_path, w in cache_items:
             if not (w > 0.0):
                 continue
-            rels, comps, _meta = load_ensemble_cache(cache_path)
+            rels, comps, _meta, mc_var = load_ensemble_cache(cache_path)
             if rels_ref is None:
                 rels_ref = rels
             elif rels_ref != rels:
                 raise RuntimeError("Image order mismatch across cached models; aborting ensemble.")
-            comps_sum = (comps * float(w)) if comps_sum is None else (comps_sum + comps * float(w))
-            w_sum += float(w)
+            comps_list.append(comps.detach().cpu().float())
+            mc_var_list.append(mc_var.detach().cpu().float() if isinstance(mc_var, torch.Tensor) else None)
+            w_list.append(float(w))
 
-        if rels_ref is None or comps_sum is None or not (w_sum > 0.0):
+        if rels_ref is None or not comps_list or not w_list:
             raise RuntimeError("Failed to build an ensemble from cached predictions.")
 
-        comps_avg = comps_sum / float(w_sum)  # (N,5)
+        comps_stack = torch.stack(comps_list, dim=0)  # (M,N,5)
+        w_base = torch.tensor(w_list, dtype=torch.float32).view(-1, 1)  # (M,1)
+        w_base_sum = float(w_base.sum().item())
+        if not (w_base_sum > 0.0):
+            raise RuntimeError("Invalid ensemble weights (sum <= 0).")
+
+        # Default: weighted mean (legacy behavior).
+        comps_avg = (comps_stack * w_base.view(-1, 1, 1)).sum(dim=0) / float(w_base_sum)  # (N,5)
+
+        # Optional per-sample weighting: scale model weights by uncertainty and/or agreement per image.
+        if bool(psw_enabled) and (bool(use_mc) or bool(use_dis)) and comps_stack.numel() > 0:
+            M, N, D = int(comps_stack.shape[0]), int(comps_stack.shape[1]), int(comps_stack.shape[2])
+            if D != 5:
+                raise RuntimeError(f"Unexpected comps dimension for ensemble: D={D} (expected 5)")
+
+            w_dyn = w_base.expand(M, N).clone()  # (M,N)
+
+            # MC-dropout uncertainty weighting (requires per-model mc_var scalars).
+            if bool(use_mc):
+                mv_rows: List[torch.Tensor] = []
+                for mv in mc_var_list:
+                    if isinstance(mv, torch.Tensor) and mv.dim() == 1 and int(mv.numel()) == N:
+                        mv_rows.append(mv.view(1, N))
+                    else:
+                        mv_rows.append(torch.full((1, N), float("nan"), dtype=torch.float32))
+                mv_mat = torch.cat(mv_rows, dim=0)  # (M,N)
+                finite = torch.isfinite(mv_mat)
+                if not bool(finite.any().item()):
+                    mv_mat = torch.zeros((M, N), dtype=torch.float32)
+                else:
+                    mv_filled = mv_mat.clone()
+                    mv_filled[~finite] = 0.0
+                    try:
+                        mv_med = torch.nanmedian(mv_mat, dim=0).values  # (N,)
+                    except Exception:
+                        mv_med = mv_filled.mean(dim=0)
+                    mv_mat = torch.where(finite, mv_mat, mv_med.view(1, N))
+
+                mc_weight_fn = str(mc_cfg.get("weight_fn", "inv") or "inv").strip().lower()
+                try:
+                    mc_power = float(mc_cfg.get("power", 1.0))
+                except Exception:
+                    mc_power = 1.0
+                try:
+                    mc_weight_eps = float(mc_cfg.get("weight_eps", mc_eps))
+                except Exception:
+                    mc_weight_eps = float(mc_eps)
+                clip = mc_cfg.get("clip", None)
+                if isinstance(clip, (list, tuple)) and len(clip) == 2:
+                    try:
+                        c0 = float(clip[0])
+                        c1 = float(clip[1])
+                        mv_mat = mv_mat.clamp(min=c0, max=c1)
+                    except Exception:
+                        pass
+
+                if mc_weight_fn in ("exp", "softmax"):
+                    try:
+                        temp = float(mc_cfg.get("temperature", 1.0))
+                    except Exception:
+                        temp = 1.0
+                    temp = max(1e-8, float(temp))
+                    w_mc = torch.exp(-mv_mat / temp)
+                else:
+                    w_mc = (mv_mat + float(mc_weight_eps)).clamp_min(0.0).pow(-float(mc_power))
+
+                w_dyn = w_dyn * w_mc
+
+            # Model disagreement / consistency weighting (based on distance to the base-weight mean).
+            if bool(use_dis):
+                dis_space = str(dis_cfg.get("space", "log1p") or "log1p").strip().lower()
+                x = comps_stack.clamp_min(0.0)
+                if dis_space in ("log", "log1p"):
+                    x = torch.log1p(x)
+
+                mean_ref = (x * w_base.view(-1, 1, 1)).sum(dim=0) / float(w_base_sum)  # (N,5)
+                dis = ((x - mean_ref.view(1, N, 5)) ** 2).mean(dim=-1)  # (M,N)
+
+                dis_weight_fn = str(dis_cfg.get("weight_fn", "inv") or "inv").strip().lower()
+                try:
+                    dis_power = float(dis_cfg.get("power", 1.0))
+                except Exception:
+                    dis_power = 1.0
+                try:
+                    dis_eps = float(dis_cfg.get("eps", 1e-8))
+                except Exception:
+                    dis_eps = 1e-8
+                if dis_weight_fn in ("exp", "softmax"):
+                    try:
+                        temp = float(dis_cfg.get("temperature", 1.0))
+                    except Exception:
+                        temp = 1.0
+                    temp = max(1e-8, float(temp))
+                    w_dis = torch.exp(-dis / temp)
+                else:
+                    w_dis = (dis + float(dis_eps)).clamp_min(0.0).pow(-float(dis_power))
+
+                w_dyn = w_dyn * w_dis
+
+            # Normalize weights per sample and ensemble.
+            w_sum_dyn = w_dyn.sum(dim=0)  # (N,)
+            bad = (~torch.isfinite(w_sum_dyn)) | (w_sum_dyn <= 0.0)
+            if bool(bad.any().item()):
+                w_dyn = torch.where(bad.view(1, N), w_base.expand(M, N), w_dyn)
+                w_sum_dyn = w_dyn.sum(dim=0).clamp_min(1e-12)
+            else:
+                w_sum_dyn = w_sum_dyn.clamp_min(1e-12)
+            w_norm = w_dyn / w_sum_dyn.view(1, N)
+            comps_avg = (comps_stack * w_norm.view(M, N, 1)).sum(dim=0)
         image_to_components: Dict[str, Dict[str, float]] = {}
         for rel_path, vec in zip(rels_ref, comps_avg.tolist()):
             clover_g, dead_g, green_g, gdm_g, total_g = vec
@@ -1316,7 +1619,7 @@ def run(settings: InferenceSettings) -> None:
     # Preserve original script semantics: only prefer weights/head/ensemble.json when configs/ensemble.json is enabled.
     prefer_packaged_manifest = bool(read_ensemble_enabled_flag(project_dir_abs))
 
-    rels_in_order, comps_5d_g, _meta = infer_components_5d_for_model(
+    rels_in_order, comps_5d_g, _meta, _mc_var = infer_components_5d_for_model(
         settings=settings,
         project_dir=project_dir_abs,
         cfg=cfg,

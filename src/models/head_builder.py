@@ -1,5 +1,6 @@
 from typing import List, Optional
 
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -306,6 +307,188 @@ class MultiLayerHeadExport(nn.Module):
         else:
             ratio = None
 
+        return main, ratio
+
+
+class DualBranchHeadExport(nn.Module):
+    """
+    Export-only dual-branch regression head (MLP patch-mode + global CLS+mean(patch) branch).
+
+    Branches:
+      - Patch branch : per-patch predictions averaged over patches
+      - Global branch: single prediction from CLS+mean(patch) (or mean(patch) if use_cls_token=False)
+      - Fusion       : y = a*y_global + (1-a)*y_patch, where a = sigmoid(alpha_logit)
+
+    This module supports multi-layer backbones by using explicit per-layer bottlenecks and heads,
+    similar to `MultiLayerHeadExport`.
+    """
+
+    def __init__(
+        self,
+        *,
+        embedding_dim: int,
+        num_outputs_main: int,
+        num_outputs_ratio: int,
+        head_hidden_dims: Optional[List[int]] = None,
+        head_activation: str = "relu",
+        dropout: float = 0.0,
+        use_cls_token: bool = True,
+        num_layers: int = 1,
+        alpha_init: float = 0.2,
+    ) -> None:
+        super().__init__()
+        if int(num_layers) <= 0:
+            raise ValueError("num_layers must be >= 1 for DualBranchHeadExport")
+
+        self.embedding_dim = int(embedding_dim)
+        self.num_outputs_main = int(num_outputs_main)
+        self.num_outputs_ratio = int(num_outputs_ratio)
+        self.use_cls_token = bool(use_cls_token)
+        self.num_layers = int(num_layers)
+
+        # Learnable fusion weight (stored as logit).
+        a0 = float(max(0.0, min(1.0, float(alpha_init))))
+        eps = 1e-4
+        a0 = float(min(1.0 - eps, max(eps, a0)))
+        logit = math.log(a0 / (1.0 - a0))
+        self.alpha_logit = nn.Parameter(torch.tensor([logit], dtype=torch.float32))
+
+        # Per-layer bottlenecks:
+        #  - patch bottleneck consumes patch token dim (C)
+        #  - global bottleneck consumes CLS+mean(patch) (2C) when use_cls_token else mean(patch) (C)
+        self.layer_bottlenecks_patch = nn.ModuleList(
+            [
+                build_bottleneck_mlp(
+                    embedding_dim=self.embedding_dim,
+                    head_hidden_dims=head_hidden_dims,
+                    head_activation=head_activation,
+                    dropout=dropout,
+                    use_patch_reg3=True,
+                    use_cls_token=True,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.layer_bottlenecks_global = nn.ModuleList(
+            [
+                build_bottleneck_mlp(
+                    embedding_dim=self.embedding_dim,
+                    head_hidden_dims=head_hidden_dims,
+                    head_activation=head_activation,
+                    dropout=dropout,
+                    use_patch_reg3=False,
+                    use_cls_token=self.use_cls_token,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+
+        # Infer bottleneck dim from the patch bottleneck (same as global by construction).
+        sample_bottleneck = self.layer_bottlenecks_patch[0]
+        bottleneck_dim: Optional[int] = None
+        for m in sample_bottleneck.modules():
+            if isinstance(m, nn.Linear):
+                bottleneck_dim = m.out_features
+        if bottleneck_dim is None:
+            bottleneck_dim = self.embedding_dim
+        self.bottleneck_dim = int(bottleneck_dim)
+
+        # Per-layer heads (mirror training-time structure).
+        self.layer_reg3_heads = nn.ModuleList(
+            nn.ModuleList([nn.Linear(self.bottleneck_dim, 1) for _ in range(self.num_outputs_main)])
+            for _ in range(self.num_layers)
+        )
+        if self.num_outputs_ratio > 0:
+            self.layer_ratio_heads = nn.ModuleList(
+                nn.Linear(self.bottleneck_dim, self.num_outputs_ratio) for _ in range(self.num_layers)
+            )
+        else:
+            self.layer_ratio_heads = None  # type: ignore[assignment]
+
+    def alpha(self) -> torch.Tensor:
+        return torch.sigmoid(self.alpha_logit)
+
+    @staticmethod
+    def _forward_reg3_logits_for_heads(
+        z: torch.Tensor,
+        heads: List[nn.Linear],
+    ) -> torch.Tensor:
+        preds = [h(z) for h in heads]
+        return torch.cat(preds, dim=-1) if preds else torch.empty(
+            (z.size(0), 0), dtype=z.dtype, device=z.device
+        )
+
+    def forward_patch_layer(
+        self,
+        pt: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not (0 <= int(layer_idx) < int(self.num_layers)):
+            raise IndexError(f"layer_idx {layer_idx} out of range for num_layers={self.num_layers}")
+        if pt.dim() != 3:
+            raise RuntimeError(f"Unexpected patch tokens shape in forward_patch_layer: {tuple(pt.shape)}")
+
+        B, N, C = pt.shape
+        bottleneck = self.layer_bottlenecks_patch[int(layer_idx)]
+
+        patch_features_flat = pt.reshape(B * N, C)
+        z_patches_flat = bottleneck(patch_features_flat)
+        main_flat = self._forward_reg3_logits_for_heads(
+            z_patches_flat,
+            list(self.layer_reg3_heads[int(layer_idx)]),
+        )
+        if int(self.num_outputs_main) > 0 and main_flat.numel() > 0:
+            main = main_flat.view(B, N, self.num_outputs_main).mean(dim=1)
+        else:
+            main = torch.empty((B, 0), dtype=pt.dtype, device=pt.device)
+
+        ratio: Optional[torch.Tensor]
+        if self.num_outputs_ratio > 0 and self.layer_ratio_heads is not None:
+            patch_mean = pt.mean(dim=1)  # (B, C)
+            z_global = bottleneck(patch_mean)
+            ratio = self.layer_ratio_heads[int(layer_idx)](z_global)
+        else:
+            ratio = None
+        return main, ratio
+
+    def forward_global_layer(
+        self,
+        cls: torch.Tensor,
+        pt: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not (0 <= int(layer_idx) < int(self.num_layers)):
+            raise IndexError(f"layer_idx {layer_idx} out of range for num_layers={self.num_layers}")
+        if pt.dim() != 3:
+            raise RuntimeError(f"Unexpected patch tokens shape in forward_global_layer: {tuple(pt.shape)}")
+        patch_mean = pt.mean(dim=1)  # (B, C)
+        feats = torch.cat([cls, patch_mean], dim=-1) if self.use_cls_token else patch_mean
+        bottleneck = self.layer_bottlenecks_global[int(layer_idx)]
+        z = bottleneck(feats)
+        main = self._forward_reg3_logits_for_heads(z, list(self.layer_reg3_heads[int(layer_idx)]))
+
+        ratio: Optional[torch.Tensor]
+        if self.num_outputs_ratio > 0 and self.layer_ratio_heads is not None:
+            ratio = self.layer_ratio_heads[int(layer_idx)](z)
+        else:
+            ratio = None
+        return main, ratio
+
+    def forward_fused_layer(
+        self,
+        cls: torch.Tensor,
+        pt: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        main_p, ratio_p = self.forward_patch_layer(pt, layer_idx)
+        main_g, ratio_g = self.forward_global_layer(cls, pt, layer_idx)
+        a = self.alpha().to(device=main_p.device, dtype=main_p.dtype)
+        main = (a * main_g) + ((1.0 - a) * main_p)
+        if ratio_p is None or ratio_g is None:
+            ratio = ratio_p if ratio_g is None else ratio_g
+        else:
+            a_r = self.alpha().to(device=ratio_p.device, dtype=ratio_p.dtype)
+            ratio = (a_r * ratio_g) + ((1.0 - a_r) * ratio_p)
         return main, ratio
 
 

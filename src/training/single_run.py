@@ -329,6 +329,17 @@ def train_single_split(
     except Exception:
         ratio_head_mode = str(head_cfg.get("ratio_head_mode", "shared") or "shared").strip().lower()
 
+    # Optional dual-branch fusion for MLP patch-mode:
+    # combine patch-based main prediction with a global prediction from CLS+mean(patch).
+    dual_branch_cfg = head_cfg.get("dual_branch", {})
+    if not isinstance(dual_branch_cfg, dict):
+        dual_branch_cfg = {}
+    dual_branch_enabled = bool(dual_branch_cfg.get("enabled", False))
+    try:
+        dual_branch_alpha_init = float(dual_branch_cfg.get("alpha_init", 0.2))
+    except Exception:
+        dual_branch_alpha_init = 0.2
+
     # Optimizer / SAM configuration
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_name = str(optimizer_cfg.get("name", "adamw"))
@@ -372,6 +383,9 @@ def train_single_split(
         use_cls_token=bool(cfg["model"]["head"].get("use_cls_token", True)),
         # Optional patch-based main regression path (scheme A: only main task uses patch path).
         use_patch_reg3=bool(cfg["model"]["head"].get("use_patch_reg3", False)),
+        # Optional dual-branch fusion (MLP patch-mode only).
+        dual_branch_enabled=bool(dual_branch_enabled),
+        dual_branch_alpha_init=float(dual_branch_alpha_init),
         # Optional separate ratio head branch (decouples ratio MLP trunk from reg3 trunk).
         ratio_head_mode=str(ratio_head_mode),
         log_scale_targets=bool(cfg["model"].get("log_scale_targets", False)),
@@ -477,13 +491,13 @@ def train_single_split(
     # the suffix `/dataloader_idx_0`. Otherwise, it logs plain `val_loss`.
     use_multi_val = bool(cfg.get("ndvi_dense", {}).get("enabled", False))
     monitor_metric = "val_loss/dataloader_idx_0" if use_multi_val else "val_loss"
+    # Checkpoint policy:
+    # - Do NOT save any "best.ckpt" (or any top-k monitored checkpoints).
+    # - Keep Lightning's "last.ckpt" for backward compatibility / resume.
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
-        filename="best",
         auto_insert_metric_name=False,
-        monitor=monitor_metric,
-        mode="min",
-        save_top_k=1,
+        save_top_k=0,
         save_last=True,
     )
     callbacks.append(checkpoint_cb)

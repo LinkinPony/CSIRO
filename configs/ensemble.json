@@ -1,9 +1,41 @@
 {
   "enabled": false,
+  "aggregation": "per_sample_weighted_mean",
+  "per_sample_weighting": {
+    "enabled": true,
+    "method": "mc_and_disagreement",
+    "mc_dropout": {
+      "enabled": true,
+      "samples": 64,
+      "var_mode": "relative",
+      "include_ratio": true,
+      "ratio_weight": 1.0,
+      "eps": 1e-8,
+      "weight_fn": "inv",
+      "power": 1.0,
+      "weight_eps": 1e-8,
+      "clip": [
+        0.0,
+        1000.0
+      ]
+    },
+    "disagreement": {
+      "enabled": true,
+      "space": "log1p",
+      "weight_fn": "inv",
+      "power": 1.0,
+      "eps": 1e-8,
+      "temperature": 1.0
+    }
+  },
   "versions": [
     "vitdet-320-detach-pair-augmix",
     "vitdet-320-start-again-detach-pair",
-    "v186-align-lb0.76-vith16plus"
+    "v186-align-lb0.76-vith16plus",
+    "vitdet-640-start-again-detach-pair",
+    "mainfold-mixup-no-patch-reg3-multilayer",
+    "patch-reg3-seprate_head",
+    "mainfold-mixup-no-patch-reg3-multilayer-log"
   ]
 }
 

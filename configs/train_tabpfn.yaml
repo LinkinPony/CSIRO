@@ -103,7 +103,7 @@ finetune:
   # The fine-tuned weights can still be evaluated with a larger ensemble size afterwards.
   # NOTE: fine-tuning with n_estimators>1 is significantly more GPU-memory hungry because it builds
   # a larger autograd graph (multiple forward passes). Start with 1 to avoid OOM.
-  n_estimators: 1
+  n_estimators: 128
 
   # Precision for fine-tuning MUST be float32 for backprop (TabPFN disallows float64 in batched mode).
   inference_precision: float32
@@ -255,3 +255,12 @@ tabpfn:
 #quantiles: 
 #real: 0.525890
 #variant: 
+
+#R^2 (mlp-patch-augmix, n_estimators = 128)
+#default:  image=0.665844 tabpfn=0.684161 Δ=+0.018317
+#real-variant: 
+#small-samples: 
+#low-skew: image=0.665844 tabpfn=0.687738 Δ=+0.021894
+#quantiles: 
+#real: .665844 tabpfn=0.684756 Δ=+0.018911
+#variant:

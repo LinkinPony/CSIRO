@@ -65,6 +65,7 @@ class RegressorForwardMixin:
         self,
         images: Optional[Tensor] = None,
         pt_tokens: Optional[Tensor] = None,
+        cls_token: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Compute main reg3 prediction logits (before optional Softplus) and global bottleneck
@@ -98,9 +99,10 @@ class RegressorForwardMixin:
                 raise ValueError(
                     "Either images or pt_tokens must be provided in patch-mode reg3"
                 )
-            _, pt = self.feature_extractor.forward_cls_and_tokens(images)
+            cls_tok, pt = self.feature_extractor.forward_cls_and_tokens(images)
         else:
             pt = pt_tokens
+            cls_tok = cls_token
         if pt.dim() != 3:
             raise RuntimeError(
                 f"Unexpected patch tokens shape in patch-mode reg3: {tuple(pt.shape)}"
@@ -108,7 +110,7 @@ class RegressorForwardMixin:
         B, N, C = pt.shape
         # Global bottleneck uses only the mean patch token (patch-only, C-dim).
         patch_mean = pt.mean(dim=1)  # (B, C)
-        z_global = self.shared_bottleneck(patch_mean)  # (B, bottleneck_dim)
+        z_patch = self.shared_bottleneck(patch_mean)  # (B, bottleneck_dim)
 
         # Build per-patch features for the main regression path: each patch token (C-dim)
         # is fed through the shared bottleneck, and predictions are averaged over patches.
@@ -117,8 +119,38 @@ class RegressorForwardMixin:
         pred_patches_flat = self._forward_reg3_logits(z_patches_flat)  # (B*N, num_outputs)
         pred_patches = pred_patches_flat.view(B, N, self.num_outputs)  # (B, N, num_outputs)
         # Average over patches to obtain per-image logits.
-        pred_reg3_logits = pred_patches.mean(dim=1)  # (B, num_outputs)
-        return pred_reg3_logits, z_global
+        pred_patch = pred_patches.mean(dim=1)  # (B, num_outputs)
+
+        # Optional dual-branch fusion: fuse patch prediction with a global prediction from
+        # CLS+mean(patch) using a learnable alpha (stored as a logit).
+        try:
+            dual_enabled = bool(getattr(self, "dual_branch_enabled", False))
+        except Exception:
+            dual_enabled = False
+        bott_global = getattr(self, "shared_bottleneck_global", None)
+        alpha_logit = getattr(self, "dual_branch_alpha_logit", None)
+        if dual_enabled and isinstance(bott_global, nn.Module):
+            feats_global: Optional[Tensor] = None
+            if bool(getattr(self, "use_cls_token", True)):
+                if isinstance(cls_tok, Tensor):
+                    feats_global = torch.cat([cls_tok, patch_mean], dim=-1)
+            else:
+                feats_global = patch_mean
+            if feats_global is None:
+                # Fallback: cannot construct CLS+mean(patch) features without CLS.
+                return pred_patch, z_patch
+
+            z_global = bott_global(feats_global)
+            pred_global = self._forward_reg3_logits(z_global)
+            if isinstance(alpha_logit, torch.Tensor):
+                a = torch.sigmoid(alpha_logit).to(device=pred_patch.device, dtype=pred_patch.dtype)
+            else:
+                a = pred_patch.new_tensor([0.5])
+            pred_fused = (a * pred_global) + ((1.0 - a) * pred_patch)
+            z_fused = (a.to(device=z_patch.device, dtype=z_patch.dtype) * z_global) + ((1.0 - a.to(device=z_patch.device, dtype=z_patch.dtype)) * z_patch)
+            return pred_fused, z_fused
+
+        return pred_patch, z_patch
 
     def _compute_reg3_and_z_multilayer(
         self,
@@ -246,8 +278,7 @@ class RegressorForwardMixin:
                     bottleneck = self.layer_bottlenecks[layer_idx]
                 else:
                     bottleneck = self.shared_bottleneck
-                z_global_l = bottleneck(patch_mean)  # (B, bottleneck_dim)
-                z_layers.append(z_global_l)
+                z_patch_l = bottleneck(patch_mean)  # (B, bottleneck_dim)
 
                 patch_features_flat = pt.reshape(B * N, C)
                 z_patches_flat = bottleneck(patch_features_flat)  # (B*N, bottleneck_dim)
@@ -257,7 +288,44 @@ class RegressorForwardMixin:
                     heads_l = list(self.reg3_heads)
                 pred_patches_flat = self._forward_reg3_logits_for_heads(z_patches_flat, heads_l)  # (B*N, num_outputs)
                 pred_patches = pred_patches_flat.view(B, N, self.num_outputs)
-                pred_l = pred_patches.mean(dim=1)  # (B, num_outputs)
+                pred_patch_l = pred_patches.mean(dim=1)  # (B, num_outputs)
+
+                # Optional dual-branch fusion (per-layer): global prediction from CLS+mean(patch)
+                # fused with patch prediction.
+                try:
+                    dual_enabled = bool(getattr(self, "dual_branch_enabled", False))
+                except Exception:
+                    dual_enabled = False
+                bott_global = None
+                if dual_enabled:
+                    lb_g = getattr(self, "layer_bottlenecks_global", None)
+                    if lb_g is not None:
+                        try:
+                            bott_global = lb_g[layer_idx]
+                        except Exception:
+                            bott_global = None
+                    if bott_global is None:
+                        bott_global = getattr(self, "shared_bottleneck_global", None)
+                if dual_enabled and isinstance(bott_global, nn.Module):
+                    if bool(getattr(self, "use_cls_token", True)):
+                        feats_global_l = torch.cat([cls, patch_mean], dim=-1)
+                    else:
+                        feats_global_l = patch_mean
+                    z_global_l = bott_global(feats_global_l)
+                    pred_global_l = self._forward_reg3_logits_for_heads(z_global_l, heads_l)
+                    alpha_logit = getattr(self, "dual_branch_alpha_logit", None)
+                    if isinstance(alpha_logit, torch.Tensor):
+                        a = torch.sigmoid(alpha_logit).to(device=pred_patch_l.device, dtype=pred_patch_l.dtype)
+                    else:
+                        a = pred_patch_l.new_tensor([0.5])
+                    pred_l = (a * pred_global_l) + ((1.0 - a) * pred_patch_l)
+                    a_z = a.to(device=z_patch_l.device, dtype=z_patch_l.dtype)
+                    z_l = (a_z * z_global_l) + ((1.0 - a_z) * z_patch_l)
+                else:
+                    pred_l = pred_patch_l
+                    z_l = z_patch_l
+
+                z_layers.append(z_l)
                 pred_layers.append(pred_l)
 
         w = self._get_backbone_layer_fusion_weights(

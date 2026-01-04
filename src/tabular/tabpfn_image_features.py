@@ -276,7 +276,7 @@ def extract_head_penultimate_features_as_tabular(
     from src.inference.data import TestImageDataset, build_transforms
     from src.inference.torch_load import load_head_state
     from src.models.backbone import build_feature_extractor
-    from src.models.head_builder import MultiLayerHeadExport, build_head_layer
+    from src.models.head_builder import DualBranchHeadExport, MultiLayerHeadExport, build_head_layer
     from src.models.vitdet_head import ViTDetHeadConfig, ViTDetMultiLayerScalarHead, ViTDetScalarHead
 
     if "image_path" not in df.columns:
@@ -427,6 +427,7 @@ def extract_head_penultimate_features_as_tabular(
         # - Or a packed MLP nn.Sequential built by build_head_layer
         use_patch_reg3 = bool(head_meta.get("use_patch_reg3", False))
         use_cls_token = bool(head_meta.get("use_cls_token", True))
+        dual_branch_enabled = bool(head_meta.get("dual_branch_enabled", False))
         use_layerwise_heads = bool(head_meta.get("use_layerwise_heads", False))
         layer_indices = list(head_meta.get("backbone_layer_indices", []))
         use_separate_bottlenecks = bool(head_meta.get("use_separate_bottlenecks", False))
@@ -437,7 +438,23 @@ def extract_head_penultimate_features_as_tabular(
         head_activation = str(head_meta.get("head_activation", "relu"))
         head_dropout = float(head_meta.get("head_dropout", 0.0))
 
-        if use_layerwise_heads and use_separate_bottlenecks:
+        if dual_branch_enabled and use_patch_reg3:
+            try:
+                alpha_init = float(head_meta.get("dual_branch_alpha_init", 0.2))
+            except Exception:
+                alpha_init = 0.2
+            head_module = DualBranchHeadExport(
+                embedding_dim=embedding_dim,
+                num_outputs_main=int(head_meta.get("num_outputs_main", 1)),
+                num_outputs_ratio=int(head_meta.get("num_outputs_ratio", 0)),
+                head_hidden_dims=head_hidden_dims,
+                head_activation=head_activation,
+                dropout=head_dropout,
+                use_cls_token=use_cls_token,
+                num_layers=num_layers_eff,
+                alpha_init=float(alpha_init),
+            )
+        elif use_layerwise_heads and use_separate_bottlenecks:
             head_module = MultiLayerHeadExport(
                 embedding_dim=embedding_dim,
                 num_outputs_main=int(head_meta.get("num_outputs_main", 1)),
@@ -531,6 +548,7 @@ def extract_head_penultimate_features_as_tabular(
                 # MLP head: extract the tensor right before the final Linear layer.
                 use_patch_reg3 = bool(head_meta.get("use_patch_reg3", False))
                 use_cls_token = bool(head_meta.get("use_cls_token", True))
+                dual_branch_enabled = bool(head_meta.get("dual_branch_enabled", False))
                 use_layerwise_heads = bool(head_meta.get("use_layerwise_heads", False))
                 layer_indices = list(head_meta.get("backbone_layer_indices", []))
                 use_separate_bottlenecks = bool(head_meta.get("use_separate_bottlenecks", False))
@@ -558,14 +576,23 @@ def extract_head_penultimate_features_as_tabular(
                             if pt_l.dim() != 3:
                                 raise RuntimeError(f"Unexpected patch token shape: {tuple(pt_l.shape)}")
                             B, N, C = pt_l.shape
-                            if use_separate_bottlenecks and isinstance(head_module, MultiLayerHeadExport):
+                            if dual_branch_enabled and isinstance(head_module, DualBranchHeadExport):
+                                z_flat = head_module.layer_bottlenecks_patch[l_idx](pt_l.reshape(B * N, C).to(device))  # type: ignore[attr-defined]
+                                z_patch = z_flat.view(B, N, -1).mean(dim=1)
+                                patch_mean = pt_l.mean(dim=1)
+                                feats_l = torch.cat([cls_l, patch_mean], dim=-1) if use_cls_token else patch_mean
+                                z_global = head_module.layer_bottlenecks_global[l_idx](feats_l.to(device))  # type: ignore[attr-defined]
+                                a = torch.sigmoid(head_module.alpha_logit).to(device=z_patch.device, dtype=z_patch.dtype)  # type: ignore[attr-defined]
+                                z_l = (a * z_global) + ((1.0 - a) * z_patch)
+                            elif use_separate_bottlenecks and isinstance(head_module, MultiLayerHeadExport):
                                 bottleneck = head_module.layer_bottlenecks[l_idx]
                                 z_flat = bottleneck(pt_l.reshape(B * N, C).to(device))
+                                z_l = z_flat.view(B, N, -1).mean(dim=1)
                             else:
                                 if not isinstance(head_module, nn.Sequential):
                                     raise RuntimeError("Expected nn.Sequential MLP head for packed layerwise path.")
                                 z_flat = _penultimate_from_sequential(head_module, pt_l.reshape(B * N, C).to(device))
-                            z_l = z_flat.view(B, N, -1).mean(dim=1)
+                                z_l = z_flat.view(B, N, -1).mean(dim=1)
                         else:
                             patch_mean = pt_l.mean(dim=1)
                             feats_l = torch.cat([cls_l, patch_mean], dim=-1) if use_cls_token else patch_mean
@@ -584,11 +611,19 @@ def extract_head_penultimate_features_as_tabular(
                         if pt.dim() != 3:
                             raise RuntimeError(f"Unexpected patch token shape: {tuple(pt.shape)}")
                         B, N, C = pt.shape
-                        if isinstance(head_module, nn.Sequential):
+                        if dual_branch_enabled and isinstance(head_module, DualBranchHeadExport):
+                            z_flat = head_module.layer_bottlenecks_patch[0](pt.reshape(B * N, C).to(device))  # type: ignore[attr-defined]
+                            z_patch = z_flat.view(B, N, -1).mean(dim=1)
+                            patch_mean = pt.mean(dim=1)
+                            feats_in = torch.cat([cls, patch_mean], dim=-1) if use_cls_token else patch_mean
+                            z_global = head_module.layer_bottlenecks_global[0](feats_in.to(device))  # type: ignore[attr-defined]
+                            a = torch.sigmoid(head_module.alpha_logit).to(device=z_patch.device, dtype=z_patch.dtype)  # type: ignore[attr-defined]
+                            feats = (a * z_global) + ((1.0 - a) * z_patch)
+                        elif isinstance(head_module, nn.Sequential):
                             z_flat = _penultimate_from_sequential(head_module, pt.reshape(B * N, C).to(device))
+                            feats = z_flat.view(B, N, -1).mean(dim=1)
                         else:
                             raise RuntimeError("Expected nn.Sequential MLP head in single-layer patch-mode.")
-                        feats = z_flat.view(B, N, -1).mean(dim=1)
                     else:
                         patch_mean = pt.mean(dim=1)
                         feats_in = torch.cat([cls, patch_mean], dim=-1) if use_cls_token else patch_mean

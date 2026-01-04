@@ -559,16 +559,38 @@ class PredictionMixin:
                     and (not is_ndvi_only)
                 ):
                     try:
-                        pt_stack = torch.stack(pt_list, dim=1)
-                        pt_stack, batch, _ = self._manifold_mixup.apply(
-                            pt_stack,
-                            batch,
-                            force=True,
-                            lam=mixup_lam,
-                            perm=mixup_perm,
-                            mix_labels=mixup_mix_labels,
-                        )
-                        pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
+                        mix_cls = bool(getattr(self._manifold_mixup, "mix_cls_token", True))
+                        if mix_cls and cls_list is not None:
+                            # Mix CLS + patch tokens together (per-layer) for consistency.
+                            tok_stack = torch.stack(
+                                [
+                                    torch.cat([cls_l.unsqueeze(1), pt_l], dim=1)
+                                    for cls_l, pt_l in zip(cls_list, pt_list)
+                                ],
+                                dim=1,
+                            )  # (B, L, N+1, C)
+                            tok_stack, batch, _ = self._manifold_mixup.apply(
+                                tok_stack,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
+                            )
+                            cls_list = [tok_stack[:, i, 0] for i in range(tok_stack.shape[1])]
+                            pt_list = [tok_stack[:, i, 1:] for i in range(tok_stack.shape[1])]
+                        else:
+                            # Legacy behavior: mix patch tokens only; keep CLS intact.
+                            pt_stack = torch.stack(pt_list, dim=1)
+                            pt_stack, batch, _ = self._manifold_mixup.apply(
+                                pt_stack,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
+                            )
+                            pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
                     except Exception as e:
                         self._raise_manifold_mixup_error(
                             context="mlp/multilayer/patch_tokens",
@@ -581,7 +603,7 @@ class PredictionMixin:
 
         else:
             if self.use_patch_reg3:
-                _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                cls_tok, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
                 if (
                     use_mixup
                     and self._manifold_mixup is not None
@@ -589,14 +611,28 @@ class PredictionMixin:
                     and (not is_ndvi_only)
                 ):
                     try:
-                        pt_tokens, batch, _ = self._manifold_mixup.apply(
-                            pt_tokens,
-                            batch,
-                            force=True,
-                            lam=mixup_lam,
-                            perm=mixup_perm,
-                            mix_labels=mixup_mix_labels,
-                        )
+                        mix_cls = bool(getattr(self._manifold_mixup, "mix_cls_token", True))
+                        if mix_cls:
+                            tok = torch.cat([cls_tok.unsqueeze(1), pt_tokens], dim=1)  # (B, N+1, C)
+                            tok, batch, _ = self._manifold_mixup.apply(
+                                tok,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
+                            )
+                            cls_tok = tok[:, 0]
+                            pt_tokens = tok[:, 1:]
+                        else:
+                            pt_tokens, batch, _ = self._manifold_mixup.apply(
+                                pt_tokens,
+                                batch,
+                                force=True,
+                                lam=mixup_lam,
+                                perm=mixup_perm,
+                                mix_labels=mixup_mix_labels,
+                            )
                     except Exception as e:
                         self._raise_manifold_mixup_error(
                             context="mlp/singlelayer/patch_tokens",
@@ -604,7 +640,9 @@ class PredictionMixin:
                             batch=batch,
                             x=pt_tokens,
                         )
-                pred_reg3, z = self._compute_reg3_from_images(images=None, pt_tokens=pt_tokens)
+                pred_reg3, z = self._compute_reg3_from_images(
+                    images=None, pt_tokens=pt_tokens, cls_token=cls_tok
+                )
             else:
                 apply_mm = bool(
                     use_mixup

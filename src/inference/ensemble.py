@@ -158,11 +158,12 @@ def save_ensemble_cache(
     model_weight: float,
     rels_in_order: List[str],
     comps_5d_g: torch.Tensor,
+    mc_var: Optional[torch.Tensor] = None,
     meta: Optional[dict] = None,
 ) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_id": str(model_id),
         "model_weight": float(model_weight),
         "components_order": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"],
@@ -170,21 +171,35 @@ def save_ensemble_cache(
         "comps_5d_g": comps_5d_g.detach().cpu().float(),
         "meta": meta or {},
     }
+    if isinstance(mc_var, torch.Tensor):
+        # MC-dropout uncertainty scalar per image (N,) or (N,1).
+        mv = mc_var.detach().cpu().float()
+        if mv.dim() == 2 and mv.size(-1) == 1:
+            mv = mv.view(-1)
+        payload["mc_var"] = mv
     torch.save(payload, cache_path)
 
 
-def load_ensemble_cache(cache_path: str) -> Tuple[List[str], torch.Tensor, dict]:
+def load_ensemble_cache(cache_path: str) -> Tuple[List[str], torch.Tensor, dict, Optional[torch.Tensor]]:
     obj = torch_load_cpu(cache_path, mmap=None, weights_only=True)
     if not isinstance(obj, dict):
         raise RuntimeError(f"Invalid cache format (expected dict): {cache_path}")
     rels = obj.get("rels_in_order", None)
     comps = obj.get("comps_5d_g", None)
     meta = obj.get("meta", {}) if isinstance(obj.get("meta", {}), dict) else {}
+    mc_var = obj.get("mc_var", None)
     if not isinstance(rels, list) or comps is None:
         raise RuntimeError(f"Invalid cache payload (missing rels/comps): {cache_path}")
     if not isinstance(comps, torch.Tensor) or comps.dim() != 2 or comps.size(-1) != 5:
         raise RuntimeError(f"Invalid comps_5d_g shape in cache: {cache_path}")
-    return [str(r) for r in rels], comps.detach().cpu().float(), meta
+    mc_var_out: Optional[torch.Tensor] = None
+    if isinstance(mc_var, torch.Tensor):
+        mv = mc_var.detach().cpu().float()
+        if mv.dim() == 2 and mv.size(-1) == 1:
+            mv = mv.view(-1)
+        if mv.dim() == 1 and mv.numel() == int(comps.shape[0]):
+            mc_var_out = mv
+    return [str(r) for r in rels], comps.detach().cpu().float(), meta, mc_var_out
 
 
 def resolve_cache_dir(project_dir: str, cache_dir_cfg: Optional[str]) -> str:

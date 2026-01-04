@@ -145,6 +145,9 @@ def extract_head_penultimate_features(
     batch_size: int,
     num_workers: int,
     cache_path: Optional[str],
+    image_size_hw: Optional[Tuple[int, int]] = None,
+    hflip: bool = False,
+    vflip: bool = False,
 ) -> Tuple[List[str], np.ndarray]:
     """
     Extract head-penultimate (pre-final-linear) features for a list of image rel paths.
@@ -161,7 +164,7 @@ def extract_head_penultimate_features(
     from src.inference.paths import resolve_path_best_effort
     from src.inference.torch_load import load_head_state
     from src.models.backbone import build_feature_extractor
-    from src.models.head_builder import MultiLayerHeadExport, build_head_layer
+    from src.models.head_builder import DualBranchHeadExport, MultiLayerHeadExport, build_head_layer
     from src.models.vitdet_head import ViTDetHeadConfig, ViTDetMultiLayerScalarHead, ViTDetScalarHead
 
     fusion_eff = str(fusion or "mean").strip().lower()
@@ -283,17 +286,23 @@ def extract_head_penultimate_features(
     if not backbone_name:
         raise RuntimeError("configs/train.yaml missing model.backbone")
 
-    # Preprocessing (reuse train.yaml to match model training)
-    image_size_raw = cfg_train_yaml.get("data", {}).get("image_size", 224)
-    try:
-        if isinstance(image_size_raw, (list, tuple)) and len(image_size_raw) == 2:
-            image_size = (int(image_size_raw[1]), int(image_size_raw[0]))  # (H,W)
-        else:
+    # Preprocessing (reuse train.yaml to match model training, unless overridden for TTA).
+    if image_size_hw is not None:
+        try:
+            image_size = (int(image_size_hw[0]), int(image_size_hw[1]))  # (H,W)
+        except Exception:
+            image_size = (int(image_size_hw[0]), int(image_size_hw[0]))  # type: ignore[index]
+    else:
+        image_size_raw = cfg_train_yaml.get("data", {}).get("image_size", 224)
+        try:
+            if isinstance(image_size_raw, (list, tuple)) and len(image_size_raw) == 2:
+                image_size = (int(image_size_raw[1]), int(image_size_raw[0]))  # (H,W)
+            else:
+                v = int(image_size_raw)
+                image_size = (v, v)
+        except Exception:
             v = int(image_size_raw)
             image_size = (v, v)
-    except Exception:
-        v = int(image_size_raw)
-        image_size = (v, v)
     mean = list(cfg_train_yaml.get("data", {}).get("normalization", {}).get("mean", [0.485, 0.456, 0.406]))
     std = list(cfg_train_yaml.get("data", {}).get("normalization", {}).get("std", [0.229, 0.224, 0.225]))
 
@@ -315,12 +324,15 @@ def extract_head_penultimate_features(
                         and str(cached_meta.get("head_weights_path", "")) == str(head_pt)
                         and str(cached_meta.get("dino_weights_pt_file", "")) == str(dino_weights_pt_file)
                         and str(cached_meta.get("fusion", "")) == str(fusion_eff)
+                        and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
+                        and bool(cached_meta.get("hflip", False)) == bool(hflip)
+                        and bool(cached_meta.get("vflip", False)) == bool(vflip)
                     ):
                         return cached_paths, feats.cpu().numpy()
             except Exception:
                 pass
 
-    tf = build_transforms(image_size=image_size, mean=mean, std=std, hflip=False, vflip=False)
+    tf = build_transforms(image_size=image_size, mean=mean, std=std, hflip=bool(hflip), vflip=bool(vflip))
     ds = TestImageDataset(list(image_paths), root_dir=str(dataset_root_abs), transform=tf)
     dl = DataLoader(
         ds,
@@ -394,6 +406,7 @@ def extract_head_penultimate_features(
     else:
         use_patch_reg3 = bool(head_meta.get("use_patch_reg3", False))
         use_cls_token = bool(head_meta.get("use_cls_token", True))
+        dual_branch_enabled = bool(head_meta.get("dual_branch_enabled", False))
         use_layerwise_heads = bool(head_meta.get("use_layerwise_heads", False))
         layer_indices = list(head_meta.get("backbone_layer_indices", []))
         use_separate_bottlenecks = bool(head_meta.get("use_separate_bottlenecks", False))
@@ -410,7 +423,23 @@ def extract_head_penultimate_features(
         head_activation = str(head_meta.get("head_activation", "relu"))
         head_dropout = float(head_meta.get("head_dropout", 0.0))
 
-        if use_layerwise_heads and use_separate_bottlenecks:
+        if dual_branch_enabled and use_patch_reg3:
+            try:
+                alpha_init = float(head_meta.get("dual_branch_alpha_init", 0.2))
+            except Exception:
+                alpha_init = 0.2
+            head_module = DualBranchHeadExport(
+                embedding_dim=embedding_dim,
+                num_outputs_main=int(head_meta.get("num_outputs_main", 1)),
+                num_outputs_ratio=int(head_meta.get("num_outputs_ratio", 0)),
+                head_hidden_dims=head_hidden_dims,
+                head_activation=head_activation,
+                dropout=head_dropout,
+                use_cls_token=use_cls_token,
+                num_layers=num_layers_eff,
+                alpha_init=float(alpha_init),
+            )
+        elif use_layerwise_heads and use_separate_bottlenecks:
             head_module = MultiLayerHeadExport(
                 embedding_dim=embedding_dim,
                 num_outputs_main=int(head_meta.get("num_outputs_main", 1)),
@@ -501,6 +530,7 @@ def extract_head_penultimate_features(
             else:
                 use_patch_reg3 = bool(head_meta.get("use_patch_reg3", False))
                 use_cls_token = bool(head_meta.get("use_cls_token", True))
+                dual_branch_enabled = bool(head_meta.get("dual_branch_enabled", False))
                 use_layerwise_heads = bool(head_meta.get("use_layerwise_heads", False))
                 layer_indices = list(head_meta.get("backbone_layer_indices", []))
                 use_separate_bottlenecks = bool(head_meta.get("use_separate_bottlenecks", False))
@@ -526,14 +556,24 @@ def extract_head_penultimate_features(
                             if pt_l.dim() != 3:
                                 raise RuntimeError(f"Unexpected patch token shape: {tuple(pt_l.shape)}")
                             B, N, C = pt_l.shape
-                            if use_separate_bottlenecks and isinstance(head_module, MultiLayerHeadExport):
+                            if dual_branch_enabled and isinstance(head_module, DualBranchHeadExport):
+                                # Dual-branch: fuse patch-bottleneck features with global-bottleneck features.
+                                z_flat = head_module.layer_bottlenecks_patch[l_idx](pt_l.reshape(B * N, C).to(device))  # type: ignore[attr-defined]
+                                z_patch = z_flat.view(B, N, -1).mean(dim=1)
+                                patch_mean = pt_l.mean(dim=1)
+                                feats_l = torch.cat([cls_l, patch_mean], dim=-1) if use_cls_token else patch_mean
+                                z_global = head_module.layer_bottlenecks_global[l_idx](feats_l.to(device))  # type: ignore[attr-defined]
+                                a = torch.sigmoid(head_module.alpha_logit).to(device=z_patch.device, dtype=z_patch.dtype)  # type: ignore[attr-defined]
+                                z_l = (a * z_global) + ((1.0 - a) * z_patch)
+                            elif use_separate_bottlenecks and isinstance(head_module, MultiLayerHeadExport):
                                 bottleneck = head_module.layer_bottlenecks[l_idx]
                                 z_flat = bottleneck(pt_l.reshape(B * N, C).to(device))
+                                z_l = z_flat.view(B, N, -1).mean(dim=1)
                             else:
                                 if not isinstance(head_module, nn.Sequential):
                                     raise RuntimeError("Expected nn.Sequential MLP head for packed layerwise path.")
                                 z_flat = _penultimate_from_sequential(head_module, pt_l.reshape(B * N, C).to(device))
-                            z_l = z_flat.view(B, N, -1).mean(dim=1)
+                                z_l = z_flat.view(B, N, -1).mean(dim=1)
                         else:
                             patch_mean = pt_l.mean(dim=1)
                             feats_l = torch.cat([cls_l, patch_mean], dim=-1) if use_cls_token else patch_mean
@@ -552,11 +592,19 @@ def extract_head_penultimate_features(
                         if pt.dim() != 3:
                             raise RuntimeError(f"Unexpected patch token shape: {tuple(pt.shape)}")
                         B, N, C = pt.shape
-                        if isinstance(head_module, nn.Sequential):
+                        if dual_branch_enabled and isinstance(head_module, DualBranchHeadExport):
+                            z_flat = head_module.layer_bottlenecks_patch[0](pt.reshape(B * N, C).to(device))  # type: ignore[attr-defined]
+                            z_patch = z_flat.view(B, N, -1).mean(dim=1)
+                            patch_mean = pt.mean(dim=1)
+                            feats_in = torch.cat([cls, patch_mean], dim=-1) if use_cls_token else patch_mean
+                            z_global = head_module.layer_bottlenecks_global[0](feats_in.to(device))  # type: ignore[attr-defined]
+                            a = torch.sigmoid(head_module.alpha_logit).to(device=z_patch.device, dtype=z_patch.dtype)  # type: ignore[attr-defined]
+                            feats = (a * z_global) + ((1.0 - a) * z_patch)
+                        elif isinstance(head_module, nn.Sequential):
                             z_flat = _penultimate_from_sequential(head_module, pt.reshape(B * N, C).to(device))
+                            feats = z_flat.view(B, N, -1).mean(dim=1)
                         else:
                             raise RuntimeError("Expected nn.Sequential MLP head in single-layer patch-mode.")
-                        feats = z_flat.view(B, N, -1).mean(dim=1)
                     else:
                         patch_mean = pt.mean(dim=1)
                         feats_in = torch.cat([cls, patch_mean], dim=-1) if use_cls_token else patch_mean
@@ -589,6 +637,9 @@ def extract_head_penultimate_features(
                         "head_weights_path": str(head_pt),
                         "dino_weights_pt_file": str(dino_weights_pt_file),
                         "fusion": str(fusion_eff),
+                        "image_size": tuple(image_size),
+                        "hflip": bool(hflip),
+                        "vflip": bool(vflip),
                     },
                 },
                 cache_path_eff,
@@ -610,6 +661,9 @@ def extract_dinov3_cls_features(
     batch_size: int,
     num_workers: int,
     cache_path: Optional[str],
+    image_size_hw: Optional[Tuple[int, int]] = None,
+    hflip: bool = False,
+    vflip: bool = False,
 ) -> Tuple[List[str], np.ndarray]:
     """
     Extract frozen DINOv3 CLS token features for a list of image rel paths.
@@ -634,17 +688,23 @@ def extract_dinov3_cls_features(
     if not backbone_name:
         raise RuntimeError("configs/train.yaml missing model.backbone")
 
-    # Preprocessing (reuse train.yaml to match model training)
-    image_size_raw = cfg_train_yaml.get("data", {}).get("image_size", 224)
-    try:
-        if isinstance(image_size_raw, (list, tuple)) and len(image_size_raw) == 2:
-            image_size = (int(image_size_raw[1]), int(image_size_raw[0]))  # (H,W)
-        else:
+    # Preprocessing (reuse train.yaml to match model training, unless overridden for TTA).
+    if image_size_hw is not None:
+        try:
+            image_size = (int(image_size_hw[0]), int(image_size_hw[1]))  # (H,W)
+        except Exception:
+            image_size = (int(image_size_hw[0]), int(image_size_hw[0]))  # type: ignore[index]
+    else:
+        image_size_raw = cfg_train_yaml.get("data", {}).get("image_size", 224)
+        try:
+            if isinstance(image_size_raw, (list, tuple)) and len(image_size_raw) == 2:
+                image_size = (int(image_size_raw[1]), int(image_size_raw[0]))  # (H,W)
+            else:
+                v = int(image_size_raw)
+                image_size = (v, v)
+        except Exception:
             v = int(image_size_raw)
             image_size = (v, v)
-    except Exception:
-        v = int(image_size_raw)
-        image_size = (v, v)
     mean = list(cfg_train_yaml.get("data", {}).get("normalization", {}).get("mean", [0.485, 0.456, 0.406]))
     std = list(cfg_train_yaml.get("data", {}).get("normalization", {}).get("std", [0.229, 0.224, 0.225]))
 
@@ -667,12 +727,14 @@ def extract_dinov3_cls_features(
                         and str(cached_meta.get("backbone", "")) == str(backbone_name)
                         and str(cached_meta.get("weights_path", "")) == str(dino_weights_pt_file)
                         and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
+                        and bool(cached_meta.get("hflip", False)) == bool(hflip)
+                        and bool(cached_meta.get("vflip", False)) == bool(vflip)
                     ):
                         return cached_paths, feats.cpu().numpy()
             except Exception:
                 pass
 
-    tf = build_transforms(image_size=image_size, mean=mean, std=std, hflip=False, vflip=False)
+    tf = build_transforms(image_size=image_size, mean=mean, std=std, hflip=bool(hflip), vflip=bool(vflip))
     ds = TestImageDataset(list(image_paths), root_dir=str(dataset_root_abs), transform=tf)
     dl = DataLoader(
         ds,
@@ -728,6 +790,8 @@ def extract_dinov3_cls_features(
                         "backbone": str(backbone_name),
                         "weights_path": str(dino_weights_pt_file),
                         "image_size": tuple(image_size),
+                        "hflip": bool(hflip),
+                        "vflip": bool(vflip),
                     },
                 },
                 cache_path_eff,
@@ -774,8 +838,20 @@ def run_tabpfn_submission(
     import pandas as pd
 
     from src.inference.data import resolve_paths
-    from src.inference.pipeline import load_config, resolve_dino_weights_path_for_model
-    from src.inference.paths import resolve_path_best_effort
+    from src.inference.ensemble import normalize_ensemble_models, read_ensemble_cfg_obj, resolve_cache_dir
+    from src.inference.pipeline import (
+        _resolve_tta_views,
+        load_config,
+        load_config_file,
+        parse_image_size,
+        resolve_dino_weights_path_for_model,
+    )
+    from src.inference.paths import (
+        resolve_path_best_effort,
+        resolve_version_head_base,
+        resolve_version_train_yaml,
+        safe_slug,
+    )
 
     project_dir_abs = os.path.abspath(settings.project_dir) if settings.project_dir else ""
     if not (project_dir_abs and os.path.isdir(project_dir_abs)):
@@ -831,6 +907,392 @@ def run_tabpfn_submission(
         raise RuntimeError(f"Not enough training samples after pivoting: {len(df_train)}")
     y_train = build_y_5d(df_train, targets_5d_order=list(TARGETS_5D_ORDER), fillna=0.0)
 
+    # ==========================================================
+    # Ensemble + TabPFN (feature-level) path
+    #
+    # Strategy (as requested):
+    # - Extract + cache per-model features for ALL ensemble models
+    # - Fit a SINGLE TabPFN model on stacked train features (repeat y per model)
+    # - For test: run that single TabPFN on each model's test features and average predictions
+    # ==========================================================
+    ensemble_models = normalize_ensemble_models(project_dir_abs)
+    if len(ensemble_models) > 0:
+        import numpy as np
+
+        feature_mode = str(getattr(tabpfn, "feature_mode", "head_penultimate") or "head_penultimate").strip().lower()
+        if feature_mode not in ("head_penultimate", "dinov3_only"):
+            raise ValueError(
+                f"Unsupported TabPFN feature_mode: {feature_mode!r} (expected 'head_penultimate' or 'dinov3_only')"
+            )
+
+        # Default feature-cache directory (always enabled for ensemble+tabpfn).
+        # If user provided explicit cache paths, we still namespace per-model to avoid collisions.
+        ensemble_obj = read_ensemble_cfg_obj(project_dir_abs) or {}
+        cache_dir_cfg = ensemble_obj.get("cache_dir", None) if isinstance(ensemble_obj, dict) else None
+        cache_dir = resolve_cache_dir(project_dir_abs, cache_dir_cfg)
+        feature_cache_dir_default = os.path.join(cache_dir, "tabpfn_features")
+        try:
+            os.makedirs(feature_cache_dir_default, exist_ok=True)
+        except Exception:
+            pass
+
+        def _derive_model_cache_tag(*, model_id: str, version: object) -> str:
+            base = str(model_id or "").strip() or "model"
+            if isinstance(version, (str, int, float)) and str(version).strip():
+                base = str(version).strip()
+            parts = [base, feature_mode]
+            if feature_mode != "dinov3_only":
+                parts.append(str(tabpfn.feature_fusion or "mean").strip().lower())
+            return safe_slug("__".join(parts))
+
+        def _resolve_cache_path_for_model(*, base_path: str, split: str, model_tag: str) -> str:
+            """
+            Resolve a per-model cache path.
+
+            - If base_path is empty: write under <ensemble_cache_dir>/tabpfn_features/
+            - If base_path is a directory: write <dir>/<split>__<model_tag>.pt
+            - If base_path is a file: insert __<model_tag> before extension
+            """
+            raw = str(base_path or "").strip()
+            if not raw:
+                return os.path.join(feature_cache_dir_default, f"{split}__{model_tag}.pt")
+
+            p = resolve_path_best_effort(project_dir_abs, raw)
+            # Treat as directory if:
+            # - user passed an existing directory
+            # - user passed a path ending with a separator
+            # - user passed a path without an extension (common for "directory-style" base paths)
+            if (p.endswith(os.sep) or p.endswith("/")) or os.path.isdir(p) or (os.path.splitext(p)[1] == ""):
+                d = p.rstrip("/").rstrip(os.sep)
+                return os.path.join(d, f"{split}__{model_tag}.pt")
+
+            root, ext = os.path.splitext(p)
+            ext_eff = ext if ext else ".pt"
+            return f"{root}__{model_tag}{ext_eff}"
+
+        # Normalize ensemble model entries (reuse inference.pipeline's semantics).
+        models_eff: list[dict] = []
+        for idx, m in enumerate(ensemble_models):
+            if not isinstance(m, dict):
+                continue
+            model_id = str(m.get("id", f"model_{idx}") or f"model_{idx}")
+            version = m.get("version", None)
+            try:
+                model_weight = float(m.get("weight", 1.0))
+            except Exception:
+                model_weight = 1.0
+            if not (model_weight > 0.0):
+                continue
+
+            # Resolve per-model YAML config
+            cfg_path = None
+            for k in ("config", "config_path", "train_yaml", "train_config"):
+                v = m.get(k, None)
+                if isinstance(v, str) and v.strip():
+                    cfg_path = resolve_path_best_effort(project_dir_abs, v.strip())
+                    break
+            if cfg_path is None:
+                if isinstance(version, (str, int, float)) and str(version).strip():
+                    cfg_path = resolve_version_train_yaml(project_dir_abs, str(version).strip())
+                else:
+                    cfg_path = os.path.join(project_dir_abs, "configs", "train.yaml")
+            cfg_model = load_config_file(cfg_path)
+
+            # Base image size for TTA view resolution (H,W)
+            try:
+                base_image_size_hw = parse_image_size(cfg_model.get("data", {}).get("image_size", 224))
+            except Exception:
+                base_image_size_hw = (224, 224)
+
+            # Allow overriding backbone name at model level (optional)
+            backbone_override = m.get("backbone", None)
+            if isinstance(backbone_override, str) and backbone_override.strip():
+                try:
+                    if "model" not in cfg_model or not isinstance(cfg_model["model"], dict):
+                        cfg_model["model"] = {}
+                    cfg_model["model"]["backbone"] = backbone_override.strip()
+                except Exception:
+                    pass
+
+            # Resolve head weights base path (unused for dinov3_only)
+            head_base = None
+            for k in ("head_base", "head_weights", "head_weights_path", "head_path"):
+                v = m.get(k, None)
+                if isinstance(v, str) and v.strip():
+                    head_base = v.strip()
+                    break
+            if head_base is None:
+                if isinstance(version, (str, int, float)) and str(version).strip():
+                    head_base = resolve_version_head_base(project_dir_abs, str(version).strip())
+                else:
+                    head_base = str(settings.head_weights_pt_path)
+
+            # Resolve backbone weights file
+            backbone_name_eff = str(cfg_model.get("model", {}).get("backbone", "") or "").strip()
+            dino_weights_file_i = resolve_dino_weights_path_for_model(
+                project_dir_abs,
+                backbone_name=backbone_name_eff,
+                cfg=cfg_model,
+                model_cfg=m,
+                global_dino_weights=str(settings.dino_weights_pt_path),
+            )
+            if not (dino_weights_file_i and os.path.isfile(dino_weights_file_i)):
+                p0 = resolve_path_best_effort(project_dir_abs, str(settings.dino_weights_pt_path))
+                if os.path.isfile(p0):
+                    dino_weights_file_i = os.path.abspath(p0)
+            if not (dino_weights_file_i and os.path.isfile(dino_weights_file_i)):
+                raise FileNotFoundError(
+                    "Cannot resolve DINO backbone weights file for an ensemble model: "
+                    f"model_id={model_id!r} version={version!r} backbone={backbone_name_eff!r}"
+                )
+
+            model_tag = _derive_model_cache_tag(model_id=model_id, version=version)
+            cache_train_i = _resolve_cache_path_for_model(
+                base_path=str(tabpfn.feature_cache_path_train or ""),
+                split="train",
+                model_tag=model_tag,
+            )
+
+            models_eff.append(
+                {
+                    "model_id": model_id,
+                    "version": str(version).strip() if isinstance(version, (str, int, float)) else None,
+                    "weight": float(model_weight),
+                    "cfg_path": str(cfg_path),
+                    "cfg": cfg_model,
+                    "backbone": backbone_name_eff,
+                    "base_image_size_hw": tuple(base_image_size_hw),
+                    "dino_weights_file": str(dino_weights_file_i),
+                    "head_base": str(head_base),
+                    "cache_train": str(cache_train_i),
+                    "model_tag": str(model_tag),
+                }
+            )
+
+        if not models_eff:
+            raise RuntimeError("Ensemble is enabled but no valid models were found for TabPFN.")
+
+        print(f"[TABPFN][ENSEMBLE] Models: {len(models_eff)} (single TabPFN fit; feature-level averaging)")
+        print(f"[TABPFN][ENSEMBLE] Feature cache dir (default): {feature_cache_dir_default}")
+        if feature_mode == "dinov3_only":
+            print("[TABPFN][ENSEMBLE] Feature mode: dinov3_only (CLS token; no head)")
+        else:
+            print(f"[TABPFN][ENSEMBLE] Feature mode: head_penultimate (fusion={str(tabpfn.feature_fusion)})")
+
+        # Extract + stack train features across all models
+        train_image_paths = df_train["image_path"].astype(str).tolist()
+        X_train_list: list[np.ndarray] = []
+        D_ref: Optional[int] = None
+        for mi in models_eff:
+            cfg_i = mi["cfg"]
+            dino_w_i = mi["dino_weights_file"]
+            head_base_i = mi["head_base"]
+            cache_train_i = mi["cache_train"]
+            model_id_i = mi["model_id"]
+            version_i = mi.get("version", None)
+            base_hw_i = tuple(mi.get("base_image_size_hw", (224, 224)))
+
+            print(
+                f"[TABPFN][ENSEMBLE] Extract train feats: model_id={model_id_i!r} version={version_i!r} "
+                f"backbone={mi['backbone']!r}"
+            )
+            if feature_mode == "dinov3_only":
+                _rels_train_i, X_train_i = extract_dinov3_cls_features(
+                    project_dir=project_dir_abs,
+                    dataset_root=str(dataset_root),
+                    cfg_train_yaml=cfg_i,
+                    dino_weights_pt_file=str(dino_w_i),
+                    image_paths=train_image_paths,
+                    batch_size=int(tabpfn.feature_batch_size),
+                    num_workers=int(tabpfn.feature_num_workers),
+                    cache_path=str(cache_train_i),
+                    image_size_hw=base_hw_i,
+                    hflip=False,
+                    vflip=False,
+                )
+            else:
+                _rels_train_i, X_train_i = extract_head_penultimate_features(
+                    project_dir=project_dir_abs,
+                    dataset_root=str(dataset_root),
+                    cfg_train_yaml=cfg_i,
+                    dino_weights_pt_file=str(dino_w_i),
+                    head_weights_pt_path=str(head_base_i),
+                    image_paths=train_image_paths,
+                    fusion=str(tabpfn.feature_fusion),
+                    batch_size=int(tabpfn.feature_batch_size),
+                    num_workers=int(tabpfn.feature_num_workers),
+                    cache_path=str(cache_train_i),
+                    image_size_hw=base_hw_i,
+                    hflip=False,
+                    vflip=False,
+                )
+
+            if not (isinstance(X_train_i, np.ndarray) and X_train_i.ndim == 2 and X_train_i.shape[0] == len(train_image_paths)):
+                raise RuntimeError(
+                    f"Invalid train features array for model_id={model_id_i!r}: shape={getattr(X_train_i, 'shape', None)}"
+                )
+            if D_ref is None:
+                D_ref = int(X_train_i.shape[1])
+            elif int(X_train_i.shape[1]) != int(D_ref):
+                raise RuntimeError(
+                    "TabPFN ensemble requires the SAME feature dimension across models. "
+                    f"Got D_ref={D_ref} but model_id={model_id_i!r} produced D={int(X_train_i.shape[1])}."
+                )
+            X_train_list.append(X_train_i)
+
+        X_train_all = np.concatenate(X_train_list, axis=0)
+        y_train_all = np.concatenate([y_train for _ in range(len(X_train_list))], axis=0)
+
+        print(f"[TABPFN][ENSEMBLE] X_train_all: {tuple(X_train_all.shape)}  y_train_all: {tuple(y_train_all.shape)}")
+
+        # Fit a SINGLE TabPFN on stacked train features
+        base = TabPFNRegressor(
+            n_estimators=int(tabpfn.n_estimators),
+            device=str(tabpfn.device),
+            fit_mode=str(tabpfn.fit_mode),
+            inference_precision=str(tabpfn.inference_precision),
+            random_state=42,
+            ignore_pretraining_limits=bool(tabpfn.ignore_pretraining_limits),
+            model_path=str(ckpt_path),
+        )
+        model = MultiOutputRegressor(base, n_jobs=int(tabpfn.n_jobs))
+        try:
+            model.fit(X_train_all, y_train_all)
+        except RuntimeError as e:
+            msg = str(e)
+            msg_l = msg.lower()
+            if (
+                "gated" in msg_l
+                or "authentication error" in msg_l
+                or "hf auth login" in msg_l
+                or "hf_token" in msg_l
+                or "unauthorized" in msg_l
+            ):
+                raise SystemExit(
+                    "TabPFN attempted a HuggingFace download/auth flow, but this pipeline is configured for local-only weights.\n"
+                    f"Please ensure weights_ckpt_path points to a valid local `.ckpt` file: {ckpt_path}\n"
+                    f"Original error: {msg.strip()}"
+                ) from e
+            raise
+
+        # Predict test set:
+        # - For each model: average predictions across its TTA views (if enabled).
+        # - Then ensemble models by ensemble.json weights.
+        test_image_paths = list(unique_test_paths)
+        y_pred_sum: Optional[np.ndarray] = None
+        w_sum: float = 0.0
+        for mi in models_eff:
+            cfg_i = mi["cfg"]
+            dino_w_i = mi["dino_weights_file"]
+            head_base_i = mi["head_base"]
+            model_id_i = mi["model_id"]
+            version_i = mi.get("version", None)
+            w_i = float(mi.get("weight", 1.0))
+            if not (w_i > 0.0):
+                continue
+            base_hw_i = tuple(mi.get("base_image_size_hw", (224, 224)))
+            model_tag_i = str(mi.get("model_tag", "") or safe_slug(str(model_id_i)))
+
+            print(
+                f"[TABPFN][ENSEMBLE] Predict test feats: model_id={model_id_i!r} version={version_i!r} "
+                f"backbone={mi['backbone']!r} weight={w_i}"
+            )
+
+            # TTA views are resolved per-model (base image_size differs across versions).
+            tta_views = _resolve_tta_views(settings, base_image_size=base_hw_i, patch_multiple=16)
+            multi_view = len(tta_views) > 1
+
+            y_pred_model_sum: Optional[np.ndarray] = None
+            n_views_eff: int = 0
+            for (image_size_view, hflip_view, vflip_view) in tta_views:
+                view_tag = safe_slug(
+                    f"{model_tag_i}__tta_{int(image_size_view[0])}x{int(image_size_view[1])}__hf{int(bool(hflip_view))}__vf{int(bool(vflip_view))}"
+                )
+                cache_test_view = _resolve_cache_path_for_model(
+                    base_path=str(tabpfn.feature_cache_path_test or ""),
+                    split="test",
+                    model_tag=(view_tag if multi_view else model_tag_i),
+                )
+
+                if feature_mode == "dinov3_only":
+                    _rels_test_i, X_test_i = extract_dinov3_cls_features(
+                        project_dir=project_dir_abs,
+                        dataset_root=str(dataset_root),
+                        cfg_train_yaml=cfg_i,
+                        dino_weights_pt_file=str(dino_w_i),
+                        image_paths=test_image_paths,
+                        batch_size=int(tabpfn.feature_batch_size),
+                        num_workers=int(tabpfn.feature_num_workers),
+                        cache_path=str(cache_test_view),
+                        image_size_hw=tuple(image_size_view),
+                        hflip=bool(hflip_view),
+                        vflip=bool(vflip_view),
+                    )
+                else:
+                    _rels_test_i, X_test_i = extract_head_penultimate_features(
+                        project_dir=project_dir_abs,
+                        dataset_root=str(dataset_root),
+                        cfg_train_yaml=cfg_i,
+                        dino_weights_pt_file=str(dino_w_i),
+                        head_weights_pt_path=str(head_base_i),
+                        image_paths=test_image_paths,
+                        fusion=str(tabpfn.feature_fusion),
+                        batch_size=int(tabpfn.feature_batch_size),
+                        num_workers=int(tabpfn.feature_num_workers),
+                        cache_path=str(cache_test_view),
+                        image_size_hw=tuple(image_size_view),
+                        hflip=bool(hflip_view),
+                        vflip=bool(vflip_view),
+                    )
+
+                if not (
+                    isinstance(X_test_i, np.ndarray)
+                    and X_test_i.ndim == 2
+                    and X_test_i.shape[0] == len(test_image_paths)
+                ):
+                    raise RuntimeError(
+                        f"Invalid test features array for model_id={model_id_i!r}: shape={getattr(X_test_i, 'shape', None)}"
+                    )
+                if D_ref is not None and int(X_test_i.shape[1]) != int(D_ref):
+                    raise RuntimeError(
+                        "TabPFN ensemble requires the SAME feature dimension across models. "
+                        f"Got D_ref={D_ref} but model_id={model_id_i!r} produced D={int(X_test_i.shape[1])}."
+                    )
+
+                y_pred_view = model.predict(X_test_i)
+                y_pred_model_sum = y_pred_view if y_pred_model_sum is None else (y_pred_model_sum + y_pred_view)
+                n_views_eff += 1
+
+            if y_pred_model_sum is None or n_views_eff <= 0:
+                raise RuntimeError(f"No TTA views produced predictions for model_id={model_id_i!r}")
+            y_pred_model = y_pred_model_sum / float(n_views_eff)
+
+            y_pred_sum = (y_pred_model * float(w_i)) if y_pred_sum is None else (y_pred_sum + y_pred_model * float(w_i))
+            w_sum += float(w_i)
+
+        if y_pred_sum is None or not (w_sum > 0.0):
+            raise RuntimeError("No valid ensemble models produced predictions for TabPFN.")
+        y_pred = y_pred_sum / float(w_sum)
+
+        if bool(getattr(tabpfn, "ratio_strict", False)):
+            from src.tabular.ratio_strict import apply_ratio_strict_5d
+
+            y_pred = apply_ratio_strict_5d(y_pred)
+
+        # Map predictions to per-image components dict
+        image_to_components: dict[str, dict[str, float]] = {}
+        for rel_path, vec in zip(unique_test_paths, y_pred.tolist()):
+            comps = {name: float(vec[i]) for i, name in enumerate(TARGETS_5D_ORDER) if i < len(vec)}
+            for k in list(comps.keys()):
+                comps[k] = max(0.0, float(comps[k]))
+            image_to_components[str(rel_path)] = comps
+
+        _write_submission_csv(df_test, image_to_components, str(settings.output_submission_path))
+        used_models = [str(mi.get("model_id", "")) for mi in models_eff]
+        print(f"[TABPFN][ENSEMBLE] Models used: {used_models}")
+        print(f"[TABPFN][ENSEMBLE] Submission written to: {settings.output_submission_path}")
+        return
+
     # Resolve DINO backbone weights file (same strategy as inference pipeline)
     backbone_name = str(cfg.get("model", {}).get("backbone", "") or "").strip()
     dino_weights_file = resolve_dino_weights_path_for_model(
@@ -864,7 +1326,13 @@ def run_tabpfn_submission(
         print("[TABPFN] Head weights:", str(settings.head_weights_pt_path))
     print("[TABPFN] TabPFN ckpt (local):", ckpt_path)
 
-    # Extract features (train + test)
+    # Resolve base image size for TTA view generation (H,W)
+    try:
+        base_image_size_hw = parse_image_size(cfg.get("data", {}).get("image_size", 224))
+    except Exception:
+        base_image_size_hw = (224, 224)
+
+    # Extract training features (always base view; TTA is applied at prediction time).
     if feature_mode == "dinov3_only":
         _train_rels, X_train = extract_dinov3_cls_features(
             project_dir=project_dir_abs,
@@ -875,16 +1343,9 @@ def run_tabpfn_submission(
             batch_size=int(tabpfn.feature_batch_size),
             num_workers=int(tabpfn.feature_num_workers),
             cache_path=str(tabpfn.feature_cache_path_train) if str(tabpfn.feature_cache_path_train or "").strip() else None,
-        )
-        _test_rels, X_test = extract_dinov3_cls_features(
-            project_dir=project_dir_abs,
-            dataset_root=str(dataset_root),
-            cfg_train_yaml=cfg,
-            dino_weights_pt_file=str(dino_weights_file),
-            image_paths=list(unique_test_paths),
-            batch_size=int(tabpfn.feature_batch_size),
-            num_workers=int(tabpfn.feature_num_workers),
-            cache_path=str(tabpfn.feature_cache_path_test) if str(tabpfn.feature_cache_path_test or "").strip() else None,
+            image_size_hw=tuple(base_image_size_hw),
+            hflip=False,
+            vflip=False,
         )
     else:
         _train_rels, X_train = extract_head_penultimate_features(
@@ -898,18 +1359,9 @@ def run_tabpfn_submission(
             batch_size=int(tabpfn.feature_batch_size),
             num_workers=int(tabpfn.feature_num_workers),
             cache_path=str(tabpfn.feature_cache_path_train) if str(tabpfn.feature_cache_path_train or "").strip() else None,
-        )
-        _test_rels, X_test = extract_head_penultimate_features(
-            project_dir=project_dir_abs,
-            dataset_root=str(dataset_root),
-            cfg_train_yaml=cfg,
-            dino_weights_pt_file=str(dino_weights_file),
-            head_weights_pt_path=str(settings.head_weights_pt_path),
-            image_paths=list(unique_test_paths),
-            fusion=str(tabpfn.feature_fusion),
-            batch_size=int(tabpfn.feature_batch_size),
-            num_workers=int(tabpfn.feature_num_workers),
-            cache_path=str(tabpfn.feature_cache_path_test) if str(tabpfn.feature_cache_path_test or "").strip() else None,
+            image_size_hw=tuple(base_image_size_hw),
+            hflip=False,
+            vflip=False,
         )
 
     # Fit TabPFN on FULL train.csv
@@ -942,7 +1394,74 @@ def run_tabpfn_submission(
             ) from e
         raise
 
-    y_pred = model.predict(X_test)
+    # Predict on test features with optional TTA (still a single fitted TabPFN).
+    test_image_paths = list(unique_test_paths)
+    tta_views = _resolve_tta_views(settings, base_image_size=tuple(base_image_size_hw), patch_multiple=16)
+    multi_view = len(tta_views) > 1
+
+    cache_test_base_raw = str(tabpfn.feature_cache_path_test or "").strip()
+    cache_test_base_resolved = resolve_path_best_effort(project_dir_abs, cache_test_base_raw) if cache_test_base_raw else ""
+
+    def _resolve_test_cache_path_for_view(*, view_tag: str) -> Optional[str]:
+        if not cache_test_base_resolved:
+            return None
+        p = str(cache_test_base_resolved)
+        is_dir_style = (p.endswith(os.sep) or p.endswith("/")) or os.path.isdir(p) or (os.path.splitext(p)[1] == "")
+        if (not multi_view) and (not is_dir_style):
+            # Backward-compatible: single view uses the raw file path.
+            return p
+        if is_dir_style:
+            d = p.rstrip("/").rstrip(os.sep)
+            return os.path.join(d, f"test__{view_tag}.pt")
+        root, ext = os.path.splitext(p)
+        ext_eff = ext if ext else ".pt"
+        return f"{root}__{view_tag}{ext_eff}"
+
+    y_pred_sum: Optional["np.ndarray"] = None
+    n_views_eff: int = 0
+    for (image_size_view, hflip_view, vflip_view) in tta_views:
+        view_tag = safe_slug(
+            f"tta_{int(image_size_view[0])}x{int(image_size_view[1])}__hf{int(bool(hflip_view))}__vf{int(bool(vflip_view))}"
+        )
+        cache_test_view = _resolve_test_cache_path_for_view(view_tag=view_tag)
+        if feature_mode == "dinov3_only":
+            _test_rels, X_test_view = extract_dinov3_cls_features(
+                project_dir=project_dir_abs,
+                dataset_root=str(dataset_root),
+                cfg_train_yaml=cfg,
+                dino_weights_pt_file=str(dino_weights_file),
+                image_paths=test_image_paths,
+                batch_size=int(tabpfn.feature_batch_size),
+                num_workers=int(tabpfn.feature_num_workers),
+                cache_path=str(cache_test_view) if cache_test_view else None,
+                image_size_hw=tuple(image_size_view),
+                hflip=bool(hflip_view),
+                vflip=bool(vflip_view),
+            )
+        else:
+            _test_rels, X_test_view = extract_head_penultimate_features(
+                project_dir=project_dir_abs,
+                dataset_root=str(dataset_root),
+                cfg_train_yaml=cfg,
+                dino_weights_pt_file=str(dino_weights_file),
+                head_weights_pt_path=str(settings.head_weights_pt_path),
+                image_paths=test_image_paths,
+                fusion=str(tabpfn.feature_fusion),
+                batch_size=int(tabpfn.feature_batch_size),
+                num_workers=int(tabpfn.feature_num_workers),
+                cache_path=str(cache_test_view) if cache_test_view else None,
+                image_size_hw=tuple(image_size_view),
+                hflip=bool(hflip_view),
+                vflip=bool(vflip_view),
+            )
+
+        y_pred_view = model.predict(X_test_view)
+        y_pred_sum = y_pred_view if y_pred_sum is None else (y_pred_sum + y_pred_view)
+        n_views_eff += 1
+
+    if y_pred_sum is None or n_views_eff <= 0:
+        raise RuntimeError("TabPFN produced no predictions for test set (TTA views empty).")
+    y_pred = y_pred_sum / float(n_views_eff)
     if bool(getattr(tabpfn, "ratio_strict", False)):
         from src.tabular.ratio_strict import apply_ratio_strict_5d
 
