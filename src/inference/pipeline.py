@@ -29,6 +29,12 @@ from src.inference.mp import (
     mp_prepare_vit7b_backbone_two_gpu,
     mp_resolve_dtype,
 )
+from src.inference.two_gpu_parallel import (
+    run_two_processes_spawn,
+    split_even_odd_indices,
+    two_gpu_parallel_enabled,
+    worker_guarded,
+)
 from src.inference.paths import (
     find_dino_weights_in_dir,
     resolve_path_best_effort,
@@ -352,6 +358,42 @@ def _load_zscore_json_for_head(head_pt_path: str) -> Optional[dict]:
     return None
 
 
+def _infer_components_5d_for_model_2gpu_worker(q, shard_id: int, device_id: int, payload: dict) -> None:
+    """
+    Worker for 2-GPU data-parallel sharding of `infer_components_5d_for_model`.
+
+    Notes:
+    - Each worker is pinned to a single GPU via torch.cuda.set_device(device_id).
+    - Recursion is prevented by ENV_DISABLE_2GPU_PARALLEL inside `worker_guarded`.
+    """
+
+    def _fn(pl: dict) -> dict:
+        rels, comps, meta, mc_var = infer_components_5d_for_model(
+            settings=pl["settings"],
+            project_dir=pl["project_dir"],
+            cfg=pl["cfg"],
+            head_base=pl["head_base"],
+            dino_weights_pt_path=pl["dino_weights_pt_path"],
+            dataset_root=pl["dataset_root"],
+            image_paths=pl["image_paths"],
+            prefer_packaged_head_manifest=pl.get("prefer_packaged_head_manifest", True),
+            compute_mc_var=bool(pl.get("compute_mc_var", False)),
+            mc_dropout_samples_override=pl.get("mc_dropout_samples_override", None),
+            mc_var_mode=str(pl.get("mc_var_mode", "relative")),
+            mc_include_ratio=bool(pl.get("mc_include_ratio", False)),
+            mc_ratio_weight=float(pl.get("mc_ratio_weight", 1.0)),
+            mc_eps=float(pl.get("mc_eps", 1e-8)),
+        )
+        return {
+            "rels_in_order": list(rels),
+            "comps_5d_g": comps.detach().cpu().float() if isinstance(comps, torch.Tensor) else comps,
+            "meta": dict(meta or {}),
+            "mc_var": mc_var.detach().cpu().float() if isinstance(mc_var, torch.Tensor) else None,
+        }
+
+    worker_guarded(q, shard_id, device_id, payload, fn=_fn)
+
+
 def infer_components_5d_for_model(
     *,
     settings: InferenceSettings,
@@ -395,6 +437,111 @@ def infer_components_5d_for_model(
 
     # --- Backbone selector ---
     backbone_name = str(cfg["model"]["backbone"]).strip()
+
+    # ==========================================================
+    # 2-GPU data-parallel inference (each GPU runs independent images)
+    #
+    # - Only used when >=2 GPUs are available.
+    # - Disabled automatically when ViT7B model-parallel is enabled (it already uses both GPUs).
+    # - Uses spawn+2 processes with even/odd sharding to preserve order on merge.
+    # ==========================================================
+    try:
+        can_two_gpu = bool(two_gpu_parallel_enabled()) and int(len(image_paths)) >= 2
+    except Exception:
+        can_two_gpu = False
+    if can_two_gpu:
+        bn_l = str(backbone_name or "").strip().lower()
+        wants_vit7b_mp = (
+            bool(getattr(settings, "use_2gpu_model_parallel_for_vit7b", False))
+            and (bn_l in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"))
+            and (mp_get_devices() is not None)
+        )
+        if not bool(wants_vit7b_mp):
+            idx0, idx1 = split_even_odd_indices(int(len(image_paths)))
+            if idx0 and idx1:
+                image_paths0 = [image_paths[i] for i in idx0]
+                image_paths1 = [image_paths[i] for i in idx1]
+
+                payload_common = {
+                    "settings": settings,
+                    "project_dir": str(project_dir),
+                    "cfg": cfg,
+                    "head_base": str(head_base),
+                    "dino_weights_pt_path": str(dino_weights_pt_path),
+                    "dataset_root": str(dataset_root),
+                    "prefer_packaged_head_manifest": bool(prefer_packaged_head_manifest),
+                    "compute_mc_var": bool(compute_mc_var),
+                    "mc_dropout_samples_override": mc_dropout_samples_override,
+                    "mc_var_mode": str(mc_var_mode),
+                    "mc_include_ratio": bool(mc_include_ratio),
+                    "mc_ratio_weight": float(mc_ratio_weight),
+                    "mc_eps": float(mc_eps),
+                }
+
+                try:
+                    res0, res1 = run_two_processes_spawn(
+                        worker=_infer_components_5d_for_model_2gpu_worker,
+                        payload0={**payload_common, "image_paths": image_paths0},
+                        payload1={**payload_common, "image_paths": image_paths1},
+                        device0=0,
+                        device1=1,
+                    )
+                except Exception as e:
+                    print(f"[WARN] 2-GPU data-parallel disabled (fallback to single process): {e}")
+                else:
+                    rels0 = [str(r) for r in (res0.get("rels_in_order", []) or [])]
+                    rels1 = [str(r) for r in (res1.get("rels_in_order", []) or [])]
+                    if rels0 != list(image_paths0):
+                        raise RuntimeError("2-GPU shard0 image order mismatch; aborting.")
+                    if rels1 != list(image_paths1):
+                        raise RuntimeError("2-GPU shard1 image order mismatch; aborting.")
+
+                    comps0 = res0.get("comps_5d_g", None)
+                    comps1 = res1.get("comps_5d_g", None)
+                    if not (isinstance(comps0, torch.Tensor) and comps0.dim() == 2 and int(comps0.shape[1]) == 5):
+                        raise RuntimeError(
+                            f"2-GPU shard0 invalid comps tensor: {type(comps0)} shape={getattr(comps0, 'shape', None)}"
+                        )
+                    if not (isinstance(comps1, torch.Tensor) and comps1.dim() == 2 and int(comps1.shape[1]) == 5):
+                        raise RuntimeError(
+                            f"2-GPU shard1 invalid comps tensor: {type(comps1)} shape={getattr(comps1, 'shape', None)}"
+                        )
+                    if int(comps0.shape[0]) != int(len(image_paths0)):
+                        raise RuntimeError(
+                            f"2-GPU shard0 N mismatch: got {int(comps0.shape[0])}, expected {len(image_paths0)}"
+                        )
+                    if int(comps1.shape[0]) != int(len(image_paths1)):
+                        raise RuntimeError(
+                            f"2-GPU shard1 N mismatch: got {int(comps1.shape[0])}, expected {len(image_paths1)}"
+                        )
+
+                    N = int(len(image_paths))
+                    comps_full = torch.empty((N, 5), dtype=torch.float32)
+                    comps_full[idx0] = comps0.detach().cpu().float()
+                    comps_full[idx1] = comps1.detach().cpu().float()
+
+                    mc0 = res0.get("mc_var", None)
+                    mc1 = res1.get("mc_var", None)
+                    mc_full: Optional[torch.Tensor] = None
+                    if isinstance(mc0, torch.Tensor) or isinstance(mc1, torch.Tensor):
+                        if not (isinstance(mc0, torch.Tensor) and isinstance(mc1, torch.Tensor)):
+                            raise RuntimeError("2-GPU MC variance mismatch across shards (one shard missing mc_var).")
+                        mc0 = mc0.detach().cpu().float().view(-1)
+                        mc1 = mc1.detach().cpu().float().view(-1)
+                        if int(mc0.numel()) != int(len(image_paths0)) or int(mc1.numel()) != int(len(image_paths1)):
+                            raise RuntimeError("2-GPU MC variance length mismatch across shards.")
+                        mc_full = torch.empty((N,), dtype=torch.float32)
+                        mc_full[idx0] = mc0
+                        mc_full[idx1] = mc1
+
+                    meta_out = dict(res0.get("meta", {}) or {})
+                    meta_out["two_gpu_data_parallel"] = True
+                    meta_out["two_gpu_shard_mode"] = "even_odd"
+                    meta_out["two_gpu_devices"] = [0, 1]
+                    meta_out["two_gpu_num_images"] = int(N)
+
+                    return list(image_paths), comps_full, meta_out, mc_full
+
     try:
         if backbone_name == "dinov3_vith16plus":
             from dinov3.hub.backbones import dinov3_vith16plus as _make_backbone  # type: ignore

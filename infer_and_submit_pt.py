@@ -30,55 +30,10 @@ PROJECT_DIR = "."
 #   4) Predict all test images and write `submission.csv`
 #
 # IMPORTANT:
-# - TabPFN weights are loaded **LOCAL-ONLY** from TABPFN_WEIGHTS_CKPT_PATH.
+# - All TabPFN settings are loaded from `configs/train_tabpfn.yaml`.
+# - TabPFN foundation weights are loaded **LOCAL-ONLY** from the path specified there (`tabpfn.model_path`).
 # - No HuggingFace download / auth is attempted in this script.
-TABPFN_ENABLED = False
-
-# Optional: path to TabPFN python package source (offline-friendly).
-# If you have tabpfn installed in the environment, you can ignore this.
-TABPFN_PATH = "third_party/TabPFN/src"
-
-# TabPFN weights path can be EITHER:
-#  - a single checkpoint file (.ckpt), OR
-#  - a directory containing one or more .ckpt files (the script will auto-select one).
-#
-# REQUIRED when TABPFN_ENABLED=True: local TabPFN 2.5 regressor checkpoint (.ckpt)
-TABPFN_WEIGHTS_CKPT_PATH = "tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real.ckpt"
-
-# TabPFN runtime params
-TABPFN_DEVICE = "auto"  # "auto"|"cpu"|"cuda"|"cuda:0"|...
-TABPFN_N_ESTIMATORS = 8
-TABPFN_FIT_MODE = "fit_preprocessors"
-TABPFN_INFERENCE_PRECISION = "auto"
-TABPFN_IGNORE_PRETRAINING_LIMITS = True
-TABPFN_N_JOBS = 1  # MultiOutputRegressor parallelism (each output fits its own TabPFNRegressor)
-TABPFN_ENABLE_TELEMETRY = False
-TABPFN_MODEL_CACHE_DIR = ""  # optional; e.g. "/tmp/tabpfn_cache"
-
-# Training data for TabPFN:
-# - Default: automatically use <dataset_root>/train.csv, where dataset_root is resolved from INPUT_PATH.
-# - Override: set to an explicit path to train.csv.
-TABPFN_TRAIN_CSV_PATH = "data/train.csv"  # optional override
-
-# Penultimate feature extraction settings
-# Feature mode (matches configs/train_tabpfn.yaml):
-# - "head_penultimate": use regression head penultimate (pre-final-linear) features (default; existing behavior)
-# - "dinov3_only"     : use frozen DINOv3 CLS token features (no LoRA, no head)
-# TABPFN_FEATURE_MODE = "dinov3_only"
-TABPFN_FEATURE_MODE = "head_penultimate"
-TABPFN_FEATURE_FUSION = "mean"  # "mean" | "concat" (concat can exceed TabPFN feature limits)
-TABPFN_FEATURE_BATCH_SIZE = 8
-TABPFN_FEATURE_NUM_WORKERS = 8
-TABPFN_FEATURE_CACHE_PATH_TRAIN = ""  # optional .pt cache
-TABPFN_FEATURE_CACHE_PATH_TEST = ""  # optional .pt cache
-
-# TabPFN output constraint (postprocess):
-# When enabled, enforce a strict coupling between Dry_Total_g and (Clover/Dead/Green) via:
-#   total_sum = clover + dead + green
-#   total_final = (total_pred + total_sum) / 2
-#   (clover, dead, green) := total_final * (component / total_sum)  (uniform when total_sum≈0)
-#   gdm := clover + green
-TABPFN_RATIO_STRICT = False
+TABPFN_ENABLED = True
 
 # ===== Multi-GPU model-parallel inference (Scheme B) =====
 # When running the VERY large dinov3_vit7b16 backbone on 2x16GB GPUs (e.g., Kaggle T4),
@@ -150,7 +105,6 @@ def main() -> None:
     # Prefer local dinov3 / peft bundles when present (offline-friendly).
     _add_import_root(DINOV3_PATH, package_name="dinov3")
     _add_import_root(PEFT_PATH, package_name="peft")
-    _add_import_root(TABPFN_PATH, package_name="tabpfn")
 
     # Validate project directory and import project modules.
     project_dir_abs = os.path.abspath(PROJECT_DIR) if PROJECT_DIR else ""
@@ -189,12 +143,9 @@ def main() -> None:
 
     dinov3_path_resolved = _resolve_under_project_dir(str(DINOV3_PATH))
     peft_path_resolved = _resolve_under_project_dir(str(PEFT_PATH))
-    tabpfn_path_resolved = _resolve_under_project_dir(str(TABPFN_PATH))
-
     # Re-add vendor roots using PROJECT_DIR-relative resolution (helps on Kaggle).
     _add_import_root(dinov3_path_resolved, package_name="dinov3")
     _add_import_root(peft_path_resolved, package_name="peft")
-    _add_import_root(tabpfn_path_resolved, package_name="tabpfn")
     _add_import_root(project_dir_abs)
 
     from src.inference.settings import InferenceSettings  # noqa: E402
@@ -223,26 +174,10 @@ def main() -> None:
     if bool(TABPFN_ENABLED):
         from src.inference.tabpfn import TabPFNSubmissionSettings, run_tabpfn_submission  # noqa: E402
 
-        tabpfn_settings = TabPFNSubmissionSettings(
-            weights_ckpt_path=str(TABPFN_WEIGHTS_CKPT_PATH),
-            tabpfn_python_path=str(tabpfn_path_resolved),
-            device=str(TABPFN_DEVICE),
-            n_estimators=int(TABPFN_N_ESTIMATORS),
-            fit_mode=str(TABPFN_FIT_MODE),
-            inference_precision=str(TABPFN_INFERENCE_PRECISION),
-            ignore_pretraining_limits=bool(TABPFN_IGNORE_PRETRAINING_LIMITS),
-            n_jobs=int(TABPFN_N_JOBS),
-            enable_telemetry=bool(TABPFN_ENABLE_TELEMETRY),
-            model_cache_dir=str(TABPFN_MODEL_CACHE_DIR),
-            train_csv_path=str(TABPFN_TRAIN_CSV_PATH),
-            feature_mode=str(TABPFN_FEATURE_MODE),
-            feature_fusion=str(TABPFN_FEATURE_FUSION),
-            feature_batch_size=int(TABPFN_FEATURE_BATCH_SIZE),
-            feature_num_workers=int(TABPFN_FEATURE_NUM_WORKERS),
-            feature_cache_path_train=str(TABPFN_FEATURE_CACHE_PATH_TRAIN),
-            feature_cache_path_test=str(TABPFN_FEATURE_CACHE_PATH_TEST),
-            ratio_strict=bool(TABPFN_RATIO_STRICT),
-        )
+        # All TabPFN params are loaded from configs/train_tabpfn.yaml.
+        from src.inference.tabpfn import load_tabpfn_submission_settings_from_yaml  # noqa: E402
+
+        tabpfn_settings = load_tabpfn_submission_settings_from_yaml(project_dir=str(project_dir_abs))
         run_tabpfn_submission(settings=settings, tabpfn=tabpfn_settings)
         return
 

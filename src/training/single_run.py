@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import (
@@ -11,10 +11,74 @@ from lightning.pytorch.callbacks import (
 )
 from loguru import logger
 
+from src.callbacks.freeze_lora_on_swa import FreezeLoraOnSwaStart
 from src.callbacks.head_checkpoint import HeadCheckpoint
 from src.data.datamodule import PastureDataModule
 from src.models.regressor import BiomassRegressor
 from src.training.logging_utils import create_lightning_loggers, plot_epoch_metrics
+
+
+def _extract_optimizer_from_conf(opt_conf: Any):
+    """
+    Handle LightningModule.configure_optimizers() return types:
+      - Optimizer
+      - dict with key "optimizer"
+    """
+    if isinstance(opt_conf, dict) and "optimizer" in opt_conf:
+        return opt_conf["optimizer"]
+    return opt_conf
+
+
+def _build_swa_lrs_for_model(
+    model: pl.LightningModule,
+    *,
+    head_swa_lr: float,
+    uw_swa_lr: Optional[float] = None,
+    freeze_lora: bool = True,
+    lora_swa_lr: float = 0.0,
+) -> List[float]:
+    """
+    Build a per-parameter-group SWA LR list (方案 B), aligned with the model's optimizer param groups.
+
+    - head / other params  -> head_swa_lr
+    - UW params (if present) -> uw_swa_lr (defaults to head_swa_lr)
+    - LoRA params -> lora_swa_lr (defaults to 0.0 when freeze_lora=True; 方案 C)
+    """
+    try:
+        opt_conf = model.configure_optimizers()
+        optimizer = _extract_optimizer_from_conf(opt_conf)
+        param_groups = list(getattr(optimizer, "param_groups", []) or [])
+    except Exception as e:
+        logger.warning(f"SWA: failed to inspect optimizer param groups for auto_lrs (fallback to scalar): {e}")
+        return [float(head_swa_lr)]
+
+    # Lightning's StochasticWeightAveraging validates that `swa_lrs` is a positive float
+    # (or a list of positive floats). Zero will raise:
+    #   "The `swa_lrs` should a positive float, or a list of positive floats"
+    #
+    # We keep LoRA freezing semantics via the dedicated callback `FreezeLoraOnSwaStart`
+    # (requires_grad=False + lr=0), so the SWA LR list should never contain zeros.
+    eps = 1e-12
+    head_lr_eff = float(head_swa_lr)
+    uw_lr_eff = float(head_lr_eff) if uw_swa_lr is None else float(uw_swa_lr)
+    # When freeze_lora=True we still return a positive LR here; the freeze callback
+    # will hard-set LoRA lr to 0.0 at SWA start (and disable grads).
+    lora_lr_eff = float(lora_swa_lr) if (not freeze_lora) else float(head_lr_eff)
+    head_lr_eff = max(head_lr_eff, eps)
+    uw_lr_eff = max(uw_lr_eff, eps)
+    lora_lr_eff = max(lora_lr_eff, eps)
+
+    swa_lrs: List[float] = []
+    for group in param_groups:
+        gtype = str(group.get("group_type", "") or "").strip().lower()
+        gname = str(group.get("name", "") or "").strip().lower()
+        if gtype == "lora" or gname.startswith("lora"):
+            swa_lrs.append(float(lora_lr_eff))
+        elif gtype == "uw" or gname == "uw":
+            swa_lrs.append(float(uw_lr_eff))
+        else:
+            swa_lrs.append(float(head_lr_eff))
+    return swa_lrs
 
 
 def parse_image_size(value: Any) -> Tuple[int, int]:
@@ -78,6 +142,15 @@ def _build_datamodule(
     log_scale_targets_cfg = bool(cfg["model"].get("log_scale_targets", False))
     irish_cfg = cfg.get("irish_glass_clover", {})
     ndvi_dense_cfg = cfg.get("ndvi_dense", {})
+    aigc_cfg = cfg.get("data", {}).get("aigc_aug", {}) or {}
+    # Normalize optional list-like config keys
+    types_val = aigc_cfg.get("types", None)
+    if types_val in (None, "", "null"):
+        aigc_types = None
+    elif isinstance(types_val, (list, tuple)):
+        aigc_types = [str(x) for x in types_val]
+    else:
+        aigc_types = [str(types_val)]
 
     dm = PastureDataModule(
         data_root=cfg["data"]["root"],
@@ -153,6 +226,13 @@ def _build_datamodule(
         else None,
         # Seed for reproducible internal split when predefined splits are not supplied
         random_seed=int(cfg.get("seed", 42)),
+        # Optional AIGC (Nano Banana Pro) offline augmentations
+        aigc_aug_enabled=bool(aigc_cfg.get("enabled", False)),
+        aigc_aug_subdir=str(aigc_cfg.get("subdir", "nano_banana_pro/train"))
+        if aigc_cfg.get("subdir", None) is not None
+        else None,
+        aigc_aug_manifest=str(aigc_cfg.get("manifest", "manifest.csv")),
+        aigc_aug_types=aigc_types,
     )
     return dm
 
@@ -494,11 +574,41 @@ def train_single_split(
     # Checkpoint policy:
     # - Do NOT save any "best.ckpt" (or any top-k monitored checkpoints).
     # - Keep Lightning's "last.ckpt" for backward compatibility / resume.
+    #
+    # NOTE:
+    #   We only need `last.ckpt` updated at least once per epoch (no step-based saving).
+    ckpt_cfg_raw = cfg.get("trainer", {}).get("checkpoint", None)
+    # Default: save `last.ckpt` once per epoch.
+    if ckpt_cfg_raw is None:
+        every_n_train_steps = 0
+        every_n_epochs = 1
+    else:
+        ckpt_cfg = dict(ckpt_cfg_raw or {})
+        every_n_train_steps = int(
+            ckpt_cfg.get("every_n_train_steps", ckpt_cfg.get("every_n_steps", 0)) or 0
+        )
+        every_n_epochs = int(ckpt_cfg.get("every_n_epochs", 1) or 0)
+        # Lightning requires checkpoint triggers to be mutually exclusive.
+        # We intentionally prefer epoch-based saving (updates `last.ckpt` once per epoch).
+        if every_n_train_steps > 0 and every_n_epochs > 0:
+            logger.warning(
+                "Both trainer.checkpoint.every_n_train_steps and every_n_epochs are set; "
+                "disabling step-based checkpointing and keeping epoch-based saving."
+            )
+            every_n_train_steps = 0
+        if every_n_train_steps <= 0 and every_n_epochs <= 0:
+            every_n_train_steps = 0
+            every_n_epochs = 1
+
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
         auto_insert_metric_name=False,
         save_top_k=0,
         save_last=True,
+        every_n_train_steps=int(every_n_train_steps),
+        every_n_epochs=int(every_n_epochs),
+        # Save on train epoch end too (helps when validation is disabled).
+        save_on_train_epoch_end=True,
     )
     callbacks.append(checkpoint_cb)
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
@@ -508,13 +618,48 @@ def train_single_split(
     swa_cfg = cfg.get("trainer", {}).get("swa", {})
     if bool(swa_cfg.get("enabled", False)):
         try:
+            # 方案 B: build SWA per-param-group LRs (head/UW/LoRA) instead of forcing a single scalar LR.
+            auto_lrs = bool(swa_cfg.get("auto_lrs", True))
+            freeze_lora = bool(swa_cfg.get("freeze_lora", True))
+            head_swa_lr = float(swa_cfg.get("head_swa_lr", swa_cfg.get("swa_lrs", cfg["optimizer"]["lr"])))
+            uw_swa_lr = (
+                float(swa_cfg.get("uw_swa_lr"))
+                if swa_cfg.get("uw_swa_lr", None) is not None
+                else None
+            )
+            # When not freezing LoRA, allow overriding its SWA LR; otherwise it is forced to 0.
+            lora_swa_lr = float(swa_cfg.get("lora_swa_lr", 0.0))
+
+            swa_lrs_val: Any
+            if auto_lrs:
+                swa_lrs_val = _build_swa_lrs_for_model(
+                    model,
+                    head_swa_lr=head_swa_lr,
+                    uw_swa_lr=uw_swa_lr,
+                    freeze_lora=freeze_lora,
+                    lora_swa_lr=lora_swa_lr,
+                )
+            else:
+                swa_lrs_val = swa_cfg.get("swa_lrs", cfg["optimizer"]["lr"])
+
             swa_cb = StochasticWeightAveraging(
-                swa_lrs=float(swa_cfg.get("swa_lrs", cfg["optimizer"]["lr"])),
+                swa_lrs=swa_lrs_val,
                 swa_epoch_start=float(swa_cfg.get("swa_epoch_start", 0.8)),
                 annealing_epochs=int(swa_cfg.get("annealing_epochs", 5)),
                 annealing_strategy=str(swa_cfg.get("annealing_strategy", "cos")),
             )
             callbacks.append(swa_cb)
+            # 方案 C: freeze LoRA during SWA (hard stop on grads + lr=0).
+            #
+            # IMPORTANT: append this callback AFTER SWA so it can override any LR updates
+            # performed by SWA schedulers at/after the SWA start boundary.
+            if freeze_lora:
+                callbacks.append(
+                    FreezeLoraOnSwaStart(
+                        swa_epoch_start=float(swa_cfg.get("swa_epoch_start", 0.8)),
+                        set_lora_lr_to=float(swa_cfg.get("freeze_lora_lr", 0.0)),
+                    )
+                )
         except Exception as e:
             logger.warning(
                 f"SWA callback creation failed, continuing without SWA: {e}"

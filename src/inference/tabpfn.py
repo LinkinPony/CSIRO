@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from src.inference.two_gpu_parallel import (
+    run_two_processes_spawn,
+    split_even_odd_indices,
+    two_gpu_parallel_enabled,
+    worker_guarded,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -40,6 +48,12 @@ class TabPFNSubmissionSettings:
     # - Override: explicit train.csv path.
     train_csv_path: str = ""
 
+    # Directory (relative to `settings.project_dir`) containing packaged TabPFN fit-state
+    # bundles produced by `package_artifacts.py`.
+    #
+    # Inference never fits TabPFN online; it requires this directory to exist.
+    fit_state_dir: str = "tabpfn_fit"
+
     # Head-penultimate feature extraction settings
     # Feature source mode (matches configs/train_tabpfn.yaml):
     # - "head_penultimate": use regression head's penultimate (pre-final-linear) features (default; existing behavior)
@@ -53,6 +67,194 @@ class TabPFNSubmissionSettings:
 
     # Post-processing constraint for 5D outputs (see `src.tabular.ratio_strict.apply_ratio_strict_5d`).
     ratio_strict: bool = False
+
+
+def load_tabpfn_submission_settings_from_yaml(
+    *,
+    project_dir: str,
+    config_path: str = "configs/train_tabpfn.yaml",
+) -> TabPFNSubmissionSettings:
+    """
+    Load TabPFN submission settings from `configs/train_tabpfn.yaml` (or a compatible file).
+
+    This keeps `infer_and_submit_pt.py` free of TabPFN parameter clutter as requested.
+    """
+    from src.inference.paths import resolve_path_best_effort
+
+    project_dir_abs = os.path.abspath(project_dir) if project_dir else ""
+    if not (project_dir_abs and os.path.isdir(project_dir_abs)):
+        raise RuntimeError("project_dir must point to the repository root containing `configs/` and `src/`.")
+
+    cfg_path = resolve_path_best_effort(project_dir_abs, str(config_path or "").strip() or "configs/train_tabpfn.yaml")
+    if not os.path.isfile(cfg_path):
+        raise FileNotFoundError(f"TabPFN config YAML not found: {cfg_path}")
+
+    try:
+        import yaml
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("PyYAML is required to load configs/train_tabpfn.yaml") from e
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        obj = yaml.safe_load(f)
+    cfg: Dict[str, Any] = dict(obj or {})
+
+    tab = cfg.get("tabpfn", {}) if isinstance(cfg.get("tabpfn", {}), dict) else {}
+    imgf = cfg.get("image_features", {}) if isinstance(cfg.get("image_features", {}), dict) else {}
+    artifacts = cfg.get("artifacts", {}) if isinstance(cfg.get("artifacts", {}), dict) else {}
+
+    # TabPFN base checkpoint (local-only)
+    weights_ckpt_path = str(tab.get("model_path", tab.get("weights_ckpt_path", "")) or "").strip()
+    if not weights_ckpt_path:
+        raise ValueError("configs/train_tabpfn.yaml missing required: tabpfn.model_path")
+
+    return TabPFNSubmissionSettings(
+        weights_ckpt_path=weights_ckpt_path,
+        tabpfn_python_path=str(tab.get("python_path", tab.get("tabpfn_python_path", "")) or "").strip(),
+        device=str(tab.get("device", "auto") or "auto"),
+        n_estimators=int(tab.get("n_estimators", 8)),
+        fit_mode=str(tab.get("fit_mode", "fit_preprocessors") or "fit_preprocessors"),
+        inference_precision=str(tab.get("inference_precision", "auto") or "auto"),
+        ignore_pretraining_limits=bool(tab.get("ignore_pretraining_limits", True)),
+        n_jobs=int(tab.get("n_jobs", 1)),
+        enable_telemetry=bool(tab.get("enable_telemetry", False)),
+        model_cache_dir=str(tab.get("model_cache_dir", "") or ""),
+        # train_csv_path is intentionally kept for backward compatibility but is not used in inference.
+        train_csv_path=str(tab.get("train_csv_path", "") or ""),
+        feature_mode=str(imgf.get("mode", "head_penultimate") or "head_penultimate"),
+        feature_fusion=str(imgf.get("fusion", "mean") or "mean"),
+        feature_batch_size=int(imgf.get("batch_size", 8)),
+        feature_num_workers=int(imgf.get("num_workers", 8)),
+        # Optional (mostly useful for debugging); inference is safe when left empty.
+        feature_cache_path_train=str(imgf.get("cache_path_train", "") or ""),
+        feature_cache_path_test=str(imgf.get("cache_path_test", "") or ""),
+        ratio_strict=bool(tab.get("ratio_strict", False)),
+        fit_state_dir=str(artifacts.get("fit_state_dir", "tabpfn_fit") or "tabpfn_fit"),
+    )
+
+
+_TABPFN_FIT_EXT = ".tabpfn_fit"
+
+
+class _TabPFNMultiOutputPredictor:
+    """
+    Lightweight multi-output predictor wrapper that avoids pickling sklearn's
+    MultiOutputRegressor and instead loads each fitted TabPFNRegressor from disk.
+    """
+
+    def __init__(self, estimators: list[Any], targets: list[str]) -> None:
+        self.estimators = list(estimators)
+        self.targets = [str(t) for t in (targets or [])]
+        if not self.targets:
+            raise ValueError("Empty targets list for TabPFN multi-output predictor.")
+        if len(self.estimators) != len(self.targets):
+            raise ValueError(
+                f"Estimator count mismatch: got {len(self.estimators)} estimators for {len(self.targets)} targets."
+            )
+
+    def predict(self, X: "np.ndarray") -> "np.ndarray":
+        import numpy as np
+
+        preds: list[np.ndarray] = []
+        for est in self.estimators:
+            y = est.predict(X)
+            y = np.asarray(y).reshape(-1, 1)
+            preds.append(y)
+        return np.concatenate(preds, axis=1)
+
+
+def _load_json(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return dict(obj or {}) if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_fit_state_subdir(*, project_dir_abs: str, tabpfn: TabPFNSubmissionSettings, subdir: str) -> str:
+    from src.inference.paths import resolve_path_best_effort
+
+    raw = str(tabpfn.fit_state_dir or "tabpfn_fit").strip() or "tabpfn_fit"
+    base = resolve_path_best_effort(project_dir_abs, raw)
+    if os.path.isdir(base):
+        return os.path.join(base, str(subdir))
+
+    # Backward/packaged layout compatibility:
+    # - running from repo root: artifacts live under <PROJECT_DIR>/weights/<raw>
+    # - running inside packaged weights dir: artifacts live under <PROJECT_DIR>/<raw>
+    alt = resolve_path_best_effort(project_dir_abs, os.path.join("weights", raw)) if not raw.startswith("weights") else ""
+    if alt and os.path.isdir(alt):
+        return os.path.join(alt, str(subdir))
+
+    # Return the best-effort path (even if missing) for clearer error messages.
+    return os.path.join(base, str(subdir))
+
+
+def _load_tabpfn_predictor_from_fit_state(
+    *,
+    project_dir_abs: str,
+    tabpfn: TabPFNSubmissionSettings,
+    subdir: str,
+    expected_targets: list[str],
+) -> _TabPFNMultiOutputPredictor:
+    """
+    Load a packaged multi-output TabPFN predictor from:
+        <project_dir>/<tabpfn.fit_state_dir>/<subdir>/
+            meta.json (optional)
+            <target>.tabpfn_fit  (one per target)
+    """
+    fit_dir = _resolve_fit_state_subdir(project_dir_abs=project_dir_abs, tabpfn=tabpfn, subdir=subdir)
+    if not os.path.isdir(fit_dir):
+        raise FileNotFoundError(
+            "Packaged TabPFN fit-state directory not found. "
+            f"Expected: {fit_dir} (did you run `package_artifacts.py` with TabPFN enabled?)"
+        )
+
+    meta = _load_json(os.path.join(fit_dir, "meta.json"))
+    targets = meta.get("targets", None)
+    if not isinstance(targets, list) or not targets:
+        targets = list(expected_targets)
+    targets = [str(t) for t in targets]
+
+    # Determine file mapping
+    files_map = meta.get("files", None)
+    if not isinstance(files_map, dict):
+        files_map = {}
+
+    paths: list[str] = []
+    for t in targets:
+        cand = files_map.get(t, None)
+        if isinstance(cand, str) and cand.strip():
+            p = os.path.join(fit_dir, cand.strip()) if not os.path.isabs(cand) else cand
+        else:
+            p = os.path.join(fit_dir, f"{t}{_TABPFN_FIT_EXT}")
+        if not os.path.isfile(p):
+            # Backward-compat: allow "target__<name>.tabpfn_fit"
+            p2 = os.path.join(fit_dir, f"target__{t}{_TABPFN_FIT_EXT}")
+            if os.path.isfile(p2):
+                p = p2
+        if not os.path.isfile(p):
+            raise FileNotFoundError(f"Missing TabPFN fit-state for target={t!r}: {p}")
+        paths.append(p)
+
+    # Ensure TabPFN is importable (offline-friendly) before loading fit states.
+    TabPFNRegressor = _import_tabpfn_regressor(
+        tabpfn_python_path=str(tabpfn.tabpfn_python_path or "").strip(),
+        project_dir=project_dir_abs,
+    )
+
+    # TabPFN fit-states store `model_path` as-is; keep relative paths working by loading from project_dir.
+    cwd = os.getcwd()
+    try:
+        os.chdir(project_dir_abs)
+        estimators = [TabPFNRegressor.load_from_fit_state(p, device=str(tabpfn.device)) for p in paths]
+    finally:
+        try:
+            os.chdir(cwd)
+        except Exception:
+            pass
+
+    return _TabPFNMultiOutputPredictor(estimators=estimators, targets=targets)
 
 
 def _add_import_root(path: str, *, package_name: str | None = None) -> None:
@@ -79,7 +281,7 @@ def _add_import_root(path: str, *, package_name: str | None = None) -> None:
         sys.path.insert(0, root)
 
 
-def _import_tabpfn_regressor(*, tabpfn_python_path: str = "") -> type:
+def _import_tabpfn_regressor(*, tabpfn_python_path: str = "", project_dir: str = "") -> type:
     """
     Import TabPFNRegressor (prefer installed package; fallback to vendored source path).
     """
@@ -94,14 +296,27 @@ def _import_tabpfn_regressor(*, tabpfn_python_path: str = "") -> type:
 
         apply_tabpfn_runtime_patches()
         return TabPFNRegressor
-    except Exception:
+    except Exception as e:
+        # 1) Explicit user-provided source path (offline-friendly)
         if tabpfn_python_path:
             _add_import_root(tabpfn_python_path, package_name="tabpfn")
             from tabpfn import TabPFNRegressor  # type: ignore
 
             apply_tabpfn_runtime_patches()
             return TabPFNRegressor
-        raise
+
+        # 2) Auto-fallback: packaged/vendored TabPFN under project_dir/third_party/TabPFN/src
+        project_dir_abs = os.path.abspath(project_dir) if project_dir else ""
+        if project_dir_abs:
+            vendored = os.path.join(project_dir_abs, "third_party", "TabPFN", "src")
+            if os.path.isdir(vendored):
+                _add_import_root(vendored, package_name="tabpfn")
+                from tabpfn import TabPFNRegressor  # type: ignore
+
+                apply_tabpfn_runtime_patches()
+                return TabPFNRegressor
+
+        raise e
 
 
 def _resolve_local_tabpfn_ckpt(project_dir: str, p: str) -> str:
@@ -131,6 +346,74 @@ def _resolve_local_tabpfn_ckpt(project_dir: str, p: str) -> str:
                     return os.path.abspath(c)
             return os.path.abspath(cands[-1])
     raise FileNotFoundError(f"TabPFN checkpoint not found (local): {abs_p}")
+
+
+def _derive_shard_cache_path(cache_path: str, shard_id: int) -> str:
+    """
+    Create a deterministic per-shard cache path from a base cache file path.
+    """
+    base = str(cache_path or "").strip()
+    if not base:
+        return base
+    root, ext = os.path.splitext(base)
+    ext_eff = ext if ext else ".pt"
+    return f"{root}__shard{int(shard_id)}{ext_eff}"
+
+
+def _extract_head_penultimate_features_2gpu_worker(q, shard_id: int, device_id: int, payload: dict) -> None:
+    """
+    Worker for 2-GPU data-parallel feature extraction (head penultimate).
+    """
+
+    def _fn(pl: dict) -> dict:
+        import torch
+
+        rels, feats_np = extract_head_penultimate_features(
+            project_dir=pl["project_dir"],
+            dataset_root=pl["dataset_root"],
+            cfg_train_yaml=pl["cfg_train_yaml"],
+            dino_weights_pt_file=pl["dino_weights_pt_file"],
+            head_weights_pt_path=pl["head_weights_pt_path"],
+            image_paths=pl["image_paths"],
+            fusion=pl["fusion"],
+            batch_size=int(pl["batch_size"]),
+            num_workers=int(pl["num_workers"]),
+            cache_path=pl.get("cache_path", None),
+            image_size_hw=pl.get("image_size_hw", None),
+            hflip=bool(pl.get("hflip", False)),
+            vflip=bool(pl.get("vflip", False)),
+        )
+        feats_t = torch.from_numpy(feats_np).contiguous().cpu().float()
+        return {"rels_in_order": list(rels), "features": feats_t}
+
+    worker_guarded(q, shard_id, device_id, payload, fn=_fn)
+
+
+def _extract_dinov3_cls_features_2gpu_worker(q, shard_id: int, device_id: int, payload: dict) -> None:
+    """
+    Worker for 2-GPU data-parallel feature extraction (DINOv3 CLS token).
+    """
+
+    def _fn(pl: dict) -> dict:
+        import torch
+
+        rels, feats_np = extract_dinov3_cls_features(
+            project_dir=pl["project_dir"],
+            dataset_root=pl["dataset_root"],
+            cfg_train_yaml=pl["cfg_train_yaml"],
+            dino_weights_pt_file=pl["dino_weights_pt_file"],
+            image_paths=pl["image_paths"],
+            batch_size=int(pl["batch_size"]),
+            num_workers=int(pl["num_workers"]),
+            cache_path=pl.get("cache_path", None),
+            image_size_hw=pl.get("image_size_hw", None),
+            hflip=bool(pl.get("hflip", False)),
+            vflip=bool(pl.get("vflip", False)),
+        )
+        feats_t = torch.from_numpy(feats_np).contiguous().cpu().float()
+        return {"rels_in_order": list(rels), "features": feats_t}
+
+    worker_guarded(q, shard_id, device_id, payload, fn=_fn)
 
 
 def extract_head_penultimate_features(
@@ -331,6 +614,106 @@ def extract_head_penultimate_features(
                         return cached_paths, feats.cpu().numpy()
             except Exception:
                 pass
+
+    # ==========================================================
+    # 2-GPU data-parallel feature extraction (each GPU runs independent images)
+    #
+    # - Only used when >=2 GPUs are available AND cache miss (handled above).
+    # - Uses spawn+2 processes with even/odd sharding to preserve order on merge.
+    # - Writes per-shard cache files and then writes the combined cache (same schema).
+    # ==========================================================
+    try:
+        can_two_gpu = bool(two_gpu_parallel_enabled()) and int(len(image_paths)) >= 2
+    except Exception:
+        can_two_gpu = False
+    if can_two_gpu:
+        idx0, idx1 = split_even_odd_indices(int(len(image_paths)))
+        if idx0 and idx1:
+            image_paths0 = [image_paths[i] for i in idx0]
+            image_paths1 = [image_paths[i] for i in idx1]
+            cache0 = _derive_shard_cache_path(cache_path_eff, 0) if cache_path_eff else ""
+            cache1 = _derive_shard_cache_path(cache_path_eff, 1) if cache_path_eff else ""
+
+            payload_common = {
+                "project_dir": str(project_dir_abs),
+                "dataset_root": str(dataset_root_abs),
+                "cfg_train_yaml": cfg_train_yaml,
+                "dino_weights_pt_file": str(dino_weights_pt_file),
+                "head_weights_pt_path": str(head_weights_pt_path),
+                "fusion": str(fusion_eff),
+                "batch_size": int(batch_size),
+                "num_workers": int(num_workers),
+                "image_size_hw": tuple(image_size) if isinstance(image_size, (list, tuple)) else None,
+                "hflip": bool(hflip),
+                "vflip": bool(vflip),
+            }
+
+            try:
+                res0, res1 = run_two_processes_spawn(
+                    worker=_extract_head_penultimate_features_2gpu_worker,
+                    payload0={**payload_common, "image_paths": image_paths0, "cache_path": (cache0 if cache0 else None)},
+                    payload1={**payload_common, "image_paths": image_paths1, "cache_path": (cache1 if cache1 else None)},
+                    device0=0,
+                    device1=1,
+                )
+            except Exception as e:
+                print(f"[TABPFN][WARN] 2-GPU feature extraction disabled (fallback to single process): {e}")
+            else:
+                rels0 = [str(r) for r in (res0.get("rels_in_order", []) or [])]
+                rels1 = [str(r) for r in (res1.get("rels_in_order", []) or [])]
+                if rels0 != list(image_paths0):
+                    raise RuntimeError("2-GPU shard0 feature extraction order mismatch (head_penultimate).")
+                if rels1 != list(image_paths1):
+                    raise RuntimeError("2-GPU shard1 feature extraction order mismatch (head_penultimate).")
+
+                feats0 = res0.get("features", None)
+                feats1 = res1.get("features", None)
+                if not (isinstance(feats0, torch.Tensor) and feats0.dim() == 2):
+                    raise RuntimeError(
+                        f"2-GPU shard0 invalid features tensor: {type(feats0)} shape={getattr(feats0, 'shape', None)}"
+                    )
+                if not (isinstance(feats1, torch.Tensor) and feats1.dim() == 2):
+                    raise RuntimeError(
+                        f"2-GPU shard1 invalid features tensor: {type(feats1)} shape={getattr(feats1, 'shape', None)}"
+                    )
+                if int(feats0.shape[0]) != int(len(image_paths0)) or int(feats1.shape[0]) != int(len(image_paths1)):
+                    raise RuntimeError("2-GPU feature extraction N mismatch across shards (head_penultimate).")
+                if int(feats0.shape[1]) != int(feats1.shape[1]):
+                    raise RuntimeError(
+                        f"2-GPU feature extraction D mismatch across shards (head_penultimate): {int(feats0.shape[1])} vs {int(feats1.shape[1])}"
+                    )
+
+                N = int(len(image_paths))
+                D = int(feats0.shape[1])
+                features_full = torch.empty((N, D), dtype=torch.float32)
+                features_full[idx0] = feats0.detach().cpu().float()
+                features_full[idx1] = feats1.detach().cpu().float()
+
+                if cache_path_eff:
+                    try:
+                        os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
+                        torch.save(
+                            {
+                                "image_paths": list(image_paths),
+                                "features": features_full.cpu(),
+                                "meta": {
+                                    "head_type": head_type,
+                                    "head_weights_path": str(head_pt),
+                                    "dino_weights_pt_file": str(dino_weights_pt_file),
+                                    "fusion": str(fusion_eff),
+                                    "image_size": tuple(image_size),
+                                    "hflip": bool(hflip),
+                                    "vflip": bool(vflip),
+                                    "two_gpu_data_parallel": True,
+                                },
+                            },
+                            cache_path_eff,
+                        )
+                        print(f"[TABPFN] Saved feature cache -> {cache_path_eff}")
+                    except Exception as e:
+                        print(f"[TABPFN][WARN] Saving feature cache failed: {e}")
+
+                return list(image_paths), features_full.cpu().numpy()
 
     tf = build_transforms(image_size=image_size, mean=mean, std=std, hflip=bool(hflip), vflip=bool(vflip))
     ds = TestImageDataset(list(image_paths), root_dir=str(dataset_root_abs), transform=tf)
@@ -734,6 +1117,103 @@ def extract_dinov3_cls_features(
             except Exception:
                 pass
 
+    # ==========================================================
+    # 2-GPU data-parallel feature extraction (each GPU runs independent images)
+    #
+    # - Only used when >=2 GPUs are available AND cache miss (handled above).
+    # - Uses spawn+2 processes with even/odd sharding to preserve order on merge.
+    # - Writes per-shard cache files and then writes the combined cache (same schema).
+    # ==========================================================
+    try:
+        can_two_gpu = bool(two_gpu_parallel_enabled()) and int(len(image_paths)) >= 2
+    except Exception:
+        can_two_gpu = False
+    if can_two_gpu:
+        idx0, idx1 = split_even_odd_indices(int(len(image_paths)))
+        if idx0 and idx1:
+            image_paths0 = [image_paths[i] for i in idx0]
+            image_paths1 = [image_paths[i] for i in idx1]
+            cache0 = _derive_shard_cache_path(cache_path_eff, 0) if cache_path_eff else ""
+            cache1 = _derive_shard_cache_path(cache_path_eff, 1) if cache_path_eff else ""
+
+            payload_common = {
+                "project_dir": str(project_dir_abs),
+                "dataset_root": str(dataset_root_abs),
+                "cfg_train_yaml": cfg_train_yaml,
+                "dino_weights_pt_file": str(dino_weights_pt_file),
+                "batch_size": int(batch_size),
+                "num_workers": int(num_workers),
+                "image_size_hw": tuple(image_size) if isinstance(image_size, (list, tuple)) else None,
+                "hflip": bool(hflip),
+                "vflip": bool(vflip),
+            }
+
+            try:
+                res0, res1 = run_two_processes_spawn(
+                    worker=_extract_dinov3_cls_features_2gpu_worker,
+                    payload0={**payload_common, "image_paths": image_paths0, "cache_path": (cache0 if cache0 else None)},
+                    payload1={**payload_common, "image_paths": image_paths1, "cache_path": (cache1 if cache1 else None)},
+                    device0=0,
+                    device1=1,
+                )
+            except Exception as e:
+                print(f"[TABPFN][WARN] 2-GPU feature extraction disabled (fallback to single process): {e}")
+            else:
+                rels0 = [str(r) for r in (res0.get("rels_in_order", []) or [])]
+                rels1 = [str(r) for r in (res1.get("rels_in_order", []) or [])]
+                if rels0 != list(image_paths0):
+                    raise RuntimeError("2-GPU shard0 feature extraction order mismatch (dinov3_only).")
+                if rels1 != list(image_paths1):
+                    raise RuntimeError("2-GPU shard1 feature extraction order mismatch (dinov3_only).")
+
+                feats0 = res0.get("features", None)
+                feats1 = res1.get("features", None)
+                if not (isinstance(feats0, torch.Tensor) and feats0.dim() == 2):
+                    raise RuntimeError(
+                        f"2-GPU shard0 invalid CLS features tensor: {type(feats0)} shape={getattr(feats0, 'shape', None)}"
+                    )
+                if not (isinstance(feats1, torch.Tensor) and feats1.dim() == 2):
+                    raise RuntimeError(
+                        f"2-GPU shard1 invalid CLS features tensor: {type(feats1)} shape={getattr(feats1, 'shape', None)}"
+                    )
+                if int(feats0.shape[0]) != int(len(image_paths0)) or int(feats1.shape[0]) != int(len(image_paths1)):
+                    raise RuntimeError("2-GPU CLS feature extraction N mismatch across shards (dinov3_only).")
+                if int(feats0.shape[1]) != int(feats1.shape[1]):
+                    raise RuntimeError(
+                        f"2-GPU CLS feature extraction D mismatch across shards (dinov3_only): {int(feats0.shape[1])} vs {int(feats1.shape[1])}"
+                    )
+
+                N = int(len(image_paths))
+                D = int(feats0.shape[1])
+                features_full = torch.empty((N, D), dtype=torch.float32)
+                features_full[idx0] = feats0.detach().cpu().float()
+                features_full[idx1] = feats1.detach().cpu().float()
+
+                if cache_path_eff:
+                    try:
+                        os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
+                        torch.save(
+                            {
+                                "image_paths": list(image_paths),
+                                "features": features_full.cpu(),
+                                "meta": {
+                                    "mode": "dinov3_only",
+                                    "backbone": str(backbone_name),
+                                    "weights_path": str(dino_weights_pt_file),
+                                    "image_size": tuple(image_size),
+                                    "hflip": bool(hflip),
+                                    "vflip": bool(vflip),
+                                    "two_gpu_data_parallel": True,
+                                },
+                            },
+                            cache_path_eff,
+                        )
+                        print(f"[TABPFN] Saved feature cache -> {cache_path_eff}")
+                    except Exception as e:
+                        print(f"[TABPFN][WARN] Saving feature cache failed: {e}")
+
+                return list(image_paths), features_full.cpu().numpy()
+
     tf = build_transforms(image_size=image_size, mean=mean, std=std, hflip=bool(hflip), vflip=bool(vflip))
     ds = TestImageDataset(list(image_paths), root_dir=str(dataset_root_abs), transform=tf)
     dl = DataLoader(
@@ -829,16 +1309,16 @@ def run_tabpfn_submission(
     tabpfn: TabPFNSubmissionSettings,
 ) -> None:
     """
-    Offline submission generation using TabPFN:
-      1) Load + pivot train.csv (image-level)
-      2) Extract image-model head penultimate features for train + test
-      3) Fit TabPFN on FULL train.csv (no CV)
-      4) Predict test images and write submission.csv
+    Offline submission generation using **packaged** TabPFN fit-state (no online training):
+      1) Load test.csv
+      2) Load fitted TabPFN state from <project_dir>/<tabpfn.fit_state_dir>/
+      3) Extract image features for test (supports ensemble + TTA)
+      4) Predict and write submission.csv
     """
     import pandas as pd
 
     from src.inference.data import resolve_paths
-    from src.inference.ensemble import normalize_ensemble_models, read_ensemble_cfg_obj, resolve_cache_dir
+    from src.inference.ensemble import normalize_ensemble_models
     from src.inference.pipeline import (
         _resolve_tta_views,
         load_config,
@@ -868,9 +1348,6 @@ def run_tabpfn_submission(
     if str(tabpfn.model_cache_dir or "").strip():
         os.environ["TABPFN_MODEL_CACHE_DIR"] = str(resolve_path_best_effort(project_dir_abs, str(tabpfn.model_cache_dir)))
 
-    TabPFNRegressor = _import_tabpfn_regressor(tabpfn_python_path=str(tabpfn.tabpfn_python_path or "").strip())
-    from sklearn.multioutput import MultiOutputRegressor
-
     # Project config (train.yaml) for backbone + transforms
     cfg = load_config(project_dir_abs)
 
@@ -879,33 +1356,6 @@ def run_tabpfn_submission(
     if not {"sample_id", "image_path", "target_name"}.issubset(df_test.columns):
         raise ValueError("test.csv must contain columns: sample_id, image_path, target_name")
     unique_test_paths = df_test["image_path"].astype(str).unique().tolist()
-
-    # Resolve train.csv path (default: <dataset_root>/train.csv)
-    train_csv_path = str(tabpfn.train_csv_path or "").strip()
-    if train_csv_path:
-        train_csv_path = resolve_path_best_effort(project_dir_abs, train_csv_path)
-    else:
-        train_csv_path = os.path.join(dataset_root, "train.csv")
-    if not os.path.isfile(train_csv_path):
-        raise FileNotFoundError(
-            "TabPFN mode requires train.csv. Not found at: "
-            f"{train_csv_path}. Set tabpfn.train_csv_path to override."
-        )
-
-    # Load + pivot train.csv (image-level)
-    from src.data.csiro_pivot import read_and_pivot_csiro_train_csv
-    from src.metrics import TARGETS_5D_ORDER
-    from src.tabular.features import build_y_5d
-
-    target_order = list(cfg.get("data", {}).get("target_order", ["Dry_Total_g"]))
-    df_train = read_and_pivot_csiro_train_csv(
-        data_root=str(dataset_root),
-        train_csv=str(train_csv_path),
-        target_order=target_order,
-    )
-    if len(df_train) < 2:
-        raise RuntimeError(f"Not enough training samples after pivoting: {len(df_train)}")
-    y_train = build_y_5d(df_train, targets_5d_order=list(TARGETS_5D_ORDER), fillna=0.0)
 
     # ==========================================================
     # Ensemble + TabPFN (feature-level) path
@@ -925,17 +1375,6 @@ def run_tabpfn_submission(
                 f"Unsupported TabPFN feature_mode: {feature_mode!r} (expected 'head_penultimate' or 'dinov3_only')"
             )
 
-        # Default feature-cache directory (always enabled for ensemble+tabpfn).
-        # If user provided explicit cache paths, we still namespace per-model to avoid collisions.
-        ensemble_obj = read_ensemble_cfg_obj(project_dir_abs) or {}
-        cache_dir_cfg = ensemble_obj.get("cache_dir", None) if isinstance(ensemble_obj, dict) else None
-        cache_dir = resolve_cache_dir(project_dir_abs, cache_dir_cfg)
-        feature_cache_dir_default = os.path.join(cache_dir, "tabpfn_features")
-        try:
-            os.makedirs(feature_cache_dir_default, exist_ok=True)
-        except Exception:
-            pass
-
         def _derive_model_cache_tag(*, model_id: str, version: object) -> str:
             base = str(model_id or "").strip() or "model"
             if isinstance(version, (str, int, float)) and str(version).strip():
@@ -949,13 +1388,13 @@ def run_tabpfn_submission(
             """
             Resolve a per-model cache path.
 
-            - If base_path is empty: write under <ensemble_cache_dir>/tabpfn_features/
+            - If base_path is empty: caching disabled (returns empty string)
             - If base_path is a directory: write <dir>/<split>__<model_tag>.pt
             - If base_path is a file: insert __<model_tag> before extension
             """
             raw = str(base_path or "").strip()
             if not raw:
-                return os.path.join(feature_cache_dir_default, f"{split}__{model_tag}.pt")
+                return ""
 
             p = resolve_path_best_effort(project_dir_abs, raw)
             # Treat as directory if:
@@ -1047,12 +1486,6 @@ def run_tabpfn_submission(
                 )
 
             model_tag = _derive_model_cache_tag(model_id=model_id, version=version)
-            cache_train_i = _resolve_cache_path_for_model(
-                base_path=str(tabpfn.feature_cache_path_train or ""),
-                split="train",
-                model_tag=model_tag,
-            )
-
             models_eff.append(
                 {
                     "model_id": model_id,
@@ -1064,7 +1497,6 @@ def run_tabpfn_submission(
                     "base_image_size_hw": tuple(base_image_size_hw),
                     "dino_weights_file": str(dino_weights_file_i),
                     "head_base": str(head_base),
-                    "cache_train": str(cache_train_i),
                     "model_tag": str(model_tag),
                 }
             )
@@ -1073,107 +1505,21 @@ def run_tabpfn_submission(
             raise RuntimeError("Ensemble is enabled but no valid models were found for TabPFN.")
 
         print(f"[TABPFN][ENSEMBLE] Models: {len(models_eff)} (single TabPFN fit; feature-level averaging)")
-        print(f"[TABPFN][ENSEMBLE] Feature cache dir (default): {feature_cache_dir_default}")
         if feature_mode == "dinov3_only":
             print("[TABPFN][ENSEMBLE] Feature mode: dinov3_only (CLS token; no head)")
         else:
             print(f"[TABPFN][ENSEMBLE] Feature mode: head_penultimate (fusion={str(tabpfn.feature_fusion)})")
 
-        # Extract + stack train features across all models
-        train_image_paths = df_train["image_path"].astype(str).tolist()
-        X_train_list: list[np.ndarray] = []
-        D_ref: Optional[int] = None
-        for mi in models_eff:
-            cfg_i = mi["cfg"]
-            dino_w_i = mi["dino_weights_file"]
-            head_base_i = mi["head_base"]
-            cache_train_i = mi["cache_train"]
-            model_id_i = mi["model_id"]
-            version_i = mi.get("version", None)
-            base_hw_i = tuple(mi.get("base_image_size_hw", (224, 224)))
+        # Load packaged ensemble fit-state (no online fitting).
+        from src.metrics import TARGETS_5D_ORDER
 
-            print(
-                f"[TABPFN][ENSEMBLE] Extract train feats: model_id={model_id_i!r} version={version_i!r} "
-                f"backbone={mi['backbone']!r}"
-            )
-            if feature_mode == "dinov3_only":
-                _rels_train_i, X_train_i = extract_dinov3_cls_features(
-                    project_dir=project_dir_abs,
-                    dataset_root=str(dataset_root),
-                    cfg_train_yaml=cfg_i,
-                    dino_weights_pt_file=str(dino_w_i),
-                    image_paths=train_image_paths,
-                    batch_size=int(tabpfn.feature_batch_size),
-                    num_workers=int(tabpfn.feature_num_workers),
-                    cache_path=str(cache_train_i),
-                    image_size_hw=base_hw_i,
-                    hflip=False,
-                    vflip=False,
-                )
-            else:
-                _rels_train_i, X_train_i = extract_head_penultimate_features(
-                    project_dir=project_dir_abs,
-                    dataset_root=str(dataset_root),
-                    cfg_train_yaml=cfg_i,
-                    dino_weights_pt_file=str(dino_w_i),
-                    head_weights_pt_path=str(head_base_i),
-                    image_paths=train_image_paths,
-                    fusion=str(tabpfn.feature_fusion),
-                    batch_size=int(tabpfn.feature_batch_size),
-                    num_workers=int(tabpfn.feature_num_workers),
-                    cache_path=str(cache_train_i),
-                    image_size_hw=base_hw_i,
-                    hflip=False,
-                    vflip=False,
-                )
-
-            if not (isinstance(X_train_i, np.ndarray) and X_train_i.ndim == 2 and X_train_i.shape[0] == len(train_image_paths)):
-                raise RuntimeError(
-                    f"Invalid train features array for model_id={model_id_i!r}: shape={getattr(X_train_i, 'shape', None)}"
-                )
-            if D_ref is None:
-                D_ref = int(X_train_i.shape[1])
-            elif int(X_train_i.shape[1]) != int(D_ref):
-                raise RuntimeError(
-                    "TabPFN ensemble requires the SAME feature dimension across models. "
-                    f"Got D_ref={D_ref} but model_id={model_id_i!r} produced D={int(X_train_i.shape[1])}."
-                )
-            X_train_list.append(X_train_i)
-
-        X_train_all = np.concatenate(X_train_list, axis=0)
-        y_train_all = np.concatenate([y_train for _ in range(len(X_train_list))], axis=0)
-
-        print(f"[TABPFN][ENSEMBLE] X_train_all: {tuple(X_train_all.shape)}  y_train_all: {tuple(y_train_all.shape)}")
-
-        # Fit a SINGLE TabPFN on stacked train features
-        base = TabPFNRegressor(
-            n_estimators=int(tabpfn.n_estimators),
-            device=str(tabpfn.device),
-            fit_mode=str(tabpfn.fit_mode),
-            inference_precision=str(tabpfn.inference_precision),
-            random_state=42,
-            ignore_pretraining_limits=bool(tabpfn.ignore_pretraining_limits),
-            model_path=str(ckpt_path),
+        predictor = _load_tabpfn_predictor_from_fit_state(
+            project_dir_abs=project_dir_abs,
+            tabpfn=tabpfn,
+            subdir="ensemble",
+            expected_targets=list(TARGETS_5D_ORDER),
         )
-        model = MultiOutputRegressor(base, n_jobs=int(tabpfn.n_jobs))
-        try:
-            model.fit(X_train_all, y_train_all)
-        except RuntimeError as e:
-            msg = str(e)
-            msg_l = msg.lower()
-            if (
-                "gated" in msg_l
-                or "authentication error" in msg_l
-                or "hf auth login" in msg_l
-                or "hf_token" in msg_l
-                or "unauthorized" in msg_l
-            ):
-                raise SystemExit(
-                    "TabPFN attempted a HuggingFace download/auth flow, but this pipeline is configured for local-only weights.\n"
-                    f"Please ensure weights_ckpt_path points to a valid local `.ckpt` file: {ckpt_path}\n"
-                    f"Original error: {msg.strip()}"
-                ) from e
-            raise
+        D_ref: Optional[int] = None
 
         # Predict test set:
         # - For each model: average predictions across its TTA views (if enabled).
@@ -1253,13 +1599,15 @@ def run_tabpfn_submission(
                     raise RuntimeError(
                         f"Invalid test features array for model_id={model_id_i!r}: shape={getattr(X_test_i, 'shape', None)}"
                     )
-                if D_ref is not None and int(X_test_i.shape[1]) != int(D_ref):
+                if D_ref is None:
+                    D_ref = int(X_test_i.shape[1])
+                elif int(X_test_i.shape[1]) != int(D_ref):
                     raise RuntimeError(
                         "TabPFN ensemble requires the SAME feature dimension across models. "
                         f"Got D_ref={D_ref} but model_id={model_id_i!r} produced D={int(X_test_i.shape[1])}."
                     )
 
-                y_pred_view = model.predict(X_test_i)
+                y_pred_view = predictor.predict(X_test_i)
                 y_pred_model_sum = y_pred_view if y_pred_model_sum is None else (y_pred_model_sum + y_pred_view)
                 n_views_eff += 1
 
@@ -1311,8 +1659,17 @@ def run_tabpfn_submission(
             f"Cannot resolve DINO backbone weights file from dino_weights_pt_path={settings.dino_weights_pt_path!r}"
         )
 
-    print("[TABPFN] Training data:", train_csv_path)
-    print("[TABPFN] Train images:", len(df_train), "Test images:", len(unique_test_paths))
+    from src.metrics import TARGETS_5D_ORDER
+
+    # Load packaged single-model fit-state (no online fitting).
+    predictor = _load_tabpfn_predictor_from_fit_state(
+        project_dir_abs=project_dir_abs,
+        tabpfn=tabpfn,
+        subdir="single",
+        expected_targets=list(TARGETS_5D_ORDER),
+    )
+
+    print("[TABPFN] Loaded packaged fit-state (single).")
     print("[TABPFN] DINO weights:", dino_weights_file)
     feature_mode = str(getattr(tabpfn, "feature_mode", "head_penultimate") or "head_penultimate").strip().lower()
     if feature_mode not in ("head_penultimate", "dinov3_only"):
@@ -1332,69 +1689,7 @@ def run_tabpfn_submission(
     except Exception:
         base_image_size_hw = (224, 224)
 
-    # Extract training features (always base view; TTA is applied at prediction time).
-    if feature_mode == "dinov3_only":
-        _train_rels, X_train = extract_dinov3_cls_features(
-            project_dir=project_dir_abs,
-            dataset_root=str(dataset_root),
-            cfg_train_yaml=cfg,
-            dino_weights_pt_file=str(dino_weights_file),
-            image_paths=df_train["image_path"].astype(str).tolist(),
-            batch_size=int(tabpfn.feature_batch_size),
-            num_workers=int(tabpfn.feature_num_workers),
-            cache_path=str(tabpfn.feature_cache_path_train) if str(tabpfn.feature_cache_path_train or "").strip() else None,
-            image_size_hw=tuple(base_image_size_hw),
-            hflip=False,
-            vflip=False,
-        )
-    else:
-        _train_rels, X_train = extract_head_penultimate_features(
-            project_dir=project_dir_abs,
-            dataset_root=str(dataset_root),
-            cfg_train_yaml=cfg,
-            dino_weights_pt_file=str(dino_weights_file),
-            head_weights_pt_path=str(settings.head_weights_pt_path),
-            image_paths=df_train["image_path"].astype(str).tolist(),
-            fusion=str(tabpfn.feature_fusion),
-            batch_size=int(tabpfn.feature_batch_size),
-            num_workers=int(tabpfn.feature_num_workers),
-            cache_path=str(tabpfn.feature_cache_path_train) if str(tabpfn.feature_cache_path_train or "").strip() else None,
-            image_size_hw=tuple(base_image_size_hw),
-            hflip=False,
-            vflip=False,
-        )
-
-    # Fit TabPFN on FULL train.csv
-    base = TabPFNRegressor(
-        n_estimators=int(tabpfn.n_estimators),
-        device=str(tabpfn.device),
-        fit_mode=str(tabpfn.fit_mode),
-        inference_precision=str(tabpfn.inference_precision),
-        random_state=42,
-        ignore_pretraining_limits=bool(tabpfn.ignore_pretraining_limits),
-        model_path=str(ckpt_path),
-    )
-    model = MultiOutputRegressor(base, n_jobs=int(tabpfn.n_jobs))
-    try:
-        model.fit(X_train, y_train)
-    except RuntimeError as e:
-        msg = str(e)
-        msg_l = msg.lower()
-        if (
-            "gated" in msg_l
-            or "authentication error" in msg_l
-            or "hf auth login" in msg_l
-            or "hf_token" in msg_l
-            or "unauthorized" in msg_l
-        ):
-            raise SystemExit(
-                "TabPFN attempted a HuggingFace download/auth flow, but this pipeline is configured for local-only weights.\n"
-                f"Please ensure weights_ckpt_path points to a valid local `.ckpt` file: {ckpt_path}\n"
-                f"Original error: {msg.strip()}"
-            ) from e
-        raise
-
-    # Predict on test features with optional TTA (still a single fitted TabPFN).
+    # Predict on test features with optional TTA (single packaged TabPFN).
     test_image_paths = list(unique_test_paths)
     tta_views = _resolve_tta_views(settings, base_image_size=tuple(base_image_size_hw), patch_multiple=16)
     multi_view = len(tta_views) > 1
@@ -1455,7 +1750,7 @@ def run_tabpfn_submission(
                 vflip=bool(vflip_view),
             )
 
-        y_pred_view = model.predict(X_test_view)
+        y_pred_view = predictor.predict(X_test_view)
         y_pred_sum = y_pred_view if y_pred_sum is None else (y_pred_sum + y_pred_view)
         n_views_eff += 1
 

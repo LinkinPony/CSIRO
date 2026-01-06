@@ -1,0 +1,102 @@
+# Nano Banana Pro augmentation config
+#
+# Usage:
+#   python tools/nano_banana_pro/augment_train.py --config configs/nano_banana_pro_augment.yaml
+#
+# Notes:
+# - Default provider is Gemini native API (Nano Banana Pro). You can also use OpenRouter.
+# - Put your API key into `gemini.secret` (Gemini) or `openrouter.secret` (OpenRouter),
+#   or set `api.api_key_file` to any path.
+# - Outputs default to: data/nano_banana_pro/train/
+# - A manifest.csv is written there; training can read it to include AIGC samples.
+
+api:
+  # Which backend to call: gemini | openrouter
+  provider: gemini
+
+  # Model name:
+  # - provider=gemini: use Gemini model id (Nano Banana Pro => gemini-3-pro-image-preview)
+  # - provider=openrouter: use OpenRouter model id (e.g. google/gemini-3-pro-image-preview)
+  model: gemini-3-pro-image-preview
+
+  # Read API key from this file (relative to repo root unless absolute)
+  api_key_file: gemini.secret
+
+  # OpenRouter-only (optional):
+  # base_url: https://openrouter.ai/api/v1/chat/completions
+  # http_referer: https://your.site   # sent as HTTP-Referer header (optional)
+  # x_title: your-app-name            # sent as X-Title header (optional)
+  # extra_headers: {}                 # arbitrary headers (optional)
+  # modalities: [image, text]         # image generation requires "image" (recommended: [image, text])
+
+  # Parallel API calls (threaded). Increase to speed up, but be mindful of rate limits/cost.
+  concurrency: 10
+  # Concurrency scope:
+  # - per_image: run variants of one image in parallel (max in-flight ~= variants per image)
+  # - global: keep up to `concurrency` requests in-flight across the dataset
+  concurrency_scope: global
+  timeout_s: 120
+  max_retries: 3
+  retry_backoff_s: 5.0
+
+  # Optional output controls (usually leave unset to match input image size/aspect):
+  # image_config:
+  #   aspectRatio: "4:3"
+  #   imageSize: "2K"
+  #
+  # OpenRouter note: its config field is also called image_config, but keys are snake_case, e.g.:
+  # image_config:
+  #   aspect_ratio: "16:9"
+  #   image_size: "2K"
+
+data:
+  data_root: data
+  train_csv: train.csv
+  # Only augment images that have these primary targets present (consistent with default training)
+  primary_targets: [Dry_Total_g]
+  # Output folder (default requested)
+  output_dir: data/nano_banana_pro/train
+  output_ext: png
+  manifest: manifest.csv
+  log_file: augment.log
+
+# Optional post-processing to make output strictly match your dataset shape.
+# For CSIRO, raw images are ~2000x1000 (W:H = 2:1). Even though image-editing mode
+# usually follows the input image size, this provides a hard guarantee.
+postprocess:
+  # Enforce exact width/height ratio. "pad" is label-preserving (recommended).
+  enforce_aspect_ratio: 2.0
+  mode: pad            # pad | crop
+  pad_mode: reflect    # reflect | edge | constant
+  pad_color: [0, 0, 0] # used only when pad_mode=constant
+  # Optionally force an exact size (YAML uses [W, H]). Set null to keep model size.
+  target_size: [2000, 1000]
+  resample: bicubic
+
+# Common prefix injected before each augmentation prompt.
+# Keep it strict: ONLY change imaging pipeline (lighting/exposure/white-balance/noise/compression/blur),
+# do NOT change vegetation structure/coverage/density/proportions.
+prompt_prefix: |
+  你正在对一张牧草样方的真实照片做“数据增强”，用来训练生物量回归模型。
+  请严格保持场景内容不变：不要新增、删除或移动任何草/三叶草/枯草/土壤元素；
+  不要改变植被覆盖的形状、边界、密度和比例；不要改变视角、构图、裁剪范围或几何形变。
+  变化幅度要自然，确保这张图仍然和原图是一一对应的同一场景。
+  输出一张与输入同分辨率、同长宽比的图片。
+
+# Augmentation types to generate.
+# Each `name` becomes part of the output filename: <image_id>__<name>__v0.png
+augmentations:
+  - name: relight_overcast
+    num_images: 1
+    prompt: |
+      把这张照片处理成阴天的柔和漫射光效果：整体对比度稍低、阴影更软、亮部不过曝、色温略偏冷但自然。
+      保持场景与植被完全不变，不要重绘纹理细节。
+
+  - name: relight_noon_hard
+    num_images: 1
+    prompt: |
+      把这张照片处理成晴天正午直射光：阴影更清晰但不过黑，高光更亮但不要大面积死白；
+      整体更像手机相机的HDR处理（动态范围更大），颜色自然不过饱和。
+
+
+

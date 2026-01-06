@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 import re
 import shutil
@@ -308,6 +309,371 @@ def copy_optional_third_party(repo_root: Path, weights_dir: Path) -> None:
         )
 
 
+def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -> None:
+    """
+    Build + package TabPFN artifacts for inference (no online training):
+      - Copy TabPFN foundation weights into the package (optional; controlled by configs/train_tabpfn.yaml).
+      - Extract train image features and fit TabPFN once (single or ensemble mode).
+      - Save fitted-state bundles under: <weights_dir>/<artifacts.fit_state_dir>/{single|ensemble}/
+    """
+    cfg_path = (weights_dir / "configs" / "train_tabpfn.yaml").resolve()
+    if not cfg_path.is_file():
+        cfg_path = (repo_root / "configs" / "train_tabpfn.yaml").resolve()
+    if not cfg_path.is_file():
+        print("[TABPFN][PKG] configs/train_tabpfn.yaml not found; skipping TabPFN packaging.")
+        return
+
+    cfg = load_cfg(str(cfg_path))
+    if not isinstance(cfg, dict):
+        print("[TABPFN][PKG] Invalid train_tabpfn.yaml (not a dict); skipping TabPFN packaging.")
+        return
+
+    tab_cfg = cfg.get("tabpfn", {}) if isinstance(cfg.get("tabpfn", {}), dict) else {}
+    imgf_cfg = cfg.get("image_features", {}) if isinstance(cfg.get("image_features", {}), dict) else {}
+    data_cfg = cfg.get("data", {}) if isinstance(cfg.get("data", {}), dict) else {}
+    art_cfg = cfg.get("artifacts", {}) if isinstance(cfg.get("artifacts", {}), dict) else {}
+
+    fit_state_dir_name = str(art_cfg.get("fit_state_dir", "tabpfn_fit") or "tabpfn_fit").strip() or "tabpfn_fit"
+    train_feat_cache_dir_name = (
+        str(art_cfg.get("train_feature_cache_dir", "tabpfn_train_features") or "tabpfn_train_features").strip()
+        or "tabpfn_train_features"
+    )
+    copy_tabpfn_weights = bool(art_cfg.get("copy_tabpfn_weights", False))
+
+    model_path_raw = str(tab_cfg.get("model_path", tab_cfg.get("weights_ckpt_path", "")) or "").strip()
+    if not model_path_raw:
+        raise RuntimeError("[TABPFN][PKG] Missing required tabpfn.model_path in configs/train_tabpfn.yaml")
+
+    # Copy TabPFN ckpt into weights/ so fit-states can load offline (relative model_path).
+    if copy_tabpfn_weights:
+        src_ckpt = Path(model_path_raw).expanduser()
+        if not src_ckpt.is_absolute():
+            src_ckpt = (repo_root / src_ckpt).resolve()
+        if not src_ckpt.exists():
+            raise FileNotFoundError(f"[TABPFN][PKG] TabPFN model_path not found: {src_ckpt}")
+
+        rel = Path(model_path_raw)
+        if rel.is_absolute():
+            rel = Path("tabpfn_weights") / src_ckpt.name
+        if not str(rel).startswith("tabpfn_weights"):
+            rel = Path("tabpfn_weights") / src_ckpt.name
+        dst_ckpt = (weights_dir / rel).resolve()
+
+        if src_ckpt.is_file():
+            dst_ckpt.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(str(src_ckpt), str(dst_ckpt))
+            print(f"[TABPFN][PKG] Copied TabPFN ckpt: {src_ckpt} -> {dst_ckpt}")
+        elif src_ckpt.is_dir():
+            if dst_ckpt.exists() and dst_ckpt.is_dir():
+                shutil.rmtree(dst_ckpt)
+            shutil.copytree(str(src_ckpt), str(dst_ckpt), dirs_exist_ok=True)
+            print(f"[TABPFN][PKG] Copied TabPFN ckpt dir: {src_ckpt} -> {dst_ckpt}")
+
+    # Resolve training data (not copied into weights/)
+    data_root = str(data_cfg.get("root", "data") or "data").strip() or "data"
+    train_csv_name = str(data_cfg.get("train_csv", "train.csv") or "train.csv").strip() or "train.csv"
+    dataset_root = Path(data_root).expanduser()
+    if not dataset_root.is_absolute():
+        dataset_root = (repo_root / dataset_root).resolve()
+    train_csv_path = (dataset_root / train_csv_name).resolve()
+    if not train_csv_path.is_file():
+        raise FileNotFoundError(f"[TABPFN][PKG] train.csv not found: {train_csv_path}")
+
+    target_order = data_cfg.get("target_order", ["Dry_Total_g"])
+    if not isinstance(target_order, list) or not target_order:
+        target_order = ["Dry_Total_g"]
+
+    from src.data.csiro_pivot import read_and_pivot_csiro_train_csv
+    from src.metrics import TARGETS_5D_ORDER
+    from src.tabular.features import build_y_5d
+
+    df_train = read_and_pivot_csiro_train_csv(
+        data_root=str(dataset_root),
+        train_csv=str(train_csv_path),
+        target_order=list(target_order),
+    )
+    if len(df_train) < 2:
+        raise RuntimeError(f"[TABPFN][PKG] Not enough training samples after pivoting: {len(df_train)}")
+    y_train = build_y_5d(df_train, targets_5d_order=list(TARGETS_5D_ORDER), fillna=0.0)
+    train_image_paths = df_train["image_path"].astype(str).tolist()
+
+    # Feature extraction config (matches inference semantics)
+    feature_mode = str(imgf_cfg.get("mode", "head_penultimate") or "head_penultimate").strip().lower()
+    feature_fusion = str(imgf_cfg.get("fusion", "mean") or "mean").strip().lower()
+    feature_batch_size = int(imgf_cfg.get("batch_size", 8))
+    feature_num_workers = int(imgf_cfg.get("num_workers", 8))
+    if feature_mode not in ("head_penultimate", "dinov3_only"):
+        raise ValueError(f"[TABPFN][PKG] Unsupported image_features.mode={feature_mode!r}")
+
+    fit_mode = str(tab_cfg.get("fit_mode", "fit_preprocessors") or "fit_preprocessors").strip()
+    if fit_mode.lower() == "fit_with_cache":
+        raise RuntimeError(
+            "[TABPFN][PKG] tabpfn.fit_mode='fit_with_cache' cannot be packaged via save_fit_state. "
+            "Use fit_preprocessors or low_memory."
+        )
+
+    # Configure TabPFN env before importing
+    enable_telemetry = bool(tab_cfg.get("enable_telemetry", False))
+    if not enable_telemetry:
+        os.environ["TABPFN_DISABLE_TELEMETRY"] = "1"
+    else:
+        os.environ.pop("TABPFN_DISABLE_TELEMETRY", None)
+    model_cache_dir = tab_cfg.get("model_cache_dir", None)
+    if isinstance(model_cache_dir, str) and model_cache_dir.strip():
+        os.environ["TABPFN_MODEL_CACHE_DIR"] = str((weights_dir / model_cache_dir.strip()).resolve())
+
+    # Import TabPFN + feature extractors
+    from src.inference.tabpfn import _import_tabpfn_regressor, extract_dinov3_cls_features, extract_head_penultimate_features
+
+    TabPFNRegressor = _import_tabpfn_regressor(
+        tabpfn_python_path=str(tab_cfg.get("python_path", "") or "").strip(),
+        project_dir=str(weights_dir),
+    )
+
+    import numpy as np
+    from sklearn.multioutput import MultiOutputRegressor
+
+    # Determine single vs ensemble mode based on packaged configs/ensemble.json
+    from src.inference.ensemble import normalize_ensemble_models
+    from src.inference.pipeline import load_config, load_config_file, parse_image_size, resolve_dino_weights_path_for_model
+    from src.inference.paths import resolve_path_best_effort, resolve_version_head_base, resolve_version_train_yaml, safe_slug
+
+    ensemble_models = normalize_ensemble_models(str(weights_dir))
+    use_ensemble = len(ensemble_models) > 0
+    subdir = "ensemble" if use_ensemble else "single"
+
+    out_fit_dir = (weights_dir / fit_state_dir_name / subdir).resolve()
+    if out_fit_dir.exists() and out_fit_dir.is_dir():
+        shutil.rmtree(out_fit_dir)
+    out_fit_dir.mkdir(parents=True, exist_ok=True)
+
+    train_cache_dir = (weights_dir / train_feat_cache_dir_name).resolve()
+    train_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # DINO weights dir (not packaged by default; used only for feature extraction during packaging)
+    dino_weights_root = (repo_root / "dinov3_weights").resolve()
+    if not dino_weights_root.is_dir():
+        raise FileNotFoundError(f"[TABPFN][PKG] dinov3_weights directory not found: {dino_weights_root}")
+
+    def _fit_and_save(*, X: np.ndarray, y: np.ndarray, meta_extra: dict) -> None:
+        # Fit inside weights_dir so model_path (relative) resolves against packaged tabpfn_weights/.
+        cwd = os.getcwd()
+        try:
+            os.chdir(str(weights_dir))
+            base = TabPFNRegressor(
+                n_estimators=int(tab_cfg.get("n_estimators", 8)),
+                device=str(tab_cfg.get("device", "auto")),
+                fit_mode=str(fit_mode),
+                inference_precision=str(tab_cfg.get("inference_precision", "auto")),
+                random_state=42,
+                ignore_pretraining_limits=bool(tab_cfg.get("ignore_pretraining_limits", True)),
+                model_path=str(model_path_raw),
+            )
+            model = MultiOutputRegressor(base, n_jobs=int(tab_cfg.get("n_jobs", 1)))
+            model.fit(X, y)
+        finally:
+            try:
+                os.chdir(cwd)
+            except Exception:
+                pass
+
+        files: dict[str, str] = {}
+        for i, tname in enumerate(list(TARGETS_5D_ORDER)):
+            out_path = out_fit_dir / f"{tname}.tabpfn_fit"
+            model.estimators_[i].save_fit_state(str(out_path))  # type: ignore[attr-defined]
+            files[str(tname)] = out_path.name
+
+        meta = {
+            "mode": str(subdir),
+            "targets": list(TARGETS_5D_ORDER),
+            "files": files,
+            "feature_mode": str(feature_mode),
+            "feature_fusion": str(feature_fusion),
+            "feature_dim": int(X.shape[1]) if isinstance(X, np.ndarray) and X.ndim == 2 else None,
+            "tabpfn": {
+                "model_path": str(model_path_raw),
+                "n_estimators": int(tab_cfg.get("n_estimators", 8)),
+                "device": str(tab_cfg.get("device", "auto")),
+                "fit_mode": str(fit_mode),
+                "inference_precision": str(tab_cfg.get("inference_precision", "auto")),
+                "ignore_pretraining_limits": bool(tab_cfg.get("ignore_pretraining_limits", True)),
+            },
+        }
+        if meta_extra:
+            meta.update(meta_extra)
+        with open(out_fit_dir / "meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+        print(f"[TABPFN][PKG] Saved fit-state -> {out_fit_dir}")
+
+    if use_ensemble:
+        print(f"[TABPFN][PKG] Ensemble enabled ({len(ensemble_models)} models): training ensemble fit-state.")
+        models_eff: list[dict] = []
+        for idx, m in enumerate(ensemble_models):
+            if not isinstance(m, dict):
+                continue
+            model_id = str(m.get("id", f"model_{idx}") or f"model_{idx}")
+            version = m.get("version", None)
+            # Resolve config path for model
+            cfg_path = None
+            for k in ("config", "config_path", "train_yaml", "train_config"):
+                v = m.get(k, None)
+                if isinstance(v, str) and v.strip():
+                    cfg_path = resolve_path_best_effort(str(weights_dir), v.strip())
+                    break
+            if cfg_path is None:
+                if isinstance(version, (str, int, float)) and str(version).strip():
+                    cfg_path = resolve_version_train_yaml(str(weights_dir), str(version).strip())
+                else:
+                    cfg_path = str((weights_dir / "configs" / "train.yaml").resolve())
+            cfg_model = load_config_file(str(cfg_path))
+
+            # Base image size (H,W)
+            try:
+                base_image_size_hw = parse_image_size(cfg_model.get("data", {}).get("image_size", 224))
+            except Exception:
+                base_image_size_hw = (224, 224)
+
+            # Head base for this model (unused for dinov3_only)
+            if isinstance(version, (str, int, float)) and str(version).strip():
+                head_base = resolve_version_head_base(str(weights_dir), str(version).strip())
+            else:
+                head_base = str((weights_dir / "head").resolve())
+
+            backbone_name = str(cfg_model.get("model", {}).get("backbone", "") or "").strip()
+            dino_weights_file = resolve_dino_weights_path_for_model(
+                str(weights_dir),
+                backbone_name=backbone_name,
+                cfg=cfg_model,
+                model_cfg=m,
+                global_dino_weights=str(dino_weights_root),
+            )
+            if not (dino_weights_file and os.path.isfile(dino_weights_file)):
+                raise FileNotFoundError(f"[TABPFN][PKG] Cannot resolve DINO weights for ensemble model: {model_id!r}")
+
+            base_tag = str(version).strip() if isinstance(version, (str, int, float)) and str(version).strip() else model_id
+            model_tag = safe_slug("__".join([base_tag, feature_mode, feature_fusion if feature_mode != "dinov3_only" else ""]))
+            cache_train = str((train_cache_dir / f"train__{model_tag}.pt").resolve())
+
+            models_eff.append(
+                {
+                    "model_id": model_id,
+                    "version": str(version).strip() if isinstance(version, (str, int, float)) else None,
+                    "cfg": cfg_model,
+                    "head_base": str(head_base),
+                    "dino_weights_file": str(dino_weights_file),
+                    "base_image_size_hw": tuple(base_image_size_hw),
+                    "cache_train": cache_train,
+                }
+            )
+
+        if not models_eff:
+            raise RuntimeError("[TABPFN][PKG] Ensemble enabled but no valid models found for TabPFN packaging.")
+
+        X_list: list[np.ndarray] = []
+        D_ref: int | None = None
+        for mi in models_eff:
+            cfg_i = mi["cfg"]
+            dino_w = mi["dino_weights_file"]
+            head_base = mi["head_base"]
+            cache_train = mi["cache_train"]
+            base_hw = tuple(mi.get("base_image_size_hw", (224, 224)))
+            if feature_mode == "dinov3_only":
+                _rels, X_i = extract_dinov3_cls_features(
+                    project_dir=str(weights_dir),
+                    dataset_root=str(dataset_root),
+                    cfg_train_yaml=cfg_i,
+                    dino_weights_pt_file=str(dino_w),
+                    image_paths=train_image_paths,
+                    batch_size=int(feature_batch_size),
+                    num_workers=int(feature_num_workers),
+                    cache_path=str(cache_train),
+                    image_size_hw=base_hw,
+                    hflip=False,
+                    vflip=False,
+                )
+            else:
+                _rels, X_i = extract_head_penultimate_features(
+                    project_dir=str(weights_dir),
+                    dataset_root=str(dataset_root),
+                    cfg_train_yaml=cfg_i,
+                    dino_weights_pt_file=str(dino_w),
+                    head_weights_pt_path=str(head_base),
+                    image_paths=train_image_paths,
+                    fusion=str(feature_fusion),
+                    batch_size=int(feature_batch_size),
+                    num_workers=int(feature_num_workers),
+                    cache_path=str(cache_train),
+                    image_size_hw=base_hw,
+                    hflip=False,
+                    vflip=False,
+                )
+            if not (isinstance(X_i, np.ndarray) and X_i.ndim == 2 and X_i.shape[0] == len(train_image_paths)):
+                raise RuntimeError(f"[TABPFN][PKG] Bad train feature array: shape={getattr(X_i, 'shape', None)}")
+            if D_ref is None:
+                D_ref = int(X_i.shape[1])
+            elif int(X_i.shape[1]) != int(D_ref):
+                raise RuntimeError(f"[TABPFN][PKG] Feature dim mismatch across models (expected {D_ref}, got {int(X_i.shape[1])}).")
+            X_list.append(X_i)
+
+        X_train_all = np.concatenate(X_list, axis=0)
+        y_train_all = np.concatenate([y_train for _ in range(len(X_list))], axis=0)
+        _fit_and_save(X=X_train_all, y=y_train_all, meta_extra={"ensemble_models": [{"version": m.get("version")} for m in models_eff]})
+    else:
+        print("[TABPFN][PKG] Ensemble disabled: training single-model fit-state.")
+        cfg_img = load_config(str(weights_dir))
+        backbone_name = str(cfg_img.get("model", {}).get("backbone", "") or "").strip()
+        dino_weights_file = resolve_dino_weights_path_for_model(
+            str(weights_dir),
+            backbone_name=backbone_name,
+            cfg=cfg_img,
+            model_cfg={},
+            global_dino_weights=str(dino_weights_root),
+        )
+        if not (dino_weights_file and os.path.isfile(dino_weights_file)):
+            raise FileNotFoundError(f"[TABPFN][PKG] Cannot resolve DINO weights file for backbone={backbone_name!r}")
+
+        try:
+            base_image_size_hw = parse_image_size(cfg_img.get("data", {}).get("image_size", 224))
+        except Exception:
+            base_image_size_hw = (224, 224)
+
+        cache_train = str((train_cache_dir / f"train__single__{safe_slug(feature_mode)}.pt").resolve())
+        if feature_mode == "dinov3_only":
+            _rels, X_train = extract_dinov3_cls_features(
+                project_dir=str(weights_dir),
+                dataset_root=str(dataset_root),
+                cfg_train_yaml=cfg_img,
+                dino_weights_pt_file=str(dino_weights_file),
+                image_paths=train_image_paths,
+                batch_size=int(feature_batch_size),
+                num_workers=int(feature_num_workers),
+                cache_path=str(cache_train),
+                image_size_hw=tuple(base_image_size_hw),
+                hflip=False,
+                vflip=False,
+            )
+        else:
+            _rels, X_train = extract_head_penultimate_features(
+                project_dir=str(weights_dir),
+                dataset_root=str(dataset_root),
+                cfg_train_yaml=cfg_img,
+                dino_weights_pt_file=str(dino_weights_file),
+                head_weights_pt_path=str((weights_dir / "head").resolve()),
+                image_paths=train_image_paths,
+                fusion=str(feature_fusion),
+                batch_size=int(feature_batch_size),
+                num_workers=int(feature_num_workers),
+                cache_path=str(cache_train),
+                image_size_hw=tuple(base_image_size_hw),
+                hflip=False,
+                vflip=False,
+            )
+        if not (isinstance(X_train, np.ndarray) and X_train.ndim == 2 and X_train.shape[0] == len(train_image_paths)):
+            raise RuntimeError(f"[TABPFN][PKG] Bad train feature array: shape={getattr(X_train, 'shape', None)}")
+        _fit_and_save(X=X_train, y=y_train, meta_extra={})
+
+
 def copy_top_level_scripts(repo_root: Path, weights_dir: Path) -> list[Path]:
     # Copy selected top-level scripts into weights/scripts/ for portability
     script_names = [
@@ -451,7 +817,11 @@ def _export_swa_head_from_checkpoint(ckpt_path: Path, dst_dir: Path) -> tuple[Pa
         _shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    head_cb = HeadCheckpoint(output_dir=str(tmp_dir))
+    # IMPORTANT:
+    # We invoke the callback manually with a dummy trainer, so it must save unconditionally.
+    # The default HeadCheckpoint behavior (save_only_last_epoch=True) relies on Trainer metadata
+    # like max_epochs/should_stop to decide "last epoch", which our dummy trainer does not provide.
+    head_cb = HeadCheckpoint(output_dir=str(tmp_dir), save_only_last_epoch=False)
 
     class _DummyTrainer:
         def __init__(self, epoch: int):
@@ -818,6 +1188,8 @@ def main():
         copy_tree(repo_root / "src", weights_dir / "src")
         copy_optional_third_party(repo_root, weights_dir)
         scripts_copied = copy_top_level_scripts(repo_root, weights_dir)
+        # NEW: package TabPFN fit-state + feature caches for offline inference
+        _package_tabpfn_inference_artifacts(repo_root=repo_root, weights_dir=weights_dir)
         print(f"Copied configs/ and src/ to: {weights_dir}")
         if scripts_copied:
             print("Copied scripts to weights/scripts/:")
@@ -1146,6 +1518,8 @@ def main():
     copy_tree(repo_root / "src", weights_dir / "src")
     copy_optional_third_party(repo_root, weights_dir)
     scripts_copied = copy_top_level_scripts(repo_root, weights_dir)
+    # NEW: package TabPFN fit-state + feature caches for offline inference
+    _package_tabpfn_inference_artifacts(repo_root=repo_root, weights_dir=weights_dir)
     print(f"Copied configs/ and src/ to: {weights_dir}")
     if scripts_copied:
         print("Copied scripts to weights/scripts/:")

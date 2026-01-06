@@ -9,6 +9,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, ConcatDataset
 import torchvision.transforms as T
 from lightning.pytorch import LightningDataModule
+from loguru import logger
 from src.data.augmentations import build_transforms as build_aug_transforms
 from .ndvi_dense import NdviDenseConfig, build_ndvi_scalar_dataloader
 from .irish_glass_clover import IrishGlassCloverDataset
@@ -174,8 +175,18 @@ class PastureImageDataset(Dataset):
         # main regression targets (one or more components depending on config.target_order)
         y_reg3_g = torch.tensor([row[t] for t in self.target_order], dtype=torch.float32)
         reg3_mask = torch.ones_like(y_reg3_g, dtype=torch.float32)
-        # Convert grams to grams per square meter if a valid area is provided
-        y_reg3_g_m2 = y_reg3_g / float(self.area_m2) if self.area_m2 > 0.0 else y_reg3_g
+        # Convert grams to grams per square meter if a valid area is provided.
+        # Supports optional per-row override via `sample_area_m2` (used by AIGC padded samples).
+        area_m2 = float(self.area_m2) if self.area_m2 is not None else 1.0
+        try:
+            row_area = row.get("sample_area_m2", None)
+            if row_area is not None:
+                row_area_f = float(row_area)
+                if row_area_f > 0.0 and np.isfinite(row_area_f):
+                    area_m2 = row_area_f
+        except Exception:
+            pass
+        y_reg3_g_m2 = y_reg3_g / float(area_m2) if area_m2 > 0.0 else y_reg3_g
         
         # Apply optional log-scale + z-score normalization
         y_reg3_norm = y_reg3_g_m2.clone()
@@ -303,6 +314,11 @@ class PastureDataModule(LightningDataModule):
         irish_image_size: Optional[Union[int, Tuple[int, int]]] = None,
         # Seed for reproducible internal train/val split when predefined splits are not supplied
         random_seed: int = 42,
+        # Optional Nano Banana Pro (AIGC) image augmentation (offline-generated images)
+        aigc_aug_enabled: bool = False,
+        aigc_aug_subdir: Optional[str] = None,
+        aigc_aug_manifest: str = "manifest.csv",
+        aigc_aug_types: Optional[Sequence[str]] = None,
     ) -> None:
         super().__init__()
         self.data_root = data_root
@@ -359,6 +375,13 @@ class PastureDataModule(LightningDataModule):
             self.random_seed: int = int(random_seed)
         except Exception:
             self.random_seed = 42
+        # AIGC augmentation config (images are generated offline; training only reads them)
+        self.aigc_aug_enabled: bool = bool(aigc_aug_enabled)
+        self.aigc_aug_subdir: str = str(aigc_aug_subdir or "nano_banana_pro/train")
+        self.aigc_aug_manifest: str = str(aigc_aug_manifest or "manifest.csv")
+        self.aigc_aug_types: Optional[List[str]] = (
+            [str(x) for x in list(aigc_aug_types)] if aigc_aug_types is not None else None
+        )
         self.irish_train_tf: Optional[T.Compose] = None
         if self.irish_enabled and self.irish_root and self.irish_csv:
             # Reuse the same augment cfg as CSIRO, but allow a different image_size
@@ -393,24 +416,190 @@ class PastureDataModule(LightningDataModule):
         if self._predefined_train_df is not None and self._predefined_val_df is not None:
             self.train_df = self._predefined_train_df.reset_index(drop=True)
             self.val_df = self._predefined_val_df.reset_index(drop=True)
-            self._compute_and_store_zscore_stats()
-            self._maybe_save_zscore_stats()
-            return
+        else:
+            merged = self._read_and_pivot()
+            rng = np.random.default_rng(seed=int(self.random_seed))
+            indices = np.arange(len(merged))
+            rng.shuffle(indices)
+            n_val = max(1, int(len(indices) * self.val_split))
+            val_idx = indices[:n_val]
+            train_idx = indices[n_val:]
+            self.train_df = merged.iloc[train_idx].reset_index(drop=True)
+            self.val_df = merged.iloc[val_idx].reset_index(drop=True)
 
-        merged = self._read_and_pivot()
-        rng = np.random.default_rng(seed=int(self.random_seed))
-        indices = np.arange(len(merged))
-        rng.shuffle(indices)
-        n_val = max(1, int(len(indices) * self.val_split))
-        val_idx = indices[:n_val]
-        train_idx = indices[n_val:]
-        self.train_df = merged.iloc[train_idx].reset_index(drop=True)
-        self.val_df = merged.iloc[val_idx].reset_index(drop=True)
+        # Compute z-score stats on the *base* train_df (before adding extra AIGC samples)
         self._compute_and_store_zscore_stats()
         self._maybe_save_zscore_stats()
+        # Optionally extend train_df with offline-generated AIGC augmentations (train only)
+        self._maybe_append_aigc_augmented_train_df()
 
     def build_full_dataframe(self) -> pd.DataFrame:
         return self._read_and_pivot()
+
+    # --- AIGC augmentation (offline-generated images) ---
+    def _normalize_rel_under_data_root(self, p: str) -> str:
+        """
+        Normalize a user-supplied path to be relative to `data_root` when possible.
+        This avoids accidental double-prefixing like "data/data/...".
+        """
+        s = str(p or "").strip()
+        if not s:
+            return s
+        if os.path.isabs(s):
+            return s
+        try:
+            data_root_norm = os.path.normpath(str(self.data_root))
+            s_norm = os.path.normpath(s)
+            if s_norm.startswith(data_root_norm + os.sep):
+                return os.path.relpath(s_norm, data_root_norm)
+        except Exception:
+            pass
+        return s.replace("\\", "/")
+
+    def _resolve_aigc_manifest_path(self) -> Optional[str]:
+        if not self.aigc_aug_enabled:
+            return None
+        subdir = self._normalize_rel_under_data_root(self.aigc_aug_subdir)
+        manifest = str(self.aigc_aug_manifest or "manifest.csv").strip()
+        if not manifest:
+            manifest = "manifest.csv"
+
+        # If manifest is an absolute path, use it as-is.
+        if os.path.isabs(manifest):
+            return manifest
+
+        # If manifest is a path (contains separators), treat it as relative to data_root.
+        if ("/" in manifest) or ("\\" in manifest):
+            manifest_rel = self._normalize_rel_under_data_root(manifest)
+            if os.path.isabs(manifest_rel):
+                return manifest_rel
+            return os.path.join(str(self.data_root), manifest_rel)
+
+        # Otherwise manifest is a filename under <data_root>/<subdir>/.
+        if os.path.isabs(subdir):
+            return os.path.join(subdir, manifest)
+        return os.path.join(str(self.data_root), subdir, manifest)
+
+    def _maybe_append_aigc_augmented_train_df(self) -> None:
+        if not self.aigc_aug_enabled:
+            return
+        if self.train_df is None or len(self.train_df) == 0:
+            return
+        manifest_path = self._resolve_aigc_manifest_path()
+        if not manifest_path or not os.path.isfile(str(manifest_path)):
+            logger.info(
+                "[AIGC] Enabled but manifest not found; skipping. manifest={}",
+                manifest_path,
+            )
+            return
+
+        try:
+            dfm = pd.read_csv(str(manifest_path))
+        except Exception as e:
+            logger.warning(
+                "[AIGC] Failed to read manifest; skipping. manifest={} error={}",
+                manifest_path,
+                e,
+            )
+            return
+
+        if "image_id" not in dfm.columns or "image_path" not in dfm.columns:
+            logger.warning(
+                "[AIGC] Manifest missing required columns (image_id, image_path); skipping. manifest={}",
+                manifest_path,
+            )
+            return
+
+        # Keep only successful generations when status column exists
+        if "status" in dfm.columns:
+            dfm = dfm[dfm["status"].astype(str) == "success"]
+
+        # Optional filter by augmentation type(s)
+        if self.aigc_aug_types:
+            if "aug_name" in dfm.columns:
+                allow = set([str(x) for x in self.aigc_aug_types])
+                dfm = dfm[dfm["aug_name"].astype(str).isin(list(allow))]
+            else:
+                logger.warning(
+                    "[AIGC] types filter requested but manifest has no aug_name column; ignoring types filter."
+                )
+
+        if len(dfm) == 0:
+            logger.info("[AIGC] No usable rows in manifest; skipping.")
+            return
+
+        # Drop duplicates in manifest to avoid repeated samples
+        keep_cols = ["image_id", "image_path"]
+        if "aug_name" in dfm.columns:
+            keep_cols.append("aug_name")
+        # Optional per-sample area correction metadata written by the augmenter
+        if "pad_area_px" in dfm.columns:
+            keep_cols.append("pad_area_px")
+        if "area_scale" in dfm.columns:
+            keep_cols.append("area_scale")
+        dfm = dfm[keep_cols].dropna(subset=["image_id", "image_path"]).drop_duplicates()
+
+        base = self.train_df.reset_index(drop=True)
+        # Ensure base samples carry a per-row area column for uniform downstream handling.
+        if "sample_area_m2" not in base.columns:
+            base = base.copy()
+            base["sample_area_m2"] = float(self.sample_area_m2)
+        if "aigc_area_scale" not in base.columns:
+            base = base.copy()
+            base["aigc_area_scale"] = 1.0
+        if "aigc_pad_area_px" not in base.columns:
+            base = base.copy()
+            base["aigc_pad_area_px"] = 0
+
+        base_no_path = base.drop(columns=["image_path"], errors="ignore")
+        try:
+            aug_samples = base_no_path.merge(dfm, on="image_id", how="inner")
+        except Exception as e:
+            logger.warning("[AIGC] Merge failed; skipping. error={}", e)
+            return
+
+        if len(aug_samples) == 0:
+            logger.info("[AIGC] No augmented samples matched current train_df; skipping.")
+            return
+
+        # Compute per-sample effective area (m^2) for augmented samples:
+        # base_area_m2 * area_scale, where area_scale reflects padding/crop in pixel space.
+        if "area_scale" in aug_samples.columns:
+            scale = pd.to_numeric(aug_samples["area_scale"], errors="coerce").fillna(1.0)
+            # Guard rails
+            try:
+                scale = scale.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+            except Exception:
+                pass
+            scale = scale.clip(lower=0.0)
+            scale = scale.where(scale > 0.0, 1.0)
+        else:
+            scale = 1.0
+        aug_samples = aug_samples.copy()
+        aug_samples["aigc_area_scale"] = scale
+        aug_samples["sample_area_m2"] = float(self.sample_area_m2) * scale
+        if "pad_area_px" in aug_samples.columns:
+            aug_samples["aigc_pad_area_px"] = pd.to_numeric(aug_samples["pad_area_px"], errors="coerce").fillna(0).astype(int)
+        else:
+            aug_samples["aigc_pad_area_px"] = 0
+
+        # Optional trace column
+        if "aug_name" in aug_samples.columns:
+            aug_samples = aug_samples.rename(columns={"aug_name": "aigc_aug_name"})
+        else:
+            aug_samples["aigc_aug_name"] = "aigc"
+        if "aigc_aug_name" not in base.columns:
+            base = base.copy()
+            base["aigc_aug_name"] = ""
+
+        self.train_df = pd.concat([base, aug_samples], ignore_index=True)
+        logger.info(
+            "[AIGC] Added {} augmented samples from {}. train_df: {} -> {}",
+            len(aug_samples),
+            manifest_path,
+            len(base),
+            len(self.train_df),
+        )
 
     def train_dataloader(self) -> DataLoader:
         assert self.train_df is not None

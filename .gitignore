@@ -219,5 +219,9 @@ kaggle.json
 weights.zip
 
 token.secret
+gemini.secret
+openrouter.secret
 tabpfn_weights/
 /demo
+
+/weights*

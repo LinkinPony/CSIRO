@@ -87,6 +87,25 @@ logging:
     enabled: true
 
 # ==========================================================
+# Packaged inference artifacts (produced by `package_artifacts.py`)
+#
+# TabPFN is **not** trained during inference. Instead, `package_artifacts.py`:
+#  - extracts train image features
+#  - fits TabPFN once
+#  - saves fitted-state bundles under `artifacts.fit_state_dir`
+#
+# Inference (`infer_and_submit_pt.py`) then loads these bundles and only computes
+# test features (optionally with ensemble + TTA).
+# ==========================================================
+artifacts:
+  # Where to store fitted TabPFN state inside the packaged weights (relative to PROJECT_DIR).
+  fit_state_dir: tabpfn_fit
+  # Optional: store extracted train features used for fitting (relative to PROJECT_DIR).
+  train_feature_cache_dir: tabpfn_train_features
+  # Copy TabPFN foundation checkpoints into the packaged weights so fit-states can load offline.
+  copy_tabpfn_weights: true
+
+# ==========================================================
 # Optional TabPFN fine-tuning (gradient-based).
 #
 # This uses TabPFN's built-in fine-tuning utilities:
@@ -235,6 +254,9 @@ tabpfn:
   # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_low-skew.ckpt
   # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_quantiles.ckpt
   model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real.ckpt
+  # Optional: explicit TabPFN python source path (offline-friendly). If empty, inference auto-falls back to
+  # PROJECT_DIR/third_party/TabPFN/src when available.
+  python_path: third_party/TabPFN/src
   # model_path: tabpfn_weights/tabpfn-v2.5-regressor-v2.5_variant.ckpt
 
 

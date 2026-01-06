@@ -1,8 +1,19 @@
 seed: 42
-version: vitdet-320-detach-pair
+version: vitdet-64-v4-detach-pair-e25
 data:
   root: data
   train_csv: train.csv
+  # Optional: include offline-generated AIGC augmented images (Nano Banana Pro) during training.
+  # The augmentation tool writes images + a manifest under `data/nano_banana_pro/train/` by default.
+  aigc_aug:
+    enabled: false
+    # Directory UNDER `data.root` that contains generated images + manifest.
+    # Recommended: "nano_banana_pro/train" (so full path is data/nano_banana_pro/train).
+    subdir: nano_banana_pro/train
+    # Manifest filename (written by tools/nano_banana_pro/augment_train.py)
+    manifest: manifest.csv
+    # Optional subset of augmentation type names to use. null/[] => use all success rows.
+    types: null
   # Dataset selection and per-dataset physical area (meters)
   dataset: csiro
   datasets:
@@ -12,7 +23,7 @@ data:
   # NOTE: `image_size` in this YAML is [W, H] (width, height). The code parses it to (H, W)
   # for torchvision transforms (Resize/RandomResizedCrop), which expect (H, W).
   image_size: [960, 480]
-  batch_size: 4
+  batch_size: 1
   val_batch_size: 1
   num_workers: 20
   prefetch_factor: 4
@@ -289,7 +300,7 @@ model:
   backbone_weights_dtype: fp32
   # Enable activation/gradient checkpointing on DINOv3 transformer blocks to reduce VRAM
   # at the cost of a slower backward pass. Useful when training LoRA with limited GPU memory.
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   # IMPORTANT: must match backbone's embed_dim:
   # - dinov3_vitl16     -> 1024
   # - dinov3_vith16plus -> 1280
@@ -306,7 +317,7 @@ model:
     #           and averages the final outputs)
     type: vitdet
     # ViTDet settings (SimpleFeaturePyramid-style):
-    vitdet_dim: 320
+    vitdet_dim: 32
     vitdet_patch_size: 16
     # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
     vitdet_scale_factors: [4.0, 2.0, 1.0, 0.5]
@@ -380,7 +391,7 @@ model:
     # Recommended DPT-style 4-layer hooks:
     indices_by_backbone:
       dinov3_vitl16: [5, 11, 17, 23]
-      dinov3_vith16plus: [25,27,29,31]
+      dinov3_vith16plus: [31]
       dinov3_vit7b16: [9, 19, 29, 39]
 
 
@@ -401,7 +412,7 @@ train_all:
   enabled: true
 
 peft:
-  enabled: true
+  enabled: false
   method: lora
   use_dora: true
   r: 4
@@ -413,6 +424,13 @@ peft:
   target_modules: [qkv, proj, w1, w2, w3]
   lora_lr: 0.0005
   lora_weight_decay: 0.0
+  # Layer-wise LR decay (LLRD) for LoRA params.
+  # - 1.0: disable (legacy single LR for all LoRA params)
+  # - <1:  earlier blocks get smaller LR; later blocks get larger LR
+  lora_llrd: 0.8
+  # Optional: group N blocks into one optimizer group to reduce the number of logged LR curves.
+  # Keep 1 for true per-block LR.
+  lora_group_size: 1
 
 loss:
   weighting: uw
@@ -442,12 +460,12 @@ scheduler:
   warmup_start_factor: 0.1
 
 kfold:
-  enabled: false
+  enabled: true
   k: 5
   even_split: true
 
 trainer:
-  max_epochs: 30
+  max_epochs: 25
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -456,13 +474,29 @@ trainer:
   # With train_all enabled, we default to 1 so that validation uses only the dummy batch.
   limit_val_batches: 1
   log_every_n_steps: 1
+  # Lightning checkpoint cadence (for `outputs/checkpoints/<version>/last.ckpt`).
+  # We only keep `last.ckpt` (no top-k / best checkpoints).
+  checkpoint:
+    # Save `last.ckpt` once per epoch (0 => disabled).
+    every_n_epochs: 1
   resume_from: null
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 8
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   swa:
     enabled: true
+    # Base SWA LR for head/other params. When auto_lrs=true, this is used for the head group.
     swa_lrs: 0.0001
+    # build per-parameter-group SWA LRs (head/UW/LoRA) automatically.
+    auto_lrs: true
+    # freeze LoRA during SWA (requires_grad=False + lr=0 for LoRA param groups).
+    freeze_lora: true
+    # Optional: override SWA LR for UW params (defaults to swa_lrs when omitted).
+    # uw_swa_lr: 0.0001
+    # Optional: if freeze_lora=false, you can set a non-zero LoRA SWA LR here.
+    # lora_swa_lr: 0.00005
+    # Hard-set LoRA lr to this value when SWA starts (default: 0).
+    freeze_lora_lr: 0.0
     swa_epoch_start: 0.8
     annealing_epochs: 5
     annealing_strategy: cos
