@@ -223,6 +223,66 @@ class DinoV3FeatureExtractor(nn.Module):
         cls, pt = self._extract_cls_and_pt(feats)
         return cls, pt
 
+    @torch.inference_mode()
+    def forward_tokens_until_block(
+        self,
+        images: torch.Tensor,
+        *,
+        block_idx: int,
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """
+        Run the DINOv3 ViT up to (but excluding) `block_idx` and return the *full* token sequence.
+
+        Returns:
+            x:  (B, N_tokens, C) token sequence containing:
+                  [CLS, (storage tokens...), patch tokens]
+            hw: (H_p, W_p) patch grid size for RoPE (NOT input image size).
+        """
+        bb: nn.Module = self.backbone
+        # Best-effort unwrap PEFT / wrapper structures to the actual DINOv3 model exposing `.blocks`.
+        if not hasattr(bb, "blocks"):
+            base_model = getattr(bb, "base_model", None)
+            if isinstance(base_model, nn.Module):
+                cand = getattr(base_model, "model", None)
+                if isinstance(cand, nn.Module) and hasattr(cand, "blocks"):
+                    bb = cand
+                elif hasattr(base_model, "blocks"):
+                    bb = base_model
+            cand2 = getattr(bb, "model", None)
+            if isinstance(cand2, nn.Module) and hasattr(cand2, "blocks"):
+                bb = cand2
+
+        # Cast image dtype to patch-embed weight dtype when possible (conv2d dtype safety).
+        try:
+            patch_embed = getattr(bb, "patch_embed", None)
+            proj = getattr(patch_embed, "proj", None)
+            w = getattr(proj, "weight", None)
+            backbone_dtype = w.dtype if isinstance(w, torch.Tensor) and w.is_floating_point() else images.dtype
+        except Exception:
+            backbone_dtype = images.dtype
+        if images.dtype != backbone_dtype:
+            images = images.to(dtype=backbone_dtype)
+
+        blocks = getattr(bb, "blocks", None)
+        if not isinstance(blocks, (nn.ModuleList, list)):
+            raise RuntimeError("forward_tokens_until_block requires a DINOv3 ViT-style backbone with `.blocks`")
+        depth = len(blocks)
+        bi = int(block_idx)
+        if bi < 0 or bi > depth:
+            raise ValueError(f"block_idx must be in [0, {depth}] but got {bi} (depth={depth})")
+
+        prepare = getattr(bb, "prepare_tokens_with_masks", None)
+        if prepare is None:
+            raise RuntimeError("Backbone does not expose prepare_tokens_with_masks(images, masks=None)")
+
+        x, hw = prepare(images, None)  # type: ignore[misc]
+        H_p, W_p = int(hw[0]), int(hw[1])
+        rope_embed = getattr(bb, "rope_embed", None)
+        rope = rope_embed(H=H_p, W=W_p) if rope_embed is not None else None
+        for i in range(bi):
+            x = blocks[i](x, rope)  # type: ignore[call-arg]
+        return x, (H_p, W_p)
+
 
 def extract_features_for_images(
     feature_extractor: nn.Module,
@@ -1077,6 +1137,178 @@ def predict_main_and_ratio_fpn(
             rels.extend(list(rel_paths))
 
     preds_main = torch.cat(preds_main_list, dim=0) if preds_main_list else torch.empty((0, head_num_main), dtype=torch.float32)
+    preds_ratio: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_list:
+        preds_ratio = torch.cat(preds_ratio_list, dim=0)
+    else:
+        preds_ratio = None
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
+    return rels, preds_main, preds_ratio, preds_main_var, preds_ratio_var
+
+
+def predict_main_and_ratio_eomt(
+    backbone: nn.Module,
+    head: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: Tuple[int, int],
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+    head_num_main: int,
+    head_num_ratio: int,
+    *,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
+    hflip: bool = False,
+    vflip: bool = False,
+) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    EoMT injected-query head inference.
+
+    Unlike FPN/DPT/ViTDet query-pooling variants, this head must run the backbone
+    blocks jointly with learnable query tokens (inserted into the last-k blocks),
+    so we cannot reuse the patch-token-only inference loop.
+    """
+    mp_devs = mp_get_devices_from_backbone(backbone) if isinstance(backbone, nn.Module) else None
+    if mp_devs is not None and torch.device(mp_devs[0]) != torch.device(mp_devs[1]):
+        raise RuntimeError(
+            "EoMT injected-query head inference currently does not support 2-GPU model-parallel backbones. "
+            "Please run on a single GPU/CPU or use a non-injected head type."
+        )
+    device = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    feature_extractor = DinoV3FeatureExtractor(backbone)
+    # In model-parallel mode we MUST NOT move the full module to a single device.
+    if mp_devs is not None:
+        feature_extractor.eval()
+    else:
+        feature_extractor.eval().to(device)
+
+    # Keep the injected head on the SAME device/dtype as the backbone blocks it will call.
+    bb: nn.Module = backbone
+    if not hasattr(bb, "blocks"):
+        base_model = getattr(bb, "base_model", None)
+        if isinstance(base_model, nn.Module):
+            cand = getattr(base_model, "model", None)
+            if isinstance(cand, nn.Module) and hasattr(cand, "blocks"):
+                bb = cand
+            elif hasattr(base_model, "blocks"):
+                bb = base_model
+        cand2 = getattr(bb, "model", None)
+        if isinstance(cand2, nn.Module) and hasattr(cand2, "blocks"):
+            bb = cand2
+    try:
+        patch_embed = getattr(bb, "patch_embed", None)
+        proj = getattr(patch_embed, "proj", None)
+        w = getattr(proj, "weight", None)
+        bb_dtype = w.dtype if isinstance(w, torch.Tensor) and w.is_floating_point() else module_param_dtype(bb, default=torch.float32)
+    except Exception:
+        bb_dtype = module_param_dtype(bb, default=torch.float32)
+    head = head.eval().to(device).to(dtype=bb_dtype)
+
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
+        _enable_dropout_only_train_mode(head, enabled=True)
+
+    # Compute injection boundary from head config (num_blocks = last-k blocks).
+    try:
+        blocks = getattr(bb, "blocks", None)
+        depth = len(blocks) if isinstance(blocks, (nn.ModuleList, list)) else 0
+    except Exception:
+        depth = 0
+    if depth <= 0:
+        raise RuntimeError("EoMT injected-query head inference requires a DINOv3 ViT backbone with `.blocks`")
+    k_blocks = int(getattr(head, "num_blocks", 4) or 4)
+    k_blocks = int(max(0, min(k_blocks, depth)))
+    start_block = int(depth - k_blocks)
+
+    rels: List[str] = []
+    preds_main_list: List[torch.Tensor] = []
+    preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
+
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device, non_blocking=True)
+
+            # Stage A: run up to (depth - k) blocks once per batch.
+            x_base, patch_hw = feature_extractor.forward_tokens_until_block(images, block_idx=int(start_block))
+
+            k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+            reg3_sum = None
+            reg3_sq_sum = None
+            ratio_sum = None
+            ratio_sq_sum = None
+            for _ in range(k):
+                out = head(  # type: ignore[call-arg]
+                    x_base,
+                    backbone=feature_extractor.backbone,
+                    patch_hw=patch_hw,
+                )
+                if not isinstance(out, dict):
+                    raise RuntimeError("EoMT head forward must return a dict")
+                reg3 = out.get("reg3", None)
+                ratio = out.get("ratio", None)
+                if reg3 is None:
+                    raise RuntimeError("EoMT head did not return 'reg3'")
+
+                reg3_f = reg3.float()
+                reg3_sum = reg3_f if reg3_sum is None else (reg3_sum + reg3_f)
+                if compute_var:
+                    reg3_sq = reg3_f * reg3_f
+                    reg3_sq_sum = reg3_sq if reg3_sq_sum is None else (reg3_sq_sum + reg3_sq)
+
+                if head_num_ratio > 0 and ratio is not None:
+                    ratio_f = ratio.float()
+                    ratio_sum = ratio_f if ratio_sum is None else (ratio_sum + ratio_f)
+                    if compute_var:
+                        ratio_sq = ratio_f * ratio_f
+                        ratio_sq_sum = ratio_sq if ratio_sq_sum is None else (ratio_sq_sum + ratio_sq)
+
+            reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
+            preds_main_list.append(reg3_mean.detach().cpu().float())
+            if compute_var and reg3_sq_sum is not None:
+                reg3_var = (reg3_sq_sum / float(k)) - (reg3_mean * reg3_mean)
+                preds_main_var_list.append(reg3_var.clamp_min(0.0).detach().cpu().float())
+
+            if head_num_ratio > 0 and ratio_sum is not None:
+                ratio_mean = ratio_sum / float(k)
+                preds_ratio_list.append(ratio_mean.detach().cpu().float())
+                if compute_var and ratio_sq_sum is not None:
+                    ratio_var = (ratio_sq_sum / float(k)) - (ratio_mean * ratio_mean)
+                    preds_ratio_var_list.append(ratio_var.clamp_min(0.0).detach().cpu().float())
+
+            rels.extend(list(rel_paths))
+
+    preds_main = (
+        torch.cat(preds_main_list, dim=0)
+        if preds_main_list
+        else torch.empty((0, head_num_main), dtype=torch.float32)
+    )
     preds_ratio: Optional[torch.Tensor]
     if head_num_ratio > 0 and preds_ratio_list:
         preds_ratio = torch.cat(preds_ratio_list, dim=0)

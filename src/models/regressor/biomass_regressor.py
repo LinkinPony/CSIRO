@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, List, Sequence
 
 import torch
 from torch import Tensor, nn
+from torch.optim import Optimizer
 from lightning.pytorch import LightningModule
 from loguru import logger
 
@@ -11,6 +12,7 @@ from ..backbone import build_feature_extractor
 from ..peft_integration import inject_lora_into_feature_extractor
 from ..layer_utils import normalize_layer_indices
 from src.training.cutmix import CutMixBatchAugment
+from src.training.pcgrad import pcgrad_project, pcgrad_project_primary_anchored
 
 from .manifold_mixup import ManifoldMixup
 from .forward import RegressorForwardMixin
@@ -37,6 +39,19 @@ class BiomassRegressor(
         vitdet_dim: int = 256,
         vitdet_patch_size: int = 16,
         vitdet_scale_factors: Optional[List[float]] = None,
+        # EoMT-style query pooling head settings
+        eomt_num_queries: int = 16,
+        eomt_num_layers: int = 2,
+        eomt_num_heads: int = 8,
+        eomt_ffn_dim: int = 2048,
+        eomt_query_pool: str = "mean",
+        # EoMT pooled feature sources + projection (concat -> proj_dim)
+        eomt_use_mean_query: bool = True,
+        eomt_use_mean_patch: bool = False,
+        eomt_use_cls_token: bool = False,
+        eomt_proj_dim: int = 0,
+        eomt_proj_activation: str = "relu",
+        eomt_proj_dropout: float = 0.0,
         # FPN (Phase A) settings
         fpn_dim: int = 256,
         fpn_num_levels: int = 3,
@@ -137,6 +152,8 @@ class BiomassRegressor(
         use_sam: bool = False,
         sam_rho: float = 0.05,
         sam_adaptive: bool = False,
+        # Gradient surgery (multi-task optimization)
+        pcgrad_cfg: Optional[Dict[str, Any]] = None,
         # --- Debug utilities ---
         # Normalization used for input images (for de-normalizing debug dumps).
         input_image_mean: Optional[Sequence[float]] = None,
@@ -164,6 +181,8 @@ class BiomassRegressor(
             head_type_norm = "dpt"
         elif head_type_norm in ("vitdet", "vitdet_head", "vitdet_scalar", "simple_feature_pyramid"):
             head_type_norm = "vitdet"
+        elif head_type_norm in ("eomt", "eomt_query", "query_pool", "qpool", "query"):
+            head_type_norm = "eomt"
         elif head_type_norm in ("mlp", "linear", "head", ""):
             head_type_norm = "mlp"
         else:
@@ -171,6 +190,63 @@ class BiomassRegressor(
             head_type_norm = "mlp"
         self._head_type: str = head_type_norm
         self.save_hyperparameters()
+
+        # --- PCGrad (Projected Conflicting Gradients) configuration ---
+        self._pcgrad_cfg: Dict[str, Any] = dict(pcgrad_cfg or {})
+        self._pcgrad_enabled: bool = bool(self._pcgrad_cfg.get("enabled", False))
+        try:
+            self._pcgrad_eps: float = float(self._pcgrad_cfg.get("eps", 1.0e-8))
+        except Exception:
+            self._pcgrad_eps = 1.0e-8
+        self._pcgrad_reduction: str = str(self._pcgrad_cfg.get("reduction", "sum") or "sum").lower().strip()
+        self._pcgrad_shuffle_tasks: bool = bool(self._pcgrad_cfg.get("shuffle_tasks", True))
+        # Mode: symmetric (default) | primary_anchored
+        mode_raw = str(self._pcgrad_cfg.get("mode", "symmetric") or "symmetric").lower().strip()
+        if mode_raw in ("primary", "anchored", "primary_anchored", "primary-anchored", "primaryanchored"):
+            self._pcgrad_mode: str = "primary_anchored"
+        elif mode_raw in ("symmetric", "pcgrad", "default"):
+            self._pcgrad_mode = "symmetric"
+        else:
+            self._pcgrad_mode = "symmetric"
+        seed_v = self._pcgrad_cfg.get("seed", None)
+        try:
+            self._pcgrad_seed: Optional[int] = int(seed_v) if seed_v is not None else None
+        except Exception:
+            self._pcgrad_seed = None
+        # Which optimizer param groups to apply PCGrad to (by `group_type` from configure_optimizers).
+        apply_to = self._pcgrad_cfg.get("apply_to_group_types", ["head", "lora"])
+        self._pcgrad_apply_to_group_types: List[str] = (
+            [str(x).lower().strip() for x in (apply_to or [])] if isinstance(apply_to, (list, tuple)) else []
+        )
+        exclude_groups = self._pcgrad_cfg.get("exclude_group_types", ["uw"])
+        self._pcgrad_exclude_group_types: List[str] = (
+            [str(x).lower().strip() for x in (exclude_groups or [])] if isinstance(exclude_groups, (list, tuple)) else []
+        )
+        excl_names = self._pcgrad_cfg.get("exclude_param_name_substrings", [])
+        self._pcgrad_exclude_param_name_substrings: List[str] = (
+            [str(x) for x in (excl_names or [])] if isinstance(excl_names, (list, tuple)) else []
+        )
+        # Task filtering (optional): include_tasks has priority over exclude_tasks.
+        inc_tasks = self._pcgrad_cfg.get("include_tasks", None)
+        exc_tasks = self._pcgrad_cfg.get("exclude_tasks", None)
+        self._pcgrad_include_tasks: Optional[List[str]] = (
+            [str(x) for x in inc_tasks] if isinstance(inc_tasks, (list, tuple)) else None
+        )
+        self._pcgrad_exclude_tasks: List[str] = (
+            [str(x) for x in exc_tasks] if isinstance(exc_tasks, (list, tuple)) else []
+        )
+        # Primary/Aux task lists (used when mode=primary_anchored).
+        prim = self._pcgrad_cfg.get("primary_tasks", None)
+        aux = self._pcgrad_cfg.get("aux_tasks", None)
+        self._pcgrad_primary_tasks: Optional[List[str]] = (
+            [str(x) for x in prim] if isinstance(prim, (list, tuple)) else None
+        )
+        self._pcgrad_aux_tasks: Optional[List[str]] = (
+            [str(x) for x in aux] if isinstance(aux, (list, tuple)) else None
+        )
+        # Stashed by training_step for the backward hook (per-step).
+        self._pcgrad_terms = None
+        self._pcgrad_unscaled_loss = None
 
         # --- Debug image dump configuration ---
         self._run_log_dir: Optional[str] = str(run_log_dir) if run_log_dir not in (None, "", "null") else None
@@ -516,6 +592,308 @@ class BiomassRegressor(
             vitdet_dim=int(vitdet_dim),
             vitdet_patch_size=int(vitdet_patch_size),
             vitdet_scale_factors=list(vitdet_scale_factors or [2.0, 1.0, 0.5]),
+            # EoMT-style query pooling (optional)
+            eomt_num_queries=int(eomt_num_queries),
+            eomt_num_layers=int(eomt_num_layers),
+            eomt_num_heads=int(eomt_num_heads),
+            eomt_ffn_dim=int(eomt_ffn_dim),
+            eomt_query_pool=str(eomt_query_pool),
+            eomt_use_mean_query=bool(eomt_use_mean_query),
+            eomt_use_mean_patch=bool(eomt_use_mean_patch),
+            eomt_use_cls_token=bool(eomt_use_cls_token),
+            eomt_proj_dim=int(eomt_proj_dim),
+            eomt_proj_activation=str(eomt_proj_activation),
+            eomt_proj_dropout=float(eomt_proj_dropout or 0.0),
         )
 
 
+    def _pcgrad_get_optimizer(self) -> Optional[Optimizer]:
+        """
+        Best-effort access to the (single) optimizer during automatic optimization.
+        """
+        try:
+            tr = getattr(self, "trainer", None)
+            opts = getattr(tr, "optimizers", None) if tr is not None else None
+            if isinstance(opts, (list, tuple)) and len(opts) >= 1:
+                opt0 = opts[0]
+                if isinstance(opt0, Optimizer):
+                    return opt0
+        except Exception:
+            return None
+        return None
+
+    def _pcgrad_select_params(self, optimizer: Optimizer) -> List[nn.Parameter]:
+        """
+        Select parameters to apply PCGrad to, based on optimizer param group metadata.
+
+        We intentionally support excluding UW parameters (`group_type: uw`) to avoid
+        cross-task gradient injection into log-variance weights.
+        """
+        include = set(self._pcgrad_apply_to_group_types or [])
+        exclude = set(self._pcgrad_exclude_group_types or [])
+        params: List[nn.Parameter] = []
+        for group in getattr(optimizer, "param_groups", []):
+            try:
+                gt = str(group.get("group_type", "") or "").lower().strip()
+            except Exception:
+                gt = ""
+            if gt and gt in exclude:
+                continue
+            if include and (gt not in include):
+                continue
+            for p in group.get("params", []):
+                if isinstance(p, nn.Parameter) and bool(getattr(p, "requires_grad", False)):
+                    params.append(p)
+        # De-duplicate while preserving order.
+        seen: set[int] = set()
+        uniq: List[nn.Parameter] = []
+        for p in params:
+            pid = id(p)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            uniq.append(p)
+
+        # Optional name-based exclusion (substrings).
+        if self._pcgrad_exclude_param_name_substrings:
+            name_by_id: Dict[int, str] = {}
+            try:
+                for n, p in self.named_parameters():
+                    name_by_id[id(p)] = str(n)
+            except Exception:
+                name_by_id = {}
+            filtered: List[nn.Parameter] = []
+            for p in uniq:
+                n = name_by_id.get(id(p), "")
+                if any(sub in n for sub in self._pcgrad_exclude_param_name_substrings):
+                    continue
+                filtered.append(p)
+            uniq = filtered
+        return uniq
+
+    def backward(self, loss: Tensor, *args: Any, **kwargs: Any) -> None:
+        """
+        PCGrad integration point.
+
+        We run a standard backward pass to populate gradients for *all* parameters, then
+        replace gradients for a configured subset of parameters with PCGrad-projected
+        gradients computed from per-task loss terms stashed in `training_step`.
+
+        This preserves Lightning AMP scaling, gradient clipping, SAM, and gradient accumulation.
+        """
+        if not bool(getattr(self, "_pcgrad_enabled", False)):
+            return super().backward(loss, *args, **kwargs)
+
+        terms_any = getattr(self, "_pcgrad_terms", None)
+        unscaled_total = getattr(self, "_pcgrad_unscaled_loss", None)
+        if not isinstance(terms_any, list) or len(terms_any) == 0:
+            return super().backward(loss, *args, **kwargs)
+
+        # Sanitize terms list: expect [(name, Tensor), ...]
+        terms_all: List[tuple[str, Tensor]] = []
+        for item in terms_any:
+            try:
+                name, t = item
+            except Exception:
+                continue
+            if isinstance(t, Tensor):
+                terms_all.append((str(name), t))
+        if not terms_all:
+            return super().backward(loss, *args, **kwargs)
+
+        if not isinstance(unscaled_total, Tensor):
+            try:
+                unscaled_total = torch.stack([t for _, t in terms_all]).sum()
+            except Exception:
+                unscaled_total = None
+        if not isinstance(unscaled_total, Tensor):
+            return super().backward(loss, *args, **kwargs)
+
+        include_set: Optional[set[str]] = (
+            set(self._pcgrad_include_tasks) if isinstance(self._pcgrad_include_tasks, list) else None
+        )
+        exclude_set: set[str] = set(self._pcgrad_exclude_tasks or [])
+
+        mode = str(getattr(self, "_pcgrad_mode", "symmetric") or "symmetric").lower().strip()
+
+        # Split tasks into (primary, aux, excluded) for primary-anchored mode, or (included/excluded) for symmetric.
+        terms_primary: List[tuple[str, Tensor]] = []
+        terms_aux: List[tuple[str, Tensor]] = []
+        terms_included: List[tuple[str, Tensor]] = []
+        terms_excluded: List[tuple[str, Tensor]] = []
+
+        if mode == "primary_anchored":
+            names_all = [n for n, _ in terms_all]
+            # Default primary: reg3 when present, else first task.
+            prim_cfg = self._pcgrad_primary_tasks
+            if isinstance(prim_cfg, list) and len(prim_cfg) > 0:
+                primary_set = set(str(x) for x in prim_cfg)
+            else:
+                primary_set = {"reg3"} if "reg3" in names_all else ({names_all[0]} if names_all else set())
+            aux_cfg = self._pcgrad_aux_tasks
+            if isinstance(aux_cfg, list) and len(aux_cfg) > 0:
+                aux_set = set(str(x) for x in aux_cfg)
+            else:
+                aux_set = set(names_all) - set(primary_set)
+
+            # Apply include/exclude filters.
+            if include_set is not None:
+                primary_set = primary_set & include_set
+                aux_set = aux_set & include_set
+            primary_set = primary_set - exclude_set
+            aux_set = aux_set - exclude_set - primary_set
+
+            for name, t in terms_all:
+                if name in primary_set:
+                    terms_primary.append((name, t))
+                elif name in aux_set:
+                    terms_aux.append((name, t))
+                else:
+                    terms_excluded.append((name, t))
+
+            # Need at least 1 primary and 1 aux to do anything meaningful.
+            if len(terms_primary) == 0 or len(terms_aux) == 0:
+                return super().backward(loss, *args, **kwargs)
+        else:
+            # symmetric (legacy)
+            for name, t in terms_all:
+                if include_set is not None:
+                    (terms_included if name in include_set else terms_excluded).append((name, t))
+                else:
+                    (terms_excluded if name in exclude_set else terms_included).append((name, t))
+
+            if len(terms_included) <= 1:
+                return super().backward(loss, *args, **kwargs)
+
+        optimizer = self._pcgrad_get_optimizer()
+        if optimizer is None:
+            return super().backward(loss, *args, **kwargs)
+        pc_params = self._pcgrad_select_params(optimizer)
+        if not pc_params:
+            return super().backward(loss, *args, **kwargs)
+
+        # Compute AMP scale factor (scaled_loss / unscaled_loss) so per-task grads match `loss.backward()`.
+        try:
+            scale = (loss.detach() / (unscaled_total.detach() + 1.0e-12)).detach()
+        except Exception:
+            scale = None
+        if scale is None or not torch.isfinite(scale).all():
+            return super().backward(loss, *args, **kwargs)
+
+        # Preserve accumulated grads before this backward (for accumulate_grad_batches > 1).
+        old_grads: List[Optional[Tensor]] = []
+        for p in pc_params:
+            g = getattr(p, "grad", None)
+            old_grads.append(g.detach().clone() if isinstance(g, Tensor) else None)
+
+        if mode == "primary_anchored":
+            # Primary gradient (anchor):
+            # - If there is only one primary task, use its gradient directly.
+            # - If there are multiple primary tasks, first apply *symmetric PCGrad among primaries*
+            #   (treat primaries equally), then use the resulting combined primary gradient as the anchor.
+            if len(terms_primary) == 1:
+                prim_term = terms_primary[0][1]
+                g_list_p = torch.autograd.grad(
+                    prim_term * scale,
+                    pc_params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                primary_grads = [g if isinstance(g, Tensor) else None for g in g_list_p]
+            else:
+                primary_grads_per_task: List[List[Optional[Tensor]]] = []
+                for _name, term in terms_primary:
+                    g_list = torch.autograd.grad(
+                        term * scale,
+                        pc_params,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    primary_grads_per_task.append([g if isinstance(g, Tensor) else None for g in g_list])
+                # NOTE: reduction="sum" so the anchor has the same overall scale as summing primary tasks,
+                # while still resolving conflicts between them via PCGrad.
+                primary_grads = pcgrad_project(
+                    primary_grads_per_task,
+                    eps=float(self._pcgrad_eps),
+                    reduction="sum",
+                    shuffle_tasks=bool(self._pcgrad_shuffle_tasks),
+                    seed=self._pcgrad_seed,
+                )
+
+            # Aux gradients (per-task).
+            aux_grads_per_task: List[List[Optional[Tensor]]] = []
+            for _name, term in terms_aux:
+                g_list = torch.autograd.grad(
+                    term * scale,
+                    pc_params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                aux_grads_per_task.append([g if isinstance(g, Tensor) else None for g in g_list])
+
+            pcgrad_grads = pcgrad_project_primary_anchored(
+                primary_grads=primary_grads,
+                aux_grads_per_task=aux_grads_per_task,
+                primary_count=int(len(terms_primary)),
+                eps=float(self._pcgrad_eps),
+                reduction=str(self._pcgrad_reduction),
+                shuffle_tasks=bool(self._pcgrad_shuffle_tasks),
+                seed=self._pcgrad_seed,
+            )
+        else:
+            # Symmetric PCGrad: per-task gradients for all included tasks.
+            grads_per_task = []
+            for _name, term in terms_included:
+                g_list = torch.autograd.grad(
+                    term * scale,
+                    pc_params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                grads_per_task.append([g if isinstance(g, Tensor) else None for g in g_list])
+            pcgrad_grads = pcgrad_project(
+                grads_per_task,
+                eps=float(self._pcgrad_eps),
+                reduction=str(self._pcgrad_reduction),
+                shuffle_tasks=bool(self._pcgrad_shuffle_tasks),
+                seed=self._pcgrad_seed,
+            )
+
+        # Gradients for excluded tasks are kept "as-is" (no surgery) and added back after projection.
+        excluded_grads: Optional[List[Optional[Tensor]]] = None
+        if terms_excluded:
+            try:
+                excl_sum = torch.stack([t for _, t in terms_excluded]).sum()
+                g_list = torch.autograd.grad(
+                    excl_sum * scale,
+                    pc_params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                excluded_grads = [g if isinstance(g, Tensor) else None for g in g_list]
+            except Exception:
+                excluded_grads = None
+
+        # Run the default backward to populate grads for all parameters (and trigger AMP/DDP hooks).
+        super().backward(loss, *args, **kwargs)
+
+        # Replace gradients for selected parameters: old_accum + excluded + pcgrad(included).
+        for idx, p in enumerate(pc_params):
+            g_acc = old_grads[idx]
+            g_new: Optional[Tensor] = None
+            if excluded_grads is not None and isinstance(excluded_grads[idx], Tensor):
+                g_new = excluded_grads[idx]
+            if isinstance(pcgrad_grads[idx], Tensor):
+                g_new = pcgrad_grads[idx] if g_new is None else (g_new + pcgrad_grads[idx])  # type: ignore[operator]
+            if g_new is None:
+                continue
+            if isinstance(g_acc, Tensor):
+                g_new = g_acc + g_new
+            p.grad = g_new  # type: ignore[assignment]
+
+        # Clear step-local stash to avoid accidental reuse.
+        try:
+            self._pcgrad_terms = None
+            self._pcgrad_unscaled_loss = None
+        except Exception:
+            pass

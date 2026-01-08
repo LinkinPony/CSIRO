@@ -47,6 +47,7 @@ from src.inference.predict import (
     extract_features_for_images,
     predict_from_features,
     predict_main_and_ratio_dpt,
+    predict_main_and_ratio_eomt,
     predict_main_and_ratio_fpn,
     predict_main_and_ratio_vitdet,
     predict_main_and_ratio_global_multilayer,
@@ -56,6 +57,7 @@ from src.inference.predict import (
 from src.inference.settings import InferenceSettings
 from src.inference.torch_load import load_head_state, torch_load_cpu
 from src.models.dpt_scalar_head import DPTHeadConfig, DPTScalarHead
+from src.models.eomt_injected_head import EoMTInjectedQueryHeadConfig, EoMTInjectedQueryScalarHead
 from src.models.head_builder import DualBranchHeadExport, MultiLayerHeadExport, build_head_layer
 from src.models.peft_integration import _import_peft
 from src.models.spatial_fpn import FPNHeadConfig, FPNScalarHead
@@ -835,6 +837,113 @@ def infer_components_5d_for_model(
                     dropout=head_dropout,
                 )
             )
+        elif head_type_meta == "eomt":
+            # EoMT-style injected-query head (matches `third_party/eomt`):
+            # run backbone for the first (depth - k) blocks without queries, then prepend
+            # Q learnable query tokens and run the last-k blocks jointly.
+            eomt_cfg = cfg.get("model", {}).get("head", {}).get("eomt", {})
+            if not isinstance(eomt_cfg, dict):
+                eomt_cfg = {}
+            eomt_num_queries_meta = int(
+                meta.get("eomt_num_queries", first_meta.get("eomt_num_queries", int(eomt_cfg.get("num_queries", 16))))
+            )
+            # Backward compatibility:
+            # - older configs use `num_layers` for this value (from the previous query-decoder variant)
+            # - older exported head meta uses `eomt_num_layers`
+            eomt_num_blocks_meta = int(
+                meta.get(
+                    "eomt_num_blocks",
+                    meta.get(
+                        "eomt_num_layers",
+                        first_meta.get(
+                            "eomt_num_blocks",
+                            first_meta.get(
+                                "eomt_num_layers",
+                                int(eomt_cfg.get("num_blocks", eomt_cfg.get("num_layers", 4))),
+                            ),
+                        ),
+                    ),
+                )
+            )
+            eomt_query_pool_meta = str(
+                meta.get("eomt_query_pool", first_meta.get("eomt_query_pool", str(eomt_cfg.get("query_pool", "mean"))))
+            ).strip().lower()
+            # New pooled feature construction (backward-compatible defaults)
+            eomt_use_mean_query_meta = bool(
+                meta.get(
+                    "eomt_use_mean_query",
+                    first_meta.get(
+                        "eomt_use_mean_query",
+                        bool(eomt_cfg.get("use_mean_query", True)),
+                    ),
+                )
+            )
+            eomt_use_mean_patch_meta = bool(
+                meta.get(
+                    "eomt_use_mean_patch",
+                    first_meta.get(
+                        "eomt_use_mean_patch",
+                        bool(eomt_cfg.get("use_mean_patch", False)),
+                    ),
+                )
+            )
+            eomt_use_cls_token_meta = bool(
+                meta.get(
+                    "eomt_use_cls_token",
+                    first_meta.get(
+                        "eomt_use_cls_token",
+                        bool(eomt_cfg.get("use_cls_token", eomt_cfg.get("use_cls", False))),
+                    ),
+                )
+            )
+            eomt_proj_dim_meta = int(
+                meta.get(
+                    "eomt_proj_dim",
+                    first_meta.get("eomt_proj_dim", int(eomt_cfg.get("proj_dim", 0))),
+                )
+            )
+            eomt_proj_activation_meta = str(
+                meta.get(
+                    "eomt_proj_activation",
+                    first_meta.get(
+                        "eomt_proj_activation",
+                        str(eomt_cfg.get("proj_activation", "relu")),
+                    ),
+                )
+            ).strip().lower()
+            try:
+                eomt_proj_dropout_meta = float(
+                    meta.get(
+                        "eomt_proj_dropout",
+                        first_meta.get(
+                            "eomt_proj_dropout",
+                            float(eomt_cfg.get("proj_dropout", 0.0)),
+                        ),
+                    )
+                )
+            except Exception:
+                eomt_proj_dropout_meta = float(eomt_cfg.get("proj_dropout", 0.0) or 0.0)
+            enable_ndvi_meta = bool(meta.get("enable_ndvi", False))
+            head_module = EoMTInjectedQueryScalarHead(
+                EoMTInjectedQueryHeadConfig(
+                    embedding_dim=head_embedding_dim,
+                    num_queries=eomt_num_queries_meta,
+                    num_blocks=eomt_num_blocks_meta,
+                    dropout=head_dropout,
+                    query_pool=eomt_query_pool_meta,
+                    use_mean_query=bool(eomt_use_mean_query_meta),
+                    use_mean_patch=bool(eomt_use_mean_patch_meta),
+                    use_cls_token=bool(eomt_use_cls_token_meta),
+                    proj_dim=int(eomt_proj_dim_meta),
+                    proj_activation=str(eomt_proj_activation_meta),
+                    proj_dropout=float(eomt_proj_dropout_meta),
+                    head_hidden_dims=head_hidden_dims,
+                    head_activation=head_activation,
+                    num_outputs_main=head_num_main,
+                    num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
+                    enable_ndvi=enable_ndvi_meta,
+                )
+            )
         elif dual_branch_enabled_head and use_patch_reg3_head:
             # Dual-branch MLP patch-mode head: patch + global prediction fused by alpha.
             num_layers_eff = max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1
@@ -1003,6 +1112,26 @@ def infer_components_5d_for_model(
                     head_num_ratio=head_num_ratio if head_is_ratio else 0,
                     use_layerwise_heads=use_layerwise_heads_head,
                     layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                    mc_dropout_enabled=mc_enabled,
+                    mc_dropout_samples=int(mc_samples_eff),
+                    hflip=bool(hflip_view),
+                    vflip=bool(vflip_view),
+                )
+            elif head_type_meta == "eomt":
+                # EoMT-style injected-query head: requires running the backbone blocks jointly
+                # with learnable query tokens (cannot reuse the patch-token-only loop).
+                rels_v, preds_main_v, preds_ratio_v, preds_main_var_v, preds_ratio_var_v = predict_main_and_ratio_eomt(
+                    backbone=backbone,
+                    head=head_module,
+                    dataset_root=dataset_root,
+                    image_paths=image_paths,
+                    image_size=image_size_view,
+                    mean=mean,
+                    std=std,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    head_num_main=head_num_main,
+                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
                     mc_dropout_enabled=mc_enabled,
                     mc_dropout_samples=int(mc_samples_eff),
                     hflip=bool(hflip_view),
@@ -1215,8 +1344,16 @@ def infer_components_5d_for_model(
         # Build this head's 5D components in grams
         N = preds_main_g.shape[0]
         if head_is_ratio and preds_ratio is not None and head_num_main >= 1 and head_num_ratio >= 1:
+            # Ratio head output format (legacy):
+            # - logits (.., >=3) -> softmax over first 3 dims -> proportions
+            #
+            # NOTE: if an older head exported extra dims (e.g., hurdle/presence logits),
+            # we intentionally ignore them (no gating).
+            def _ratio_logits_to_probs_inf(rlog: torch.Tensor) -> torch.Tensor:
+                return F.softmax(rlog[..., :3], dim=-1)
+
             # Prefer constraint-aware fusion when we have multi-layer per-layer outputs:
-            # c_l = softmax(ratio_l) * total_l, then average c across layers.
+            # c_l = p(ratio_l) * total_l, then average c across layers.
             comps_5d = None
             try:
                 if (
@@ -1229,7 +1366,7 @@ def infer_components_5d_for_model(
                 ):
                     L = int(preds_main_layers_g.shape[1])
                     total_layers_g = preds_main_layers_g[:, :, 0].clamp_min(0.0)  # (N, L)
-                    p_layers = F.softmax(preds_ratio_layers, dim=-1)  # (N, L, 3)
+                    p_layers = _ratio_logits_to_probs_inf(preds_ratio_layers)  # (N, L, 3)
                     comp_layers = p_layers * total_layers_g.unsqueeze(-1)  # (N, L, 3)
                     # Optional learned fusion weights from the head module (fallback to uniform).
                     layer_w: Optional[torch.Tensor] = None
@@ -1256,7 +1393,7 @@ def infer_components_5d_for_model(
 
             if comps_5d is None:
                 total_g = preds_main_g[:, 0].view(N)
-                p_ratio = F.softmax(preds_ratio, dim=-1)
+                p_ratio = _ratio_logits_to_probs_inf(preds_ratio)
                 zeros = torch.zeros_like(total_g)
                 comp_clover = (total_g * p_ratio[:, 0]) if head_num_ratio > 0 else zeros
                 comp_dead = (total_g * p_ratio[:, 1]) if head_num_ratio > 1 else zeros

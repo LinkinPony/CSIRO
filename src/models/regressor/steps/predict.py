@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 
 class PredictionMixin:
@@ -122,11 +122,11 @@ class PredictionMixin:
             pred_reg3: (B, num_outputs) logits in normalized domain (pre-softplus)
             z:         (B, D) shared global representation
             z_layers:  Optional[list[(B, D)]] per-layer z (layerwise heads)
-            ratio_logits_pred: Optional[(B,3)] ratio logits for FPN/DPT heads
+            ratio_logits_pred: Optional[(B,R)] ratio outputs for FPN/DPT heads
             ndvi_pred: Optional[(B,1)] NDVI pred for FPN/DPT heads
             batch: possibly-updated batch (mixup mutates labels)
             pred_reg3_layers: Optional[list[(B, num_outputs)]] per-layer reg3 logits (for multi-layer ViTDet)
-            ratio_logits_layers: Optional[list[(B,3)]] per-layer ratio logits (for multi-layer ViTDet)
+            ratio_logits_layers: Optional[list[(B,R)]] per-layer ratio outputs (for multi-layer ViTDet)
         """
         pred_reg3: Tensor
         z: Tensor
@@ -439,6 +439,97 @@ class PredictionMixin:
             ndvi_pred = out_dpt.get("ndvi", None)
             if pred_reg3 is None or z is None:
                 raise RuntimeError("DPT head did not return required outputs (reg3/z)")
+
+        elif head_type == "eomt":
+            # EoMT-style injected-query head (matches `third_party/eomt`):
+            #   1) run backbone up to (depth - k) blocks WITHOUT queries
+            #   2) run the remaining k blocks jointly with injected queries
+            #   3) (optional) apply manifold mixup on the *concatenated pooled representation*
+            #      (mean_query / mean_patch / cls) so labels are mixed consistently with what the head consumes
+            #
+            # NOTE: This path ignores `use_layerwise_heads` because the injected-query
+            # design is defined by "last-k blocks" rather than arbitrary layer indices.
+            try:
+                bb = getattr(self.feature_extractor, "backbone", None)
+                bb0 = bb
+                if bb0 is not None and (not hasattr(bb0, "blocks")):
+                    base_model = getattr(bb0, "base_model", None)
+                    if isinstance(base_model, nn.Module):
+                        cand = getattr(base_model, "model", None)
+                        if isinstance(cand, nn.Module) and hasattr(cand, "blocks"):
+                            bb0 = cand
+                        elif hasattr(base_model, "blocks"):
+                            bb0 = base_model
+                    cand2 = getattr(bb0, "model", None)
+                    if isinstance(cand2, nn.Module) and hasattr(cand2, "blocks"):
+                        bb0 = cand2
+                blocks = getattr(bb0, "blocks", None)
+                depth = len(blocks) if isinstance(blocks, (nn.ModuleList, list)) else 0
+            except Exception:
+                depth = 0
+            if depth <= 0:
+                raise RuntimeError("EoMT injected-query head requires a DINOv3 ViT backbone with `.blocks`")
+
+            k_blocks = int(getattr(self, "eomt_num_layers", 4) or 4)
+            k_blocks = int(max(0, min(k_blocks, depth)))
+            start_block = int(depth - k_blocks)
+
+            # Stage A: run up to start_block and return token sequence + patch-grid HW for RoPE.
+            x_base, (H_p, W_p) = self.feature_extractor.forward_tokens_until_block(
+                images, block_idx=int(start_block)
+            )
+
+            # Run injected-query transformer to obtain the normalized token sequence
+            # (queries + base tokens). We then build the pooled concat representation
+            # inside the head so it matches inference behavior.
+            try:
+                x_norm = self.eomt_head._forward_x_norm(  # type: ignore[attr-defined]
+                    x_base,
+                    backbone=getattr(self.feature_extractor, "backbone"),
+                    patch_hw=(int(H_p), int(W_p)),
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to compute EoMT injected tokens (head_type='eomt'). Original error: {e!r}"
+                ) from e
+
+            fused_concat = self.eomt_head.build_concat_features_from_tokens(  # type: ignore[attr-defined]
+                x_norm, backbone=getattr(self.feature_extractor, "backbone")
+            )
+
+            # Optional manifold mixup on the pooled concat representation.
+            if (
+                use_mixup
+                and self._manifold_mixup is not None
+                and (stage == "train")
+                and (not is_ndvi_only)
+            ):
+                try:
+                    fused_concat, batch, _ = self._manifold_mixup.apply(
+                        fused_concat,
+                        batch,
+                        force=True,
+                        lam=mixup_lam,
+                        perm=mixup_perm,
+                        mix_labels=mixup_mix_labels,
+                    )
+                except Exception as e:
+                    self._raise_manifold_mixup_error(
+                        context="eomt/injected/fused_concat",
+                        err=e,
+                        batch=batch,
+                        x=fused_concat,
+                    )
+
+            out_eomt = self.eomt_head.forward_from_concat_features(  # type: ignore[attr-defined]
+                fused_concat
+            )
+            pred_reg3 = out_eomt.get("reg3", None)  # type: ignore[assignment]
+            z = out_eomt.get("z", None)  # type: ignore[assignment]
+            ratio_logits_pred = out_eomt.get("ratio", None)
+            ndvi_pred = out_eomt.get("ndvi", None)
+            if pred_reg3 is None or z is None:
+                raise RuntimeError("EoMT head did not return required outputs (reg3/z)")
 
         elif self.use_layerwise_heads:
             # Multi-layer path: obtain per-layer CLS and patch tokens from the backbone.

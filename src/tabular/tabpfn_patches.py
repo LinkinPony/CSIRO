@@ -117,6 +117,75 @@ def patch_tabpfn_transform_borders_one_errstate() -> bool:
     return True
 
 
+def patch_sklearn_column_transformer_unpickle_compat() -> bool:
+    """
+    Patch scikit-learn ColumnTransformer to be robust to older pickled state.
+
+    Why:
+    - TabPFN fit-states may embed a fitted sklearn `ColumnTransformer` (preprocessor_).
+    - When running inference in a different sklearn version (common on Kaggle),
+      internal private attributes may be missing after unpickling.
+    - Some sklearn versions access `_name_to_fitted_passthrough` during `transform()`.
+      If missing, it crashes with:
+        AttributeError: 'ColumnTransformer' object has no attribute '_name_to_fitted_passthrough'
+
+    Fix:
+    - Wrap `ColumnTransformer.transform` to lazily create the missing attribute.
+    - When passthrough entries exist in `transformers_`, populate the mapping with a
+      lightweight identity `FunctionTransformer` so transform can proceed safely.
+    """
+    try:
+        from sklearn.compose import ColumnTransformer  # type: ignore
+        from sklearn.preprocessing import FunctionTransformer  # type: ignore
+    except Exception:
+        return False
+
+    cur = getattr(ColumnTransformer, "transform", None)
+    if cur is None:
+        return False
+    if bool(getattr(cur, "_csiro_unpickle_compat_patched", False)):
+        return True
+
+    orig_transform = cur
+
+    def _make_identity_transformer() -> Any:
+        # Prefer validate=False (works for numpy arrays and pandas DataFrames).
+        try:
+            return FunctionTransformer(validate=False)
+        except Exception:
+            try:
+                return FunctionTransformer()
+            except Exception:
+                return None
+
+    def transform(self, X: Any, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        if (not hasattr(self, "_name_to_fitted_passthrough")) or (getattr(self, "_name_to_fitted_passthrough", None) is None):
+            mapping: dict[Any, Any] = {}
+            try:
+                transformers_fitted = getattr(self, "transformers_", None)
+                if isinstance(transformers_fitted, (list, tuple)):
+                    for t in transformers_fitted:
+                        if not (isinstance(t, (list, tuple)) and len(t) >= 2):
+                            continue
+                        name, trans = t[0], t[1]
+                        if trans == "passthrough":
+                            ident = _make_identity_transformer()
+                            if ident is not None:
+                                mapping[name] = ident
+            except Exception:
+                mapping = {}
+            try:
+                setattr(self, "_name_to_fitted_passthrough", mapping)
+            except Exception:
+                pass
+
+        return orig_transform(self, X, *args, **kwargs)
+
+    transform._csiro_unpickle_compat_patched = True  # type: ignore[attr-defined]
+    ColumnTransformer.transform = transform  # type: ignore[assignment]
+    return True
+
+
 def apply_tabpfn_runtime_patches() -> Dict[str, bool]:
     """
     Apply all CSIRO runtime patches for TabPFN.
@@ -127,6 +196,7 @@ def apply_tabpfn_runtime_patches() -> Dict[str, bool]:
     results["tabpfn_common_utils_shim"] = install_tabpfn_common_utils_shim()
     results["safe_power_force_float64"] = patch_tabpfn_safe_power_force_float64()
     results["transform_borders_one_errstate"] = patch_tabpfn_transform_borders_one_errstate()
+    results["sklearn_column_transformer_unpickle_compat"] = patch_sklearn_column_transformer_unpickle_compat()
     return results
 
 

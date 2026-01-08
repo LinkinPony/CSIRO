@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -9,6 +10,21 @@ import torch
 from loguru import logger
 
 from src.tabular.tabpfn_utils import parse_image_size_hw, resolve_under_repo
+
+
+def _cfg_version(cfg_img: Dict[str, Any]) -> str:
+    try:
+        return str(cfg_img.get("version", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _file_fingerprint(path: Path) -> dict:
+    try:
+        st = os.stat(str(path))
+        return {"size": int(getattr(st, "st_size", 0)), "mtime_ns": int(getattr(st, "st_mtime_ns", 0))}
+    except Exception:
+        return {"size": None, "mtime_ns": None}
 
 
 def _pick_ckpt_for_swa(ckpt_root: Path) -> Optional[Path]:
@@ -312,10 +328,10 @@ def extract_head_penultimate_features_as_tabular(
     if not isinstance(head_meta, dict):
         head_meta = {}
     head_type = str(head_meta.get("head_type", "mlp") or "mlp").strip().lower()
-    if head_type not in ("mlp", "vitdet"):
+    if head_type not in ("mlp", "vitdet", "eomt"):
         raise SystemExit(
             f"Unsupported head_type={head_type!r} for penultimate-feature extraction. "
-            "Currently supported: mlp, vitdet."
+            "Currently supported: mlp, vitdet, eomt."
         )
 
     # Penultimate feature source selection
@@ -336,11 +352,21 @@ def extract_head_penultimate_features_as_tabular(
                 cached_paths = list(obj["image_paths"])
                 feats = obj["features"]
                 cached_meta = dict(obj.get("meta", {}) or {})
+                cfg_ver = _cfg_version(cfg_img)
+                head_fp = _file_fingerprint(head_weights_path)
+                bb_fp = _file_fingerprint(weights_path)
                 if (
                     cached_paths == image_paths
                     and isinstance(feats, torch.Tensor)
                     and feats.dim() == 2
+                    and str(cached_meta.get("cfg_version", "")) == str(cfg_ver)
                     and str(cached_meta.get("head_weights_path", "")) == str(head_weights_path)
+                    and dict(cached_meta.get("head_weights_fingerprint", {}) or {}) == dict(head_fp)
+                    and str(cached_meta.get("backbone", "")) == str(backbone_name)
+                    and str(cached_meta.get("weights_path", "")) == str(weights_path)
+                    and dict(cached_meta.get("backbone_weights_fingerprint", {}) or {}) == dict(bb_fp)
+                    and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
+                    and str(cached_meta.get("fusion", "")) == str(fusion)
                 ):
                     return feats.cpu().numpy()
         except Exception:
@@ -421,6 +447,63 @@ def extract_head_penultimate_features_as_tabular(
             head_module = ViTDetMultiLayerScalarHead(vitdet_cfg, num_layers=num_layers_eff, layer_fusion=fusion_mode)
         else:
             head_module = ViTDetScalarHead(vitdet_cfg)
+    elif head_type == "eomt":
+        from src.models.eomt_injected_head import EoMTInjectedQueryHeadConfig, EoMTInjectedQueryScalarHead
+
+        eomt_cfg = cfg_img.get("model", {}).get("head", {}).get("eomt", {})
+        if not isinstance(eomt_cfg, dict):
+            eomt_cfg = {}
+
+        eomt_num_queries = int(head_meta.get("eomt_num_queries", int(eomt_cfg.get("num_queries", 16))))
+        eomt_num_blocks = int(
+            head_meta.get(
+                "eomt_num_blocks",
+                head_meta.get(
+                    "eomt_num_layers",
+                    int(eomt_cfg.get("num_blocks", eomt_cfg.get("num_layers", 4))),
+                ),
+            )
+        )
+        eomt_query_pool = str(head_meta.get("eomt_query_pool", str(eomt_cfg.get("query_pool", "mean")))).strip().lower()
+        # New pooled feature construction (backward-compatible defaults)
+        eomt_use_mean_query = bool(head_meta.get("eomt_use_mean_query", bool(eomt_cfg.get("use_mean_query", True))))
+        eomt_use_mean_patch = bool(head_meta.get("eomt_use_mean_patch", bool(eomt_cfg.get("use_mean_patch", False))))
+        eomt_use_cls_token = bool(
+            head_meta.get("eomt_use_cls_token", bool(eomt_cfg.get("use_cls_token", eomt_cfg.get("use_cls", False))))
+        )
+        eomt_proj_dim = int(head_meta.get("eomt_proj_dim", int(eomt_cfg.get("proj_dim", 0))))
+        eomt_proj_activation = str(head_meta.get("eomt_proj_activation", str(eomt_cfg.get("proj_activation", "relu")))).strip().lower()
+        try:
+            eomt_proj_dropout = float(head_meta.get("eomt_proj_dropout", float(eomt_cfg.get("proj_dropout", 0.0))))
+        except Exception:
+            eomt_proj_dropout = float(eomt_cfg.get("proj_dropout", 0.0) or 0.0)
+        enable_ndvi = bool(head_meta.get("enable_ndvi", False))
+
+        embedding_dim = int(head_meta.get("embedding_dim", int(cfg_img.get("model", {}).get("embedding_dim", 1024))))
+        head_hidden_dims = list(head_meta.get("head_hidden_dims", []))
+        head_activation = str(head_meta.get("head_activation", "relu"))
+        head_dropout = float(head_meta.get("head_dropout", 0.0))
+
+        head_module = EoMTInjectedQueryScalarHead(
+            EoMTInjectedQueryHeadConfig(
+                embedding_dim=int(embedding_dim),
+                num_queries=int(eomt_num_queries),
+                num_blocks=int(eomt_num_blocks),
+                dropout=float(head_dropout),
+                query_pool=str(eomt_query_pool),
+                use_mean_query=bool(eomt_use_mean_query),
+                use_mean_patch=bool(eomt_use_mean_patch),
+                use_cls_token=bool(eomt_use_cls_token),
+                proj_dim=int(eomt_proj_dim),
+                proj_activation=str(eomt_proj_activation),
+                proj_dropout=float(eomt_proj_dropout),
+                head_hidden_dims=list(head_hidden_dims),
+                head_activation=str(head_activation),
+                num_outputs_main=int(head_meta.get("num_outputs_main", 1)),
+                num_outputs_ratio=int(head_meta.get("num_outputs_ratio", 0)),
+                enable_ndvi=bool(enable_ndvi),
+            )
+        )
     else:
         # MLP-style exported head module:
         # - Either MultiLayerHeadExport (when layerwise heads + separate bottlenecks)
@@ -483,6 +566,23 @@ def extract_head_penultimate_features_as_tabular(
     feature_extractor = feature_extractor.eval().to(device)
     head_module = head_module.eval().to(device)
 
+    eomt_start_block: Optional[int] = None
+    if head_type == "eomt":
+        try:
+            bb0 = EoMTInjectedQueryScalarHead._resolve_base_backbone(feature_extractor.backbone)  # type: ignore[attr-defined]
+            blocks = getattr(bb0, "blocks", None)
+            depth = len(blocks) if isinstance(blocks, (nn.ModuleList, list)) else 0
+        except Exception:
+            depth = 0
+        if depth <= 0:
+            raise RuntimeError("EoMT injected-query feature extraction requires a DINOv3 ViT backbone with `.blocks`")
+        try:
+            k_blocks = int(getattr(head_module, "num_blocks", int(head_meta.get("eomt_num_blocks", head_meta.get("eomt_num_layers", 4)))))
+        except Exception:
+            k_blocks = int(head_meta.get("eomt_num_blocks", head_meta.get("eomt_num_layers", 4)) or 4)
+        k_blocks = int(max(0, min(k_blocks, depth)))
+        eomt_start_block = int(depth - k_blocks)
+
     def _penultimate_from_sequential(head_seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
         mods = list(head_seq)
         last_lin = None
@@ -544,6 +644,21 @@ def extract_head_penultimate_features_as_tabular(
                     if not isinstance(z, torch.Tensor):
                         raise RuntimeError("ViTDet head did not return 'z'")
                     feats = z
+            elif head_type == "eomt":
+                if eomt_start_block is None:
+                    raise RuntimeError("Internal error: eomt_start_block not initialized")
+                x_base, (H_p, W_p) = feature_extractor.forward_tokens_until_block(  # type: ignore[attr-defined]
+                    images, block_idx=int(eomt_start_block)
+                )
+                out = head_module(  # type: ignore[call-arg]
+                    x_base,
+                    backbone=getattr(feature_extractor, "backbone"),
+                    patch_hw=(int(H_p), int(W_p)),
+                )
+                z = out.get("z", None) if isinstance(out, dict) else None
+                if not isinstance(z, torch.Tensor):
+                    raise RuntimeError("EoMT head did not return 'z'")
+                feats = z
             else:
                 # MLP head: extract the tensor right before the final Linear layer.
                 use_patch_reg3 = bool(head_meta.get("use_patch_reg3", False))
@@ -646,15 +761,22 @@ def extract_head_penultimate_features_as_tabular(
     if cache_path is not None:
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_ver = _cfg_version(cfg_img)
+            head_fp = _file_fingerprint(head_weights_path)
+            bb_fp = _file_fingerprint(weights_path)
             torch.save(
                 {
                     "image_paths": image_paths,
                     "features": features,
                     "meta": {
+                        "schema_version": 2,
+                        "cfg_version": str(cfg_ver),
                         "head_type": head_type,
                         "head_weights_path": str(head_weights_path),
+                        "head_weights_fingerprint": dict(head_fp),
                         "backbone": backbone_name,
                         "weights_path": str(weights_path),
+                        "backbone_weights_fingerprint": dict(bb_fp),
                         "image_size": tuple(image_size),
                         "fusion": fusion,
                     },
@@ -717,12 +839,16 @@ def extract_dinov3_cls_features_as_tabular(
                 cached_paths = list(obj["image_paths"])
                 feats = obj["features"]
                 cached_meta = dict(obj.get("meta", {}) or {})
+                cfg_ver = _cfg_version(cfg_img)
+                bb_fp = _file_fingerprint(weights_path)
                 if (
                     cached_paths == image_paths
                     and isinstance(feats, torch.Tensor)
                     and feats.dim() == 2
                     and str(cached_meta.get("backbone", "")) == str(backbone_name)
                     and str(cached_meta.get("weights_path", "")) == str(weights_path)
+                    and dict(cached_meta.get("weights_fingerprint", {}) or {}) == dict(bb_fp)
+                    and str(cached_meta.get("cfg_version", "")) == str(cfg_ver)
                     and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
                 ):
                     return feats.cpu().numpy()
@@ -778,14 +904,19 @@ def extract_dinov3_cls_features_as_tabular(
     if cache_path is not None:
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_ver = _cfg_version(cfg_img)
+            bb_fp = _file_fingerprint(weights_path)
             torch.save(
                 {
                     "image_paths": image_paths,
                     "features": features,
                     "meta": {
+                        "schema_version": 2,
                         "mode": "dinov3_only",
+                        "cfg_version": str(cfg_ver),
                         "backbone": backbone_name,
                         "weights_path": str(weights_path),
+                        "weights_fingerprint": dict(bb_fp),
                         "image_size": tuple(image_size),
                     },
                 },

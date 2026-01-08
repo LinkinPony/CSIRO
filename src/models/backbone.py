@@ -281,6 +281,87 @@ class DinoV3FeatureExtractor(nn.Module):
         cls, pt = self._extract_cls_and_pt(feats)
         return cls, pt
 
+    def _resolve_base_backbone(self) -> nn.Module:
+        """
+        Return the underlying DINOv3 backbone module, unwrapping PEFT models when present.
+        """
+        bb = self.backbone
+        # 1) Direct model
+        if hasattr(bb, "blocks"):
+            return bb
+        # 2) PEFT-style: backbone.base_model.model
+        base_model = getattr(bb, "base_model", None)
+        if isinstance(base_model, nn.Module):
+            cand = getattr(base_model, "model", None)
+            if isinstance(cand, nn.Module) and hasattr(cand, "blocks"):
+                return cand
+            if hasattr(base_model, "blocks"):
+                return base_model
+        # 3) Some wrappers use `.model`
+        cand2 = getattr(bb, "model", None)
+        if isinstance(cand2, nn.Module) and hasattr(cand2, "blocks"):
+            return cand2
+        return bb
+
+    def forward_tokens_until_block(
+        self,
+        images: Tensor,
+        *,
+        block_idx: int,
+    ) -> Tuple[Tensor, Tuple[int, int]]:
+        """
+        Run the DINOv3 ViT up to (but excluding) `block_idx` and return the *full* token sequence.
+
+        This is intended for EoMT-style query injection where we:
+          1) run the backbone for the first (depth - k) blocks without query tokens,
+          2) prepend query tokens,
+          3) run the remaining k blocks jointly.
+
+        Returns:
+            x:  (B, N_tokens, C) token sequence containing:
+                  [CLS, (storage tokens...), patch tokens]
+            hw: (H_p, W_p) patch grid size for RoPE (NOT input image size).
+        """
+        bb = self._resolve_base_backbone()
+
+        # Ensure inputs match backbone dtype (avoid conv2d dtype mismatch).
+        backbone_dtype = self._infer_backbone_input_dtype(images.dtype)
+        if images.dtype != backbone_dtype:
+            images = images.to(dtype=backbone_dtype)
+
+        blocks = getattr(bb, "blocks", None)
+        if not isinstance(blocks, (nn.ModuleList, list)):
+            raise RuntimeError(
+                "forward_tokens_until_block requires a DINOv3 ViT-style backbone with `.blocks`"
+            )
+        depth = len(blocks)
+        bi = int(block_idx)
+        if bi < 0 or bi > depth:
+            raise ValueError(
+                f"block_idx must be in [0, {depth}] but got {bi} (depth={depth})"
+            )
+
+        prepare = getattr(bb, "prepare_tokens_with_masks", None)
+        if prepare is None:
+            raise RuntimeError(
+                "forward_tokens_until_block requires backbone.prepare_tokens_with_masks(images, masks=None)"
+            )
+
+        def _run() -> Tuple[Tensor, Tuple[int, int]]:
+            # Full token sequence (CLS + storage + patches), and patch-grid (H_p, W_p)
+            x, hw = prepare(images, None)  # type: ignore[misc]
+            H_p, W_p = int(hw[0]), int(hw[1])
+            rope_embed = getattr(bb, "rope_embed", None)
+            rope = rope_embed(H=H_p, W=W_p) if rope_embed is not None else None
+            for i in range(bi):
+                x = blocks[i](x, rope)  # type: ignore[call-arg]
+            return x, (H_p, W_p)
+
+        if self.inference_only:
+            with torch.inference_mode():
+                return _run()
+        return _run()
+
     def forward_patch_tokens(self, images: Tensor) -> Tuple[Tensor, int]:
         """
         Returns:

@@ -1,5 +1,5 @@
 seed: 42
-version: vitdet-64-v4-detach-pair-e25
+version: mlp-pcgrad
 data:
   root: data
   train_csv: train.csv
@@ -315,9 +315,10 @@ model:
     # - vitdet (ViTDet SimpleFeaturePyramid-style head from *single-layer* patch tokens;
     #           when model.backbone_layers.enabled=true, builds one independent head per selected layer
     #           and averages the final outputs)
-    type: vitdet
+    # - eomt (EoMT-inspired query pooling head: learn Q query tokens and pool patch tokens via cross-attention)
+    type: mlp
     # ViTDet settings (SimpleFeaturePyramid-style):
-    vitdet_dim: 32
+    vitdet_dim: 320
     vitdet_patch_size: 16
     # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
     vitdet_scale_factors: [4.0, 2.0, 1.0, 0.5]
@@ -335,6 +336,29 @@ model:
     dpt_features: 256
     dpt_patch_size: 16
     dpt_readout: ignore
+    # EoMT-style injected-query settings (only used when model.head.type=eomt)
+    eomt:
+      # Number of learnable query tokens (Q). Small Q keeps compute ~O(QN) where N is #patch tokens.
+      num_queries: 16
+      # Number of LAST backbone blocks (k) to run jointly with injected queries.
+      # This matches `third_party/eomt`'s `num_blocks` concept.
+      num_blocks: 4
+      # Query pooling strategy: mean | first
+      query_pool: mean
+      # Which token sources to fuse into a single global representation (configurable):
+      # - mean_query : mean pooled injected query outputs
+      # - mean_patch : mean pooled patch tokens (after the injected last-k blocks)
+      # - cls_token  : CLS token (after the injected last-k blocks)
+      #
+      # Recommended: enable all three and project back to embedding_dim.
+      use_mean_query: true
+      use_mean_patch: true
+      use_cls_token: true
+      # After concatenation (dim = embedding_dim * num_enabled_sources), project down to this dim.
+      # Set to `model.embedding_dim` for a clean drop-in replacement (e.g. 1280 for dinov3_vith16plus).
+      proj_dim: 640
+      proj_activation: relu
+      proj_dropout: 0.2
     hidden_dims: [1280]
     activation: relu
     dropout: 0.2
@@ -357,7 +381,7 @@ model:
     # Dual-branch fusion (recommended A for MLP patch-mode):
     # combine the patch-based prediction with a global prediction from CLS+mean(patch).
     dual_branch:
-      enabled: true
+      enabled: false
       # Initial global-branch weight a in: y = a*y_global + (1-a)*y_patch
       alpha_init: 0.2
     # Biomass ratio head coupling mode.
@@ -391,18 +415,18 @@ model:
     # Recommended DPT-style 4-layer hooks:
     indices_by_backbone:
       dinov3_vitl16: [5, 11, 17, 23]
-      dinov3_vith16plus: [31]
+      dinov3_vith16plus: [12,24,31]
       dinov3_vit7b16: [9, 19, 29, 39]
 
 
 mtl:
   enabled: true
   tasks:
-    height: false
-    ndvi: false
+    height: true
+    ndvi: true
     ndvi_dense: false
     species: false
-    state: false
+    state: true
   # Per-step sampling ratio within an epoch (expected proportion).
   # ndvi_dense: probability to include NDVI-dense loss on a training step.
   sample_ratio:
@@ -412,7 +436,7 @@ train_all:
   enabled: true
 
 peft:
-  enabled: false
+  enabled: true
   method: lora
   use_dora: true
   r: 4
@@ -427,7 +451,7 @@ peft:
   # Layer-wise LR decay (LLRD) for LoRA params.
   # - 1.0: disable (legacy single LR for all LoRA params)
   # - <1:  earlier blocks get smaller LR; later blocks get larger LR
-  lora_llrd: 0.8
+  lora_llrd: 1.0
   # Optional: group N blocks into one optimizer group to reduce the number of logged LR curves.
   # Keep 1 for true per-block LR.
   lora_group_size: 1
@@ -454,6 +478,53 @@ optimizer:
   sam_rho: 0.05
   sam_adaptive: true
 
+# PCGrad (Projected Conflicting Gradients) to reduce gradient conflicts between tasks (reg3/ratio/5D/aux).
+#
+# Notes:
+# - When enabled, PCGrad is applied only to selected optimizer param groups (default: head + LoRA).
+# - UW (uncertainty-weighting) parameters are excluded by default to avoid injecting task gradients
+#   into log-variance weights.
+pcgrad:
+  enabled: true
+  # Gradient surgery mode:
+  # - symmetric        : standard PCGrad (all selected tasks treated equally)
+  # - primary_anchored : protect primary tasks; project auxiliary gradients only
+  mode: symmetric
+  eps: 1.0e-8
+  # How to combine per-task projected gradients: sum | mean
+  reduction: sum
+  # PCGrad paper default: randomize projection order.
+  shuffle_tasks: true
+  # Optional deterministic seed for shuffling (null => use global RNG).
+  seed: null
+  # Primary/Aux task specification (used only when mode=primary_anchored).
+  # If aux_tasks is null, it defaults to "all tasks except primary_tasks".
+  #
+  # Available task names (can be used in primary_tasks/aux_tasks/include_tasks/exclude_tasks):
+  # - reg3        : main regression loss
+  # - ratio       : biomass ratio head loss (when loss.use_ratio_head=true)
+  # - biomass_5d  : 5D weighted biomass loss (when loss.use_5d_weighted_mse=true)
+  # - consistency : AugMix consistency regularization (when data.augment.augmix.consistency.enabled=true)
+  # - height      : auxiliary height regression (mtl.tasks.height=true)
+  # - ndvi        : auxiliary NDVI regression (mtl.tasks.ndvi=true or NDVI-only batches)
+  # - species     : auxiliary species classification (mtl.tasks.species=true)
+  # - state       : auxiliary state classification (mtl.tasks.state=true)
+  # Note (mode=primary_anchored): if primary_tasks has multiple entries, we first apply symmetric PCGrad
+  # among the primary tasks to build the anchor, then project auxiliary task gradients against that anchor.
+  primary_tasks: [reg3, ratio, biomass_5d]
+  aux_tasks: null
+  # Apply PCGrad only to optimizer param groups with these `group_type` labels.
+  # Available group_type values in this repo: head | uw | lora
+  apply_to_group_types: [head]
+  # Explicit group_type exclusions (recommended: exclude UW).
+  exclude_group_types: [uw]
+  # Optional param-name substring exclusions (applied after group filtering).
+  exclude_param_name_substrings: []
+  # Optional task filtering. If include_tasks is non-null, only those tasks are projected.
+  include_tasks: null
+  # Otherwise, exclude_tasks are removed from PCGrad projection but still contribute normally to the loss.
+  exclude_tasks: []
+
 scheduler:
   name: cosine
   warmup_epochs: 0
@@ -462,10 +533,10 @@ scheduler:
 kfold:
   enabled: true
   k: 5
-  even_split: true
+  even_split: false
 
 trainer:
-  max_epochs: 25
+  max_epochs: 30
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -490,7 +561,7 @@ trainer:
     # build per-parameter-group SWA LRs (head/UW/LoRA) automatically.
     auto_lrs: true
     # freeze LoRA during SWA (requires_grad=False + lr=0 for LoRA param groups).
-    freeze_lora: true
+    freeze_lora: false
     # Optional: override SWA LR for UW params (defaults to swa_lrs when omitted).
     # uw_swa_lr: 0.0001
     # Optional: if freeze_lora=false, you can set a non-zero LoRA SWA LR here.

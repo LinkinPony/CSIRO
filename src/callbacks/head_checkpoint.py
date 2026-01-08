@@ -94,7 +94,7 @@ class HeadCheckpoint(Callback):
                 num_outputs_main = int(getattr(pl_module.hparams, "num_outputs", 1)) if hasattr(pl_module, "hparams") else 1
                 # Enable ratio outputs if the training module had ratio head enabled
                 enable_ratio = bool(getattr(pl_module, "enable_ratio_head", False))
-                num_ratio_outputs = 3 if enable_ratio else 0
+                num_ratio_outputs = int(getattr(pl_module, "num_ratio_outputs", 3)) if enable_ratio else 0
                 head_total_outputs = int(num_outputs_main + num_ratio_outputs)
 
                 embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024)) if hasattr(pl_module, "hparams") else 1024
@@ -155,6 +155,9 @@ class HeadCheckpoint(Callback):
                         "backbone_layer_indices": list(backbone_layer_indices),
                         "use_separate_bottlenecks": bool(use_separate_bottlenecks),
                         "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
+                        "ratio_head_format": str(getattr(pl_module, "ratio_head_format", "legacy")),
+                        "ratio_num_components": 3 if num_ratio_outputs > 0 else 0,
+                        "ratio_has_presence": False,
                     },
                 }
                 # Optionally bundle LoRA payload
@@ -186,7 +189,7 @@ class HeadCheckpoint(Callback):
                 # ---------------------------
                 num_outputs_main = int(getattr(pl_module.hparams, "num_outputs", 1)) if hasattr(pl_module, "hparams") else 1
                 enable_ratio = bool(getattr(pl_module, "enable_ratio_head", False))
-                num_ratio_outputs = 3 if enable_ratio else 0
+                num_ratio_outputs = int(getattr(pl_module, "num_ratio_outputs", 3)) if enable_ratio else 0
                 head_total_outputs = int(num_outputs_main + num_ratio_outputs)
 
                 embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024)) if hasattr(pl_module, "hparams") else 1024
@@ -251,6 +254,9 @@ class HeadCheckpoint(Callback):
                         "use_separate_bottlenecks": bool(use_separate_bottlenecks),
                         "num_layers": int(num_layers_eff),
                         "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
+                        "ratio_head_format": str(getattr(pl_module, "ratio_head_format", "legacy")),
+                        "ratio_num_components": 3 if num_ratio_outputs > 0 else 0,
+                        "ratio_has_presence": False,
                     },
                 }
                 # Optionally bundle LoRA payload
@@ -281,7 +287,7 @@ class HeadCheckpoint(Callback):
                 # ---------------------------
                 num_outputs_main = int(getattr(pl_module.hparams, "num_outputs", 1)) if hasattr(pl_module, "hparams") else 1
                 enable_ratio = bool(getattr(pl_module, "enable_ratio_head", False))
-                num_ratio_outputs = 3 if enable_ratio else 0
+                num_ratio_outputs = int(getattr(pl_module, "num_ratio_outputs", 3)) if enable_ratio else 0
                 head_total_outputs = int(num_outputs_main + num_ratio_outputs)
 
                 embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024)) if hasattr(pl_module, "hparams") else 1024
@@ -337,6 +343,119 @@ class HeadCheckpoint(Callback):
                         "use_separate_bottlenecks": bool(use_separate_bottlenecks),
                         "num_layers": int(num_layers_eff),
                         "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
+                        "ratio_head_format": str(getattr(pl_module, "ratio_head_format", "legacy")),
+                        "ratio_num_components": 3 if num_ratio_outputs > 0 else 0,
+                        "ratio_has_presence": False,
+                    },
+                }
+                # Optionally bundle LoRA payload
+                try:
+                    fe = getattr(pl_module, "feature_extractor", None)
+                    if fe is not None and hasattr(fe, "backbone"):
+                        peft_payload = export_lora_payload_if_any(fe.backbone)
+                        if peft_payload is not None:
+                            state["peft"] = peft_payload
+                except Exception:
+                    pass
+
+                suffix_parts: list[str] = []
+                if val_loss is not None:
+                    suffix_parts.append(f"val_loss{val_loss:.6f}")
+                if train_loss is not None:
+                    suffix_parts.append(f"train_loss{train_loss:.6f}")
+                if val_r2 is not None:
+                    suffix_parts.append(f"val_r2{val_r2:.6f}")
+                metrics_suffix = ("-" + "-".join(suffix_parts)) if suffix_parts else ""
+                out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}{metrics_suffix}.pt")
+                self._save(state, out_path)
+                return
+
+            if head_type in ("eomt", "eomt_query", "query_pool", "qpool", "query"):
+                # ---------------------------
+                # EoMT-style injected-query head export
+                # ---------------------------
+                num_outputs_main = int(getattr(pl_module.hparams, "num_outputs", 1)) if hasattr(pl_module, "hparams") else 1
+                enable_ratio = bool(getattr(pl_module, "enable_ratio_head", False))
+                num_ratio_outputs = int(getattr(pl_module, "num_ratio_outputs", 3)) if enable_ratio else 0
+                head_total_outputs = int(num_outputs_main + num_ratio_outputs)
+
+                embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024)) if hasattr(pl_module, "hparams") else 1024
+                head_hidden_dims = list(getattr(pl_module.hparams, "head_hidden_dims", [])) if hasattr(pl_module, "hparams") else []
+                head_activation = str(getattr(pl_module.hparams, "head_activation", "relu")) if hasattr(pl_module, "hparams") else "relu"
+                dropout = float(getattr(pl_module.hparams, "dropout", 0.0)) if hasattr(pl_module, "hparams") else 0.0
+
+                eomt_num_queries = int(getattr(pl_module.hparams, "eomt_num_queries", 16)) if hasattr(pl_module, "hparams") else 16
+                eomt_num_layers = int(getattr(pl_module.hparams, "eomt_num_layers", 2)) if hasattr(pl_module, "hparams") else 2
+                eomt_num_heads = int(getattr(pl_module.hparams, "eomt_num_heads", 8)) if hasattr(pl_module, "hparams") else 8
+                eomt_ffn_dim = int(getattr(pl_module.hparams, "eomt_ffn_dim", 2048)) if hasattr(pl_module, "hparams") else 2048
+                eomt_query_pool = str(getattr(pl_module.hparams, "eomt_query_pool", "mean")) if hasattr(pl_module, "hparams") else "mean"
+                # New pooled feature construction (backward-compatible defaults)
+                eomt_use_mean_query = bool(getattr(pl_module.hparams, "eomt_use_mean_query", True)) if hasattr(pl_module, "hparams") else True
+                eomt_use_mean_patch = bool(getattr(pl_module.hparams, "eomt_use_mean_patch", False)) if hasattr(pl_module, "hparams") else False
+                eomt_use_cls_token = bool(getattr(pl_module.hparams, "eomt_use_cls_token", False)) if hasattr(pl_module, "hparams") else False
+                eomt_proj_dim = int(getattr(pl_module.hparams, "eomt_proj_dim", 0)) if hasattr(pl_module, "hparams") else 0
+                eomt_proj_activation = str(getattr(pl_module.hparams, "eomt_proj_activation", "relu")) if hasattr(pl_module, "hparams") else "relu"
+                eomt_proj_dropout = float(getattr(pl_module.hparams, "eomt_proj_dropout", 0.0)) if hasattr(pl_module, "hparams") else 0.0
+
+                use_layerwise_heads = bool(getattr(pl_module, "use_layerwise_heads", False))
+                backbone_layer_indices = list(getattr(pl_module, "backbone_layer_indices", []))
+                use_separate_bottlenecks = bool(getattr(pl_module, "use_separate_bottlenecks", False))
+                enable_ndvi = bool(getattr(pl_module, "enable_ndvi", False))
+
+                eomt_head = getattr(pl_module, "eomt_head", None)
+                if eomt_head is None or not isinstance(eomt_head, nn.Module):
+                    raise RuntimeError(
+                        "EoMT head export failed: expected `pl_module.eomt_head` to be an nn.Module. "
+                        "This likely indicates a mismatched head_type or an unexpected LightningModule structure."
+                    )
+                state_dict_to_save = eomt_head.state_dict()
+
+                state: Dict[str, Any] = {
+                    "state_dict": state_dict_to_save,
+                    "meta": {
+                        "head_type": "eomt",
+                        "backbone": getattr(pl_module.hparams, "backbone_name", None) if hasattr(pl_module, "hparams") else None,
+                        "embedding_dim": embedding_dim,
+                        # EoMT injected-query config
+                        "eomt_num_queries": int(eomt_num_queries),
+                        # Backward compatibility: keep `eomt_num_layers` key but interpret it as num_blocks (last-k blocks).
+                        "eomt_num_layers": int(eomt_num_layers),
+                        "eomt_num_blocks": int(eomt_num_layers),
+                        "eomt_style": "injected_last_k_blocks",
+                        # Deprecated (unused for injected-query mode; kept for compatibility with older configs/tools)
+                        "eomt_num_heads": int(eomt_num_heads),
+                        "eomt_ffn_dim": int(eomt_ffn_dim),
+                        "eomt_query_pool": str(eomt_query_pool).strip().lower(),
+                        # New pooled feature construction
+                        "eomt_use_mean_query": bool(eomt_use_mean_query),
+                        "eomt_use_mean_patch": bool(eomt_use_mean_patch),
+                        "eomt_use_cls_token": bool(eomt_use_cls_token),
+                        "eomt_proj_dim": int(eomt_proj_dim),
+                        "eomt_proj_activation": str(eomt_proj_activation),
+                        "eomt_proj_dropout": float(eomt_proj_dropout),
+                        "enable_ndvi": bool(enable_ndvi),
+                        "num_outputs_main": int(num_outputs_main),
+                        "num_outputs_ratio": int(num_ratio_outputs),
+                        "head_total_outputs": int(head_total_outputs),
+                        "head_hidden_dims": list(head_hidden_dims),
+                        "head_activation": str(head_activation),
+                        "head_dropout": float(dropout),
+                        # Export without terminal Softplus; inference handles main outputs.
+                        "use_output_softplus": False,
+                        "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,
+                        # Patch tokens are required for EoMT heads.
+                        "use_patch_reg3": True,
+                        "use_cls_token": bool(getattr(pl_module.hparams, "use_cls_token", True)) if hasattr(pl_module, "hparams") else True,
+                        "use_layerwise_heads": bool(use_layerwise_heads),
+                        "backbone_layer_indices": list(backbone_layer_indices),
+                        "use_separate_bottlenecks": bool(use_separate_bottlenecks),
+                        "ratio_head_mode": str(getattr(pl_module, "ratio_head_mode", "shared")),
+                        "separate_ratio_head": bool(getattr(pl_module, "separate_ratio_head", False)),
+                        "separate_ratio_spatial_head": bool(getattr(pl_module, "separate_ratio_spatial_head", False)),
+                        "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
+                        "ratio_head_format": str(getattr(pl_module, "ratio_head_format", "legacy")),
+                        "ratio_num_components": 3 if num_ratio_outputs > 0 else 0,
+                        "ratio_has_presence": False,
                     },
                 }
                 # Optionally bundle LoRA payload
@@ -732,6 +851,9 @@ class HeadCheckpoint(Callback):
                 "use_separate_bottlenecks": bool(getattr(pl_module.hparams, "use_separate_bottlenecks", False)) if hasattr(pl_module, "hparams") else False,
                 # Order of ratio components packed in the head (if any)
                 "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
+                "ratio_head_format": str(getattr(pl_module, "ratio_head_format", "legacy")),
+                "ratio_num_components": 3 if num_ratio_outputs > 0 else 0,
+                "ratio_has_presence": False,
             },
         }
         # Optional: export learned fusion logits for the MLP multi-layer path.

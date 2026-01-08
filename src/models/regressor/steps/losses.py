@@ -10,6 +10,40 @@ from ...layer_utils import fuse_layerwise_predictions
 
 
 class LossesMixin:
+    def _build_pcgrad_terms(
+        self, named_losses: List[Tuple[str, Tensor]], *, normalize: bool = True
+    ) -> List[Tuple[str, Tensor]]:
+        """
+        Build per-task loss *terms* that sum to the exact scalar used for backprop.
+
+        - When UW is enabled, each task contributes: 0.5 * (exp(-s) * L + s)
+        - When UW is disabled, each task contributes: L
+        - In both cases we normalize by number of tasks (matching `_uw_sum` behavior).
+
+        These terms are useful for PCGrad, which needs per-task gradients while preserving
+        the original scalar loss definition.
+        """
+        if not named_losses:
+            return []
+        denom = float(len(named_losses)) if bool(normalize) else 1.0
+        denom = float(denom) if denom > 0.0 else 1.0
+        terms: List[Tuple[str, Tensor]] = []
+        if (
+            getattr(self, "loss_weighting", None) == "uw"
+            and getattr(self, "_uw_task_params", None) is not None
+        ):
+            for name, loss in named_losses:
+                s = self._uw_task_params.get(name, None)  # type: ignore[union-attr]
+                if s is None:
+                    term = loss
+                else:
+                    term = 0.5 * (torch.exp(-s) * loss + s)
+                terms.append((name, term / denom))
+        else:
+            for name, loss in named_losses:
+                terms.append((name, loss / denom))
+        return terms
+
     def _loss_ndvi_only(
         self,
         *,
@@ -30,7 +64,7 @@ class LossesMixin:
             return {"loss": zero}
 
         y_ndvi_only: Tensor = batch["y_ndvi"]  # (B,1)
-        if head_type in ("fpn", "dpt", "vitdet"):
+        if head_type in ("fpn", "dpt", "vitdet", "eomt"):
             if ndvi_pred_from_head is None:
                 zero = (z.sum() * 0.0)
                 self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
@@ -57,9 +91,15 @@ class LossesMixin:
         self.log(f"{stage}_mse_ndvi", loss_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
         mae_ndvi_only = F.l1_loss(pred_ndvi_only, y_ndvi_only)
         self.log(f"{stage}_mae_ndvi", mae_ndvi_only, on_step=False, on_epoch=True, prog_bar=False)
-        total_ndvi = self._uw_sum([("ndvi", loss_ndvi_only)])
+        named_losses = [("ndvi", loss_ndvi_only)]
+        pcgrad_terms = (
+            self._build_pcgrad_terms(named_losses, normalize=True)
+            if bool(getattr(self, "_pcgrad_enabled", False))
+            else None
+        )
+        total_ndvi = self._uw_sum(named_losses)
         self.log(f"{stage}_loss", total_ndvi, on_step=False, on_epoch=True, prog_bar=True)
-        return {"loss": total_ndvi}
+        return {"loss": total_ndvi, "named_losses": named_losses, "pcgrad_terms": pcgrad_terms}
 
     def _loss_supervised(
         self,
@@ -129,11 +169,21 @@ class LossesMixin:
                 for i in range(per_dim_mse.shape[0]):
                     _log(f"{stage}_mse_reg3_{i}", per_dim_mse[i], on_step=False, on_epoch=True, prog_bar=False)
 
-        # --- Ratio MSE loss ---
-        loss_ratio_mse: Optional[Tensor] = None
+        # --- Ratio loss (legacy): MSE on softmax proportions ---
+        #
+        # Training-time target is still a simplex ratio p_true in R^3 (clover/dead/green),
+        # and the head outputs logits in R^3; we apply softmax and supervise with MSE.
+        loss_ratio_mse: Optional[Tensor] = None  # keep historical key name for logging/aggregation
         if self.enable_ratio_head:
             y_ratio: Optional[Tensor] = batch.get("y_ratio", None)  # (B,3)
             ratio_mask: Optional[Tensor] = batch.get("ratio_mask", None)  # (B,1)
+
+            def _ratio_logits_to_probs(rlog: Tensor) -> Tensor:
+                # Accept (B,3) logits; if extra dims exist (older hurdle heads), ignore them.
+                if rlog is None:
+                    raise TypeError("ratio logits is None")
+                return F.softmax(rlog[..., :3], dim=-1)
+
             if y_ratio is not None and ratio_mask is not None:
                 # Constraint-aware fusion (preferred): for multi-layer ViTDet, fuse in component space
                 # using per-layer total predictions and per-layer ratio logits.
@@ -146,24 +196,24 @@ class LossesMixin:
                     and len(pred_reg3_layers) == len(ratio_logits_layers)
                 ):
                     try:
-                        # Convert each layer's main prediction to g/m^2, then form components per layer.
                         comp_layers: List[Tensor] = []
                         used_idxs: List[int] = []
                         for li, (p_tot, r_log) in enumerate(zip(pred_reg3_layers, ratio_logits_layers)):
                             if p_tot is None or r_log is None:
                                 continue
                             t_gm2 = self._invert_reg3_to_g_per_m2(p_tot).clamp_min(0.0)  # (B,1)
-                            p_l = F.softmax(r_log, dim=-1)  # (B,3)
+                            p_l = _ratio_logits_to_probs(r_log)  # (B,3)
                             comp_layers.append(p_l * t_gm2)  # (B,3)
                             used_idxs.append(int(li))
                         if comp_layers:
                             comp_stack = torch.stack(comp_layers, dim=0)  # (K,B,3)
-                            # Optional learned fusion weights from vitdet head (fallback to uniform).
                             w = None
                             try:
                                 vh = getattr(self, "vitdet_head", None)
                                 if vh is not None and hasattr(vh, "get_layer_weights"):
-                                    w_full = vh.get_layer_weights(device=comp_stack.device, dtype=comp_stack.dtype)  # type: ignore[attr-defined]
+                                    w_full = vh.get_layer_weights(  # type: ignore[attr-defined]
+                                        device=comp_stack.device, dtype=comp_stack.dtype
+                                    )
                                     if isinstance(w_full, torch.Tensor) and w_full.numel() >= (max(used_idxs) + 1):
                                         idx_t = torch.tensor(used_idxs, device=w_full.device, dtype=torch.long)
                                         w = w_full.index_select(0, idx_t)
@@ -176,33 +226,30 @@ class LossesMixin:
                                 comp_bar = (w.view(-1, 1, 1) * comp_stack).sum(dim=0)  # (B,3)
                             tot_bar = comp_bar.sum(dim=-1, keepdim=True).clamp_min(1e-8)  # (B,1)
                             p_pred = (comp_bar / tot_bar).clamp_min(0.0)
-                            # Renormalize to exactly sum-to-1 (numerical safety).
                             p_pred = p_pred / p_pred.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                     except Exception:
                         p_pred = None
 
-                # Fallback (legacy): compute p_pred from a single set of ratio logits.
+                # Fallback: compute p_pred from a single set of ratio logits.
                 if p_pred is None:
-                    if head_type in ("fpn", "dpt", "vitdet"):
+                    if head_type in ("fpn", "dpt", "vitdet", "eomt"):
                         ratio_logits = ratio_logits_pred
                     elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
-                        logits_per_layer: List[Tensor] = []
-                        for idx, head in enumerate(self.layer_ratio_heads):
-                            logits_per_layer.append(head(z_layers[idx]))
+                        logits_per_layer = [head(z_layers[idx]) for idx, head in enumerate(self.layer_ratio_heads)]
                         w = self._get_backbone_layer_fusion_weights(
                             device=logits_per_layer[0].device, dtype=logits_per_layer[0].dtype
                         )
                         ratio_logits = fuse_layerwise_predictions(logits_per_layer, weights=w)
                     else:
                         ratio_logits = self.ratio_head(z)  # type: ignore[operator]
-                    if ratio_logits is not None:
-                        p_pred = F.softmax(ratio_logits, dim=-1)
+                    if isinstance(ratio_logits, torch.Tensor):
+                        p_pred = _ratio_logits_to_probs(ratio_logits)
 
+                loss_ratio_mse_eff: Optional[Tensor] = None
                 if p_pred is not None:
+                    # Build p_true (normalize defensively).
                     y_ratio_raw = y_ratio
-                    y_ratio_safe = torch.nan_to_num(
-                        y_ratio_raw, nan=0.0, posinf=0.0, neginf=0.0
-                    )
+                    y_ratio_safe = torch.nan_to_num(y_ratio_raw, nan=0.0, posinf=0.0, neginf=0.0)
                     m = ratio_mask.to(device=p_pred.device, dtype=p_pred.dtype)
                     if m.dim() == 1:
                         m = m.view(-1, 1)
@@ -215,19 +262,15 @@ class LossesMixin:
                     denom = p_true.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                     p_true = p_true / denom
 
-                    diff_ratio = p_pred - p_true
-                    mse_per_sample = (diff_ratio * diff_ratio).sum(dim=-1, keepdim=True)  # (B,1)
-                    mse_per_sample = torch.where(m > 0.0, mse_per_sample, torch.zeros_like(mse_per_sample))
-                    num = mse_per_sample.sum()
-                    den = m.sum().clamp_min(1.0)
-                    loss_ratio_mse = (num / den)
-                    _log(
-                        f"{stage}_loss_ratio_mse",
-                        loss_ratio_mse,
-                        on_step=False,
-                        on_epoch=True,
-                        prog_bar=False,
-                    )
+                    # MSE on proportions (per-sample, masked).
+                    diff = p_pred - p_true
+                    diff = torch.where(m > 0.0, diff, torch.zeros_like(diff))
+                    diff2 = diff * diff
+                    loss_ratio_mse_eff = diff2.sum() / (m.sum().clamp_min(1.0) * float(p_pred.size(-1)))
+                    _log(f"{stage}_loss_ratio_mse", loss_ratio_mse_eff, on_step=False, on_epoch=True, prog_bar=False)
+
+                if loss_ratio_mse_eff is not None:
+                    loss_ratio_mse = loss_ratio_mse_eff
 
         # --- 5D weighted MSE loss ---
         loss_5d: Optional[Tensor] = None
@@ -253,7 +296,7 @@ class LossesMixin:
                         if p_tot is None or r_log is None:
                             continue
                         t_gm2 = self._invert_reg3_to_g_per_m2(p_tot).clamp_min(0.0)  # (B,1)
-                        p_l = F.softmax(r_log, dim=-1)  # (B,3)
+                        p_l = _ratio_logits_to_probs(r_log)  # (B,3)
                         comp_layers.append(p_l * t_gm2)  # (B,3)
                         used_idxs.append(int(li))
                     if comp_layers:
@@ -286,7 +329,7 @@ class LossesMixin:
 
             if pred_5d_gm2 is None:
                 pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
-                if head_type in ("fpn", "dpt", "vitdet"):
+                if head_type in ("fpn", "dpt", "vitdet", "eomt"):
                     ratio_logits = ratio_logits_pred
                 elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
                     logits_per_layer_5d: List[Tensor] = []
@@ -302,7 +345,7 @@ class LossesMixin:
                 if ratio_logits is None:
                     p_pred = None
                 else:
-                    p_pred = F.softmax(ratio_logits, dim=-1)  # (B,3)
+                    p_pred = _ratio_logits_to_probs(ratio_logits)  # (B,3)
 
                 if p_pred is None:
                     comp_gm2 = torch.zeros(
@@ -393,8 +436,29 @@ class LossesMixin:
                     for name, l in extra_uw_losses:
                         if isinstance(l, torch.Tensor):
                             named_losses_simple.append((str(name), l))
+                pcgrad_terms = (
+                    self._build_pcgrad_terms(named_losses_simple, normalize=True)
+                    if bool(getattr(self, "_pcgrad_enabled", False))
+                    else None
+                )
                 total_loss = self._uw_sum(named_losses_simple)
             else:
+                named_losses_simple = [("reg3", loss_reg3_mse)]
+                if loss_ratio_mse is not None:
+                    named_losses_simple.append(("ratio", loss_ratio_mse))
+                if loss_5d is not None:
+                    named_losses_simple.append(("biomass_5d", loss_5d))
+                if extra_uw_losses:
+                    for name, l in extra_uw_losses:
+                        if isinstance(l, torch.Tensor):
+                            named_losses_simple.append((str(name), l))
+                # In non-UW single-task mode, this branch historically optimizes the SUM of enabled
+                # supervised losses (reg3 + optional ratio + optional 5D), not their mean.
+                pcgrad_terms = (
+                    self._build_pcgrad_terms(named_losses_simple, normalize=False)
+                    if bool(getattr(self, "_pcgrad_enabled", False))
+                    else None
+                )
                 total_loss = loss_reg3_total
             _log(f"{stage}_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
             _log(f"{stage}_mae", mae_reg3, on_step=False, on_epoch=True, prog_bar=False)
@@ -428,6 +492,8 @@ class LossesMixin:
                 "mse": loss_reg3_mse,
                 "preds": preds_out,
                 "targets": targets_out,
+                "named_losses": named_losses_simple,
+                "pcgrad_terms": pcgrad_terms,
                 "loss_reg3_mse": loss_reg3_mse,
                 "loss_ratio_mse": loss_ratio_out,
                 "loss_5d_weighted": loss_5d_out,
@@ -441,7 +507,7 @@ class LossesMixin:
         pred_ndvi = None
         logits_species = None
         logits_state = None
-        if head_type in ("fpn", "dpt", "vitdet"):
+        if head_type in ("fpn", "dpt", "vitdet", "eomt"):
             pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
             pred_ndvi = ndvi_pred_from_head if self.enable_ndvi else None
             logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
@@ -552,6 +618,11 @@ class LossesMixin:
                 if isinstance(l, torch.Tensor):
                     named_losses.append((str(name), l))
 
+        pcgrad_terms = (
+            self._build_pcgrad_terms(named_losses, normalize=True)
+            if bool(getattr(self, "_pcgrad_enabled", False))
+            else None
+        )
         total_loss = self._uw_sum(named_losses)
 
         mae = mae_reg3
@@ -579,6 +650,8 @@ class LossesMixin:
             "mse": mse,
             "preds": preds_out,
             "targets": targets_out,
+            "named_losses": named_losses,
+            "pcgrad_terms": pcgrad_terms,
             "loss_reg3_mse": loss_reg3_mse,
             "loss_ratio_mse": (loss_ratio_mse if loss_ratio_mse is not None else (loss_reg3_mse.sum() * 0.0)),
             "loss_5d_weighted": (loss_5d if loss_5d is not None else (loss_reg3_mse.sum() * 0.0)),

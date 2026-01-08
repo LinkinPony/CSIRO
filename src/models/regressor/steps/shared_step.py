@@ -540,6 +540,14 @@ class SharedStepMixin:
                 )
                 if self.loss_weighting != "uw" or (not use_uw_task):
                     out["loss"] = out["loss"] + loss_cons_total
+                    # Ensure PCGrad terms sum to the *exact* scalar loss used for backprop.
+                    try:
+                        if "pcgrad_terms" in out and isinstance(out["pcgrad_terms"], list):
+                            out["pcgrad_terms"] = list(out["pcgrad_terms"]) + [  # type: ignore[assignment]
+                                ("consistency", loss_cons_total)
+                            ]
+                    except Exception:
+                        pass
                     # Ensure total loss is logged under the standard key.
                     self.log(f"{stage}_loss", out["loss"], on_step=False, on_epoch=True, prog_bar=True)
                 return out
@@ -618,7 +626,40 @@ class SharedStepMixin:
             self.log(f"{stage}_mse", loss_reg3_mse, on_step=False, on_epoch=True, prog_bar=False)
             self.log(f"{stage}_loss", loss_total, on_step=False, on_epoch=True, prog_bar=True)
 
-            return {"loss": loss_total}
+            # Propagate PCGrad terms (and raw named losses) by averaging across views.
+            pcgrad_terms = None
+            named_losses = None
+            try:
+                if view_outs and isinstance(view_outs[0], dict):
+                    if "pcgrad_terms" in view_outs[0] and isinstance(view_outs[0]["pcgrad_terms"], list):
+                        base = list(view_outs[0]["pcgrad_terms"])
+                        terms_out = []
+                        for k, (name, _t0) in enumerate(base):
+                            ts = [o["pcgrad_terms"][k][1] for o in view_outs if "pcgrad_terms" in o]  # type: ignore[index]
+                            terms_out.append((name, torch.stack(ts, dim=0).mean(dim=0)))
+                        pcgrad_terms = terms_out
+                    if "named_losses" in view_outs[0] and isinstance(view_outs[0]["named_losses"], list):
+                        base_n = list(view_outs[0]["named_losses"])
+                        nl_out = []
+                        for k, (name, _l0) in enumerate(base_n):
+                            ls = [o["named_losses"][k][1] for o in view_outs if "named_losses" in o]  # type: ignore[index]
+                            nl_out.append((name, torch.stack(ls, dim=0).mean(dim=0)))
+                        named_losses = nl_out
+                # If consistency was added directly (non-UW or UW-without-uw_task), append as an additive term
+                # so that sum(pcgrad_terms) == loss_total.
+                if (self.loss_weighting != "uw" or (not use_uw_task)) and isinstance(loss_cons_total, torch.Tensor):
+                    if pcgrad_terms is not None:
+                        pcgrad_terms = list(pcgrad_terms) + [("consistency", loss_cons_total)]
+            except Exception:
+                pcgrad_terms = None
+                named_losses = None
+
+            out: Dict[str, Tensor] = {"loss": loss_total}
+            if pcgrad_terms is not None:
+                out["pcgrad_terms"] = pcgrad_terms  # type: ignore[assignment]
+            if named_losses is not None:
+                out["named_losses"] = named_losses  # type: ignore[assignment]
+            return out
 
         # --- Single-view (legacy) path ---
         images: Tensor = images_any  # type: ignore[assignment]

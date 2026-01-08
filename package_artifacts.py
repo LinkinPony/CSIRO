@@ -618,7 +618,22 @@ def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -
 
         X_train_all = np.concatenate(X_list, axis=0)
         y_train_all = np.concatenate([y_train for _ in range(len(X_list))], axis=0)
-        _fit_and_save(X=X_train_all, y=y_train_all, meta_extra={"ensemble_models": [{"version": m.get("version")} for m in models_eff]})
+        image_versions = [
+            str(m.get("version")).strip()
+            for m in models_eff
+            if isinstance(m.get("version", None), (str, int, float)) and str(m.get("version")).strip()
+        ]
+        # Deduplicate while preserving order
+        _seen = set()
+        image_versions = [v for v in image_versions if not (v in _seen or _seen.add(v))]
+        _fit_and_save(
+            X=X_train_all,
+            y=y_train_all,
+            meta_extra={
+                "image_versions": list(image_versions),
+                "ensemble_models": [{"version": m.get("version")} for m in models_eff],
+            },
+        )
     else:
         print("[TABPFN][PKG] Ensemble disabled: training single-model fit-state.")
         cfg_img = load_config(str(weights_dir))
@@ -671,7 +686,17 @@ def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -
             )
         if not (isinstance(X_train, np.ndarray) and X_train.ndim == 2 and X_train.shape[0] == len(train_image_paths)):
             raise RuntimeError(f"[TABPFN][PKG] Bad train feature array: shape={getattr(X_train, 'shape', None)}")
-        _fit_and_save(X=X_train, y=y_train, meta_extra={})
+        image_version_single = str(cfg_img.get("version", "") or "").strip()
+        _fit_and_save(
+            X=X_train,
+            y=y_train,
+            meta_extra={
+                # New schema (preferred)
+                "image_versions": ([image_version_single] if image_version_single else []),
+                # Legacy single-version key (kept for readability/backward-compat)
+                "image_version": (image_version_single if image_version_single else None),
+            },
+        )
 
 
 def copy_top_level_scripts(repo_root: Path, weights_dir: Path) -> list[Path]:

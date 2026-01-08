@@ -38,6 +38,7 @@ def init_dpt_head(
     enable_ndvi = bool(getattr(model, "enable_ndvi", False)) and bool(getattr(model, "mtl_enabled", True))
     enable_ratio_head = bool(getattr(model, "enable_ratio_head", True))
     num_outputs_main = int(getattr(model, "num_outputs", 1))
+    num_ratio_outputs = int(getattr(model, "num_ratio_outputs", 3)) if bool(enable_ratio_head) else 0
 
     dpt_cfg = DPTHeadConfig(
         embedding_dim=int(embedding_dim),
@@ -46,7 +47,7 @@ def init_dpt_head(
         readout=str(dpt_readout),
         num_layers=int(max(1, num_layers_eff)),
         num_outputs_main=int(num_outputs_main),
-        num_outputs_ratio=3 if bool(enable_ratio_head) else 0,
+        num_outputs_ratio=int(num_ratio_outputs),
         enable_ndvi=bool(enable_ndvi),
         separate_ratio_head=bool(getattr(model, "separate_ratio_head", False)),
         separate_ratio_spatial_head=bool(getattr(model, "separate_ratio_spatial_head", False)),

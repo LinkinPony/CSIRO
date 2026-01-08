@@ -418,6 +418,45 @@ class RegressorForwardMixin:
             pred_reg3_logits = out_dict.get("reg3", None)  # type: ignore[assignment]
             if pred_reg3_logits is None:
                 raise RuntimeError("DPT head did not return reg3 logits")
+        elif head_type == "eomt":
+            # EoMT-style injected-query head (matches `third_party/eomt`):
+            # run backbone up to (depth - k) blocks, prepend queries, then run last-k blocks jointly.
+            try:
+                bb = getattr(self.feature_extractor, "backbone", None)
+                bb0 = bb
+                if bb0 is not None and (not hasattr(bb0, "blocks")):
+                    base_model = getattr(bb0, "base_model", None)
+                    if isinstance(base_model, nn.Module):
+                        cand = getattr(base_model, "model", None)
+                        if isinstance(cand, nn.Module) and hasattr(cand, "blocks"):
+                            bb0 = cand
+                        elif hasattr(base_model, "blocks"):
+                            bb0 = base_model
+                    cand2 = getattr(bb0, "model", None)
+                    if isinstance(cand2, nn.Module) and hasattr(cand2, "blocks"):
+                        bb0 = cand2
+                blocks = getattr(bb0, "blocks", None)
+                depth = len(blocks) if isinstance(blocks, (nn.ModuleList, list)) else 0
+            except Exception:
+                depth = 0
+            if depth <= 0:
+                raise RuntimeError("EoMT injected-query head requires a DINOv3 ViT backbone with `.blocks`")
+
+            k_blocks = int(getattr(self, "eomt_num_layers", 4) or 4)
+            k_blocks = int(max(0, min(k_blocks, depth)))
+            start_block = int(depth - k_blocks)
+
+            x_base, (H_p, W_p) = self.feature_extractor.forward_tokens_until_block(
+                images, block_idx=int(start_block)
+            )
+            out_dict = self.eomt_head(  # type: ignore[attr-defined]
+                x_base,
+                backbone=getattr(self.feature_extractor, "backbone"),
+                patch_hw=(int(H_p), int(W_p)),
+            )
+            pred_reg3_logits = out_dict.get("reg3", None)  # type: ignore[assignment]
+            if pred_reg3_logits is None:
+                raise RuntimeError("EoMT head did not return reg3 logits")
         else:
             # Legacy behavior:
             # When use_patch_reg3 is enabled, this corresponds to the per-patch prediction

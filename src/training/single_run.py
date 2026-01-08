@@ -439,6 +439,71 @@ def train_single_split(
             )
         ),
         vitdet_scale_factors=list(cfg["model"]["head"].get("vitdet_scale_factors", [2.0, 1.0, 0.5])),
+        # EoMT-style query pooling head (optional)
+        eomt_num_queries=int(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("num_queries", 16)
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else 16,
+        eomt_num_layers=int(
+            # Backward compatibility:
+            # - new injected-query mode uses `num_blocks` (matches `third_party/eomt`)
+            # - older configs used `num_layers` (from the previous query-decoder variant)
+            (cfg["model"]["head"].get("eomt", {}) or {}).get(
+                "num_blocks",
+                (cfg["model"]["head"].get("eomt", {}) or {}).get("num_layers", 4),
+            )
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else 4,
+        eomt_num_heads=int(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("num_heads", 8)
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else 8,
+        eomt_ffn_dim=int(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("ffn_dim", 2048)
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else 2048,
+        eomt_query_pool=str(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("query_pool", "mean")
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else "mean",
+        eomt_use_mean_query=bool(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("use_mean_query", True)
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else True,
+        eomt_use_mean_patch=bool(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("use_mean_patch", False)
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else False,
+        eomt_use_cls_token=bool(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get(
+                "use_cls_token",
+                (cfg["model"]["head"].get("eomt", {}) or {}).get("use_cls", False),
+            )
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else False,
+        eomt_proj_dim=int(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("proj_dim", 0)
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else 0,
+        eomt_proj_activation=str(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("proj_activation", "relu")
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else "relu",
+        eomt_proj_dropout=float(
+            (cfg["model"]["head"].get("eomt", {}) or {}).get("proj_dropout", 0.0)
+        )
+        if isinstance(cfg["model"]["head"].get("eomt", {}), dict)
+        else 0.0,
         fpn_dim=int(cfg["model"]["head"].get("fpn_dim", 256)),
         fpn_num_levels=int(cfg["model"]["head"].get("fpn_num_levels", 3)),
         fpn_patch_size=int(cfg["model"]["head"].get("fpn_patch_size", 16)),
@@ -554,6 +619,8 @@ def train_single_split(
         use_sam=use_sam,
         sam_rho=sam_rho,
         sam_adaptive=sam_adaptive,
+        # Gradient surgery (multi-task)
+        pcgrad_cfg=dict(cfg.get("pcgrad", {})),
         # Debug: optionally dump the final model input images (after CutMix) for sanity checks.
         input_image_mean=list(cfg.get("data", {}).get("normalization", {}).get("mean", [0.485, 0.456, 0.406])),
         input_image_std=list(cfg.get("data", {}).get("normalization", {}).get("std", [0.229, 0.224, 0.225])),

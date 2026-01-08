@@ -219,11 +219,17 @@ class PastureImageDataset(Dataset):
         # Only valid for CSIRO samples where all components are present and Dry_Total_g > 0.
         y_ratio = torch.zeros(3, dtype=torch.float32)
         ratio_mask = torch.zeros(1, dtype=torch.float32)
-        if torch.isfinite(y_5d_g[-1]) and y_5d_g[-1] > 0:
+        if (
+            torch.isfinite(y_5d_g[-1])
+            and y_5d_g[-1] > 0
+            and torch.isfinite(y_5d_g[0])
+            and torch.isfinite(y_5d_g[1])
+            and torch.isfinite(y_5d_g[2])
+        ):
             total = y_5d_g[-1]
-            clover = y_5d_g[0] if torch.isfinite(y_5d_g[0]) else 0.0
-            dead = y_5d_g[1] if torch.isfinite(y_5d_g[1]) else 0.0
-            green = y_5d_g[2] if torch.isfinite(y_5d_g[2]) else 0.0
+            clover = y_5d_g[0]
+            dead = y_5d_g[1]
+            green = y_5d_g[2]
             y_ratio[0] = clover / total
             y_ratio[1] = dead / total
             y_ratio[2] = green / total

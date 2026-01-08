@@ -55,3 +55,6 @@
 [submodule "third_party/lightly-train"]
 	path = third_party/lightly-train
 	url = https://github.com/lightly-ai/lightly-train.git
+[submodule "third_party/eomt"]
+	path = third_party/eomt
+	url = git@github.com:tue-mps/eomt.git

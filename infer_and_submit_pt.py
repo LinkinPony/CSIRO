@@ -30,10 +30,18 @@ PROJECT_DIR = "."
 #   4) Predict all test images and write `submission.csv`
 #
 # IMPORTANT:
-# - All TabPFN settings are loaded from `configs/train_tabpfn.yaml`.
-# - TabPFN foundation weights are loaded **LOCAL-ONLY** from the path specified there (`tabpfn.model_path`).
-# - No HuggingFace download / auth is attempted in this script.
-TABPFN_ENABLED = True
+# - By default, TabPFN settings are loaded from `configs/train_tabpfn.yaml`.
+# - TabPFN foundation weights are loaded **LOCAL-ONLY** (no HuggingFace download / auth).
+# - For backward compatibility / notebook convenience, you can optionally override
+#   the key TabPFN paths via the variables below.
+TABPFN_ENABLED = False
+# Optional TabPFN path overrides (take precedence over configs/train_tabpfn.yaml when set).
+# - TABPFN_PATH: TabPFN python source path (repo root or src/ root; should contain `tabpfn/`).
+# - TABPFN_WEIGHTS_CKPT_PATH: local TabPFN foundation checkpoint (.ckpt).
+# - TABPFN_TRAIN_CSV_PATH: explicit train.csv path (kept for backward-compat; may be unused in packaged fit-state mode).
+TABPFN_PATH = "third_party/TabPFN/src"  # e.g. ""
+TABPFN_WEIGHTS_CKPT_PATH = "tabpfn_weights/tabpfn-v2.5-regressor-v2.5_real.ckpt"  # e.g. ""
+TABPFN_TRAIN_CSV_PATH = "data/train.csv"  # e.g. "data/train.csv"
 
 # ===== Multi-GPU model-parallel inference (Scheme B) =====
 # When running the VERY large dinov3_vit7b16 backbone on 2x16GB GPUs (e.g., Kaggle T4),
@@ -172,12 +180,25 @@ def main() -> None:
     )
 
     if bool(TABPFN_ENABLED):
+        from dataclasses import replace  # noqa: E402
+
         from src.inference.tabpfn import TabPFNSubmissionSettings, run_tabpfn_submission  # noqa: E402
 
         # All TabPFN params are loaded from configs/train_tabpfn.yaml.
         from src.inference.tabpfn import load_tabpfn_submission_settings_from_yaml  # noqa: E402
 
         tabpfn_settings = load_tabpfn_submission_settings_from_yaml(project_dir=str(project_dir_abs))
+        # Optional user overrides (resolved relative to PROJECT_DIR when possible).
+        tabpfn_path_resolved = _resolve_under_project_dir(str(TABPFN_PATH))
+        tabpfn_ckpt_resolved = _resolve_under_project_dir(str(TABPFN_WEIGHTS_CKPT_PATH))
+        tabpfn_train_csv_resolved = _resolve_under_project_dir(str(TABPFN_TRAIN_CSV_PATH))
+        if isinstance(tabpfn_path_resolved, str) and tabpfn_path_resolved.strip():
+            tabpfn_settings = replace(tabpfn_settings, tabpfn_python_path=str(tabpfn_path_resolved))
+        if isinstance(tabpfn_ckpt_resolved, str) and tabpfn_ckpt_resolved.strip():
+            tabpfn_settings = replace(tabpfn_settings, weights_ckpt_path=str(tabpfn_ckpt_resolved))
+        if isinstance(tabpfn_train_csv_resolved, str) and tabpfn_train_csv_resolved.strip():
+            tabpfn_settings = replace(tabpfn_settings, train_csv_path=str(tabpfn_train_csv_resolved))
+
         run_tabpfn_submission(settings=settings, tabpfn=tabpfn_settings)
         return
 

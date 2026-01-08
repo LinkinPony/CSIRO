@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -135,6 +136,43 @@ def load_tabpfn_submission_settings_from_yaml(
 _TABPFN_FIT_EXT = ".tabpfn_fit"
 
 
+def _cfg_version(cfg_train_yaml: dict) -> str:
+    """
+    Best-effort extract the experiment/version string from a train.yaml-like config.
+    Used to key feature caches so they don't silently cross-contaminate versions.
+    """
+    try:
+        v = str(cfg_train_yaml.get("version", "") or "").strip()
+    except Exception:
+        v = ""
+    return v
+
+
+def _file_fingerprint(path: str) -> dict:
+    """
+    Cheap file fingerprint used for cache invalidation.
+
+    We intentionally avoid hashing file contents (can be large). `(size, mtime_ns)` is
+    enough to detect almost all updates and is extremely cheap.
+    """
+    try:
+        st = os.stat(path)
+        return {"size": int(getattr(st, "st_size", 0)), "mtime_ns": int(getattr(st, "st_mtime_ns", 0))}
+    except Exception:
+        return {"size": None, "mtime_ns": None}
+
+
+def _stable_json_sha256(obj: dict) -> str:
+    """
+    Deterministic hash for small dicts (e.g., head meta) used in cache invalidation.
+    """
+    try:
+        s = json.dumps(obj, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
+    except Exception:
+        s = str(obj)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
 class _TabPFNMultiOutputPredictor:
     """
     Lightweight multi-output predictor wrapper that avoids pickling sklearn's
@@ -196,6 +234,7 @@ def _load_tabpfn_predictor_from_fit_state(
     tabpfn: TabPFNSubmissionSettings,
     subdir: str,
     expected_targets: list[str],
+    expected_image_versions: Optional[list[str]] = None,
 ) -> _TabPFNMultiOutputPredictor:
     """
     Load a packaged multi-output TabPFN predictor from:
@@ -215,6 +254,54 @@ def _load_tabpfn_predictor_from_fit_state(
     if not isinstance(targets, list) or not targets:
         targets = list(expected_targets)
     targets = [str(t) for t in targets]
+
+    # ----------------------------------------------------------
+    # Validate fit-state compatibility with current inference settings.
+    #
+    # Inference is offline-only (no online fitting), so when the packaged fit-state
+    # does not match the current version / feature settings, the correct action is
+    # to force users to re-run `package_artifacts.py` (so caches + fit-state align).
+    # ----------------------------------------------------------
+    try:
+        # Feature mode / fusion checks (when present in meta.json)
+        fm = meta.get("feature_mode", None)
+        if isinstance(fm, str) and fm.strip():
+            if str(fm).strip().lower() != str(tabpfn.feature_mode or "").strip().lower():
+                raise RuntimeError(
+                    f"TabPFN fit-state feature_mode mismatch: meta={fm!r} vs current={tabpfn.feature_mode!r}"
+                )
+        ff = meta.get("feature_fusion", None)
+        if isinstance(ff, str) and ff.strip():
+            if str(ff).strip().lower() != str(tabpfn.feature_fusion or "").strip().lower():
+                raise RuntimeError(
+                    f"TabPFN fit-state feature_fusion mismatch: meta={ff!r} vs current={tabpfn.feature_fusion!r}"
+                )
+
+        # Version checks (new schema: image_versions list; legacy: image_version string)
+        want = [str(v).strip() for v in (expected_image_versions or []) if isinstance(v, str) and str(v).strip()]
+        have_raw = meta.get("image_versions", None)
+        have: list[str] = []
+        if isinstance(have_raw, list):
+            have = [str(x).strip() for x in have_raw if isinstance(x, (str, int, float)) and str(x).strip()]
+        else:
+            v0 = meta.get("image_version", None)
+            if isinstance(v0, (str, int, float)) and str(v0).strip():
+                have = [str(v0).strip()]
+        have = [h for h in have if h]
+
+        if want and not have:
+            raise RuntimeError(
+                "TabPFN fit-state meta.json is missing `image_versions`/`image_version`, so version compatibility cannot be verified"
+            )
+        if want and have and set(want) != set(have):
+            raise RuntimeError(
+                f"TabPFN fit-state version mismatch: fit_state={sorted(set(have))} vs current={sorted(set(want))}"
+            )
+    except Exception as e:
+        raise RuntimeError(
+            str(e)
+            + ". Please re-run `package_artifacts.py` to regenerate TabPFN artifacts (`tabpfn_fit/` and feature caches)."
+        ) from e
 
     # Determine file mapping
     files_map = meta.get("files", None)
@@ -559,10 +646,10 @@ def extract_head_penultimate_features(
 
     head_meta = dict(head_meta or {})
     head_type = str(head_meta.get("head_type", "mlp") or "mlp").strip().lower()
-    if head_type not in ("mlp", "vitdet"):
+    if head_type not in ("mlp", "vitdet", "eomt"):
         raise RuntimeError(
             f"Unsupported head_type={head_type!r} for TabPFN penultimate feature extraction. "
-            "Currently supported: mlp, vitdet."
+            "Currently supported: mlp, vitdet, eomt."
         )
 
     backbone_name = str(cfg_train_yaml.get("model", {}).get("backbone", "") or "").strip()
@@ -600,12 +687,21 @@ def extract_head_penultimate_features(
                     cached_paths = list(obj["image_paths"])
                     feats = obj["features"]
                     cached_meta = dict(obj.get("meta", {}) or {})
+                    cfg_ver = _cfg_version(cfg_train_yaml)
+                    head_fp = _file_fingerprint(str(head_pt))
+                    dino_fp = _file_fingerprint(str(dino_weights_pt_file))
+                    head_meta_sig = _stable_json_sha256(head_meta)
                     if (
                         cached_paths == list(image_paths)
                         and isinstance(feats, torch.Tensor)
                         and feats.dim() == 2
+                        and str(cached_meta.get("cfg_version", "")) == str(cfg_ver)
                         and str(cached_meta.get("head_weights_path", "")) == str(head_pt)
+                        and dict(cached_meta.get("head_weights_fingerprint", {}) or {}) == dict(head_fp)
+                        and str(cached_meta.get("head_type", "")) == str(head_type)
+                        and str(cached_meta.get("head_meta_sha256", "")) == str(head_meta_sig)
                         and str(cached_meta.get("dino_weights_pt_file", "")) == str(dino_weights_pt_file)
+                        and dict(cached_meta.get("dino_weights_fingerprint", {}) or {}) == dict(dino_fp)
                         and str(cached_meta.get("fusion", "")) == str(fusion_eff)
                         and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
                         and bool(cached_meta.get("hflip", False)) == bool(hflip)
@@ -692,14 +788,23 @@ def extract_head_penultimate_features(
                 if cache_path_eff:
                     try:
                         os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
+                        cfg_ver = _cfg_version(cfg_train_yaml)
+                        head_fp = _file_fingerprint(str(head_pt))
+                        dino_fp = _file_fingerprint(str(dino_weights_pt_file))
+                        head_meta_sig = _stable_json_sha256(head_meta)
                         torch.save(
                             {
                                 "image_paths": list(image_paths),
                                 "features": features_full.cpu(),
                                 "meta": {
+                                    "schema_version": 2,
+                                    "cfg_version": str(cfg_ver),
                                     "head_type": head_type,
                                     "head_weights_path": str(head_pt),
+                                    "head_weights_fingerprint": dict(head_fp),
+                                    "head_meta_sha256": str(head_meta_sig),
                                     "dino_weights_pt_file": str(dino_weights_pt_file),
+                                    "dino_weights_fingerprint": dict(dino_fp),
                                     "fusion": str(fusion_eff),
                                     "image_size": tuple(image_size),
                                     "hflip": bool(hflip),
@@ -786,6 +891,64 @@ def extract_head_penultimate_features(
             head_module = ViTDetMultiLayerScalarHead(vitdet_cfg, num_layers=num_layers_eff, layer_fusion=fusion_mode)
         else:
             head_module = ViTDetScalarHead(vitdet_cfg)
+    elif head_type == "eomt":
+        from src.models.eomt_injected_head import EoMTInjectedQueryHeadConfig, EoMTInjectedQueryScalarHead
+
+        # EoMT injected-query config (meta-first; fall back to train.yaml).
+        eomt_cfg = cfg_train_yaml.get("model", {}).get("head", {}).get("eomt", {})
+        if not isinstance(eomt_cfg, dict):
+            eomt_cfg = {}
+
+        eomt_num_queries = int(head_meta.get("eomt_num_queries", int(eomt_cfg.get("num_queries", 16))))
+        eomt_num_blocks = int(
+            head_meta.get(
+                "eomt_num_blocks",
+                head_meta.get(
+                    "eomt_num_layers",
+                    int(eomt_cfg.get("num_blocks", eomt_cfg.get("num_layers", 4))),
+                ),
+            )
+        )
+        eomt_query_pool = str(head_meta.get("eomt_query_pool", str(eomt_cfg.get("query_pool", "mean")))).strip().lower()
+        # New pooled feature construction (backward-compatible defaults)
+        eomt_use_mean_query = bool(head_meta.get("eomt_use_mean_query", bool(eomt_cfg.get("use_mean_query", True))))
+        eomt_use_mean_patch = bool(head_meta.get("eomt_use_mean_patch", bool(eomt_cfg.get("use_mean_patch", False))))
+        eomt_use_cls_token = bool(
+            head_meta.get("eomt_use_cls_token", bool(eomt_cfg.get("use_cls_token", eomt_cfg.get("use_cls", False))))
+        )
+        eomt_proj_dim = int(head_meta.get("eomt_proj_dim", int(eomt_cfg.get("proj_dim", 0))))
+        eomt_proj_activation = str(head_meta.get("eomt_proj_activation", str(eomt_cfg.get("proj_activation", "relu")))).strip().lower()
+        try:
+            eomt_proj_dropout = float(head_meta.get("eomt_proj_dropout", float(eomt_cfg.get("proj_dropout", 0.0))))
+        except Exception:
+            eomt_proj_dropout = float(eomt_cfg.get("proj_dropout", 0.0) or 0.0)
+        enable_ndvi = bool(head_meta.get("enable_ndvi", False))
+
+        embedding_dim = int(head_meta.get("embedding_dim", int(cfg_train_yaml.get("model", {}).get("embedding_dim", 1024))))
+        head_hidden_dims = list(head_meta.get("head_hidden_dims", []))
+        head_activation = str(head_meta.get("head_activation", "relu"))
+        head_dropout = float(head_meta.get("head_dropout", 0.0))
+
+        head_module = EoMTInjectedQueryScalarHead(
+            EoMTInjectedQueryHeadConfig(
+                embedding_dim=int(embedding_dim),
+                num_queries=int(eomt_num_queries),
+                num_blocks=int(eomt_num_blocks),
+                dropout=float(head_dropout),
+                query_pool=str(eomt_query_pool),
+                use_mean_query=bool(eomt_use_mean_query),
+                use_mean_patch=bool(eomt_use_mean_patch),
+                use_cls_token=bool(eomt_use_cls_token),
+                proj_dim=int(eomt_proj_dim),
+                proj_activation=str(eomt_proj_activation),
+                proj_dropout=float(eomt_proj_dropout),
+                head_hidden_dims=list(head_hidden_dims),
+                head_activation=str(head_activation),
+                num_outputs_main=int(head_meta.get("num_outputs_main", 1)),
+                num_outputs_ratio=int(head_meta.get("num_outputs_ratio", 0)),
+                enable_ndvi=bool(enable_ndvi),
+            )
+        )
     else:
         use_patch_reg3 = bool(head_meta.get("use_patch_reg3", False))
         use_cls_token = bool(head_meta.get("use_cls_token", True))
@@ -851,6 +1014,25 @@ def extract_head_penultimate_features(
     feature_extractor = feature_extractor.eval().to(device)
     head_module = head_module.eval().to(device)
 
+    eomt_start_block: Optional[int] = None
+    if head_type == "eomt":
+        # Precompute (depth - k) boundary so we can reuse it for all batches.
+        try:
+            # Reuse the head's own backbone unwrapping logic to match forward() behaviour.
+            bb0 = EoMTInjectedQueryScalarHead._resolve_base_backbone(feature_extractor.backbone)  # type: ignore[attr-defined]
+            blocks = getattr(bb0, "blocks", None)
+            depth = len(blocks) if isinstance(blocks, (nn.ModuleList, list)) else 0
+        except Exception:
+            depth = 0
+        if depth <= 0:
+            raise RuntimeError("EoMT injected-query feature extraction requires a DINOv3 ViT backbone with `.blocks`")
+        try:
+            k_blocks = int(getattr(head_module, "num_blocks", int(head_meta.get("eomt_num_blocks", head_meta.get("eomt_num_layers", 4)))))
+        except Exception:
+            k_blocks = int(head_meta.get("eomt_num_blocks", head_meta.get("eomt_num_layers", 4)) or 4)
+        k_blocks = int(max(0, min(k_blocks, depth)))
+        eomt_start_block = int(depth - k_blocks)
+
     def _penultimate_from_sequential(head_seq: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
         mods = list(head_seq)
         last_lin = None
@@ -910,6 +1092,21 @@ def extract_head_penultimate_features(
                     if not isinstance(z, torch.Tensor):
                         raise RuntimeError("ViTDet head did not return 'z'")
                     feats = z
+            elif head_type == "eomt":
+                if eomt_start_block is None:
+                    raise RuntimeError("Internal error: eomt_start_block not initialized")
+                x_base, (H_p, W_p) = feature_extractor.forward_tokens_until_block(  # type: ignore[attr-defined]
+                    images, block_idx=int(eomt_start_block)
+                )
+                out = head_module(  # type: ignore[call-arg]
+                    x_base,
+                    backbone=getattr(feature_extractor, "backbone"),
+                    patch_hw=(int(H_p), int(W_p)),
+                )
+                z = out.get("z", None) if isinstance(out, dict) else None
+                if not isinstance(z, torch.Tensor):
+                    raise RuntimeError("EoMT head did not return 'z'")
+                feats = z
             else:
                 use_patch_reg3 = bool(head_meta.get("use_patch_reg3", False))
                 use_cls_token = bool(head_meta.get("use_cls_token", True))
@@ -1011,14 +1208,23 @@ def extract_head_penultimate_features(
     if cache_path_eff:
         try:
             os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
+            cfg_ver = _cfg_version(cfg_train_yaml)
+            head_fp = _file_fingerprint(str(head_pt))
+            dino_fp = _file_fingerprint(str(dino_weights_pt_file))
+            head_meta_sig = _stable_json_sha256(head_meta)
             torch.save(
                 {
                     "image_paths": list(image_paths),
                     "features": features.cpu(),
                     "meta": {
+                        "schema_version": 2,
+                        "cfg_version": str(cfg_ver),
                         "head_type": head_type,
                         "head_weights_path": str(head_pt),
+                        "head_weights_fingerprint": dict(head_fp),
+                        "head_meta_sha256": str(head_meta_sig),
                         "dino_weights_pt_file": str(dino_weights_pt_file),
+                        "dino_weights_fingerprint": dict(dino_fp),
                         "fusion": str(fusion_eff),
                         "image_size": tuple(image_size),
                         "hflip": bool(hflip),
@@ -1102,6 +1308,8 @@ def extract_dinov3_cls_features(
                     cached_paths = list(obj["image_paths"])
                     feats = obj["features"]
                     cached_meta = dict(obj.get("meta", {}) or {})
+                    cfg_ver = _cfg_version(cfg_train_yaml)
+                    w_fp = _file_fingerprint(str(dino_weights_pt_file))
                     if (
                         cached_paths == list(image_paths)
                         and isinstance(feats, torch.Tensor)
@@ -1109,6 +1317,8 @@ def extract_dinov3_cls_features(
                         and str(cached_meta.get("mode", "")) == "dinov3_only"
                         and str(cached_meta.get("backbone", "")) == str(backbone_name)
                         and str(cached_meta.get("weights_path", "")) == str(dino_weights_pt_file)
+                        and dict(cached_meta.get("weights_fingerprint", {}) or {}) == dict(w_fp)
+                        and str(cached_meta.get("cfg_version", "")) == str(cfg_ver)
                         and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
                         and bool(cached_meta.get("hflip", False)) == bool(hflip)
                         and bool(cached_meta.get("vflip", False)) == bool(vflip)
@@ -1192,14 +1402,19 @@ def extract_dinov3_cls_features(
                 if cache_path_eff:
                     try:
                         os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
+                        cfg_ver = _cfg_version(cfg_train_yaml)
+                        w_fp = _file_fingerprint(str(dino_weights_pt_file))
                         torch.save(
                             {
                                 "image_paths": list(image_paths),
                                 "features": features_full.cpu(),
                                 "meta": {
+                                    "schema_version": 2,
                                     "mode": "dinov3_only",
+                                    "cfg_version": str(cfg_ver),
                                     "backbone": str(backbone_name),
                                     "weights_path": str(dino_weights_pt_file),
+                                    "weights_fingerprint": dict(w_fp),
                                     "image_size": tuple(image_size),
                                     "hflip": bool(hflip),
                                     "vflip": bool(vflip),
@@ -1261,14 +1476,19 @@ def extract_dinov3_cls_features(
     if cache_path_eff:
         try:
             os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
+            cfg_ver = _cfg_version(cfg_train_yaml)
+            w_fp = _file_fingerprint(str(dino_weights_pt_file))
             torch.save(
                 {
                     "image_paths": list(image_paths),
                     "features": features.cpu(),
                     "meta": {
+                        "schema_version": 2,
                         "mode": "dinov3_only",
+                        "cfg_version": str(cfg_ver),
                         "backbone": str(backbone_name),
                         "weights_path": str(dino_weights_pt_file),
+                        "weights_fingerprint": dict(w_fp),
                         "image_size": tuple(image_size),
                         "hflip": bool(hflip),
                         "vflip": bool(vflip),
@@ -1317,6 +1537,17 @@ def run_tabpfn_submission(
     """
     import pandas as pd
 
+    # Defensive sklearn compatibility patch:
+    # Some Kaggle environments ship a sklearn version that expects private attributes
+    # on unpickled ColumnTransformers (embedded in TabPFN fit-states). Ensure the
+    # patch is applied even if TabPFN was imported elsewhere before this call.
+    try:
+        from src.tabular.tabpfn_patches import patch_sklearn_column_transformer_unpickle_compat
+
+        patch_sklearn_column_transformer_unpickle_compat()
+    except Exception:
+        pass
+
     from src.inference.data import resolve_paths
     from src.inference.ensemble import normalize_ensemble_models
     from src.inference.pipeline import (
@@ -1350,6 +1581,7 @@ def run_tabpfn_submission(
 
     # Project config (train.yaml) for backbone + transforms
     cfg = load_config(project_dir_abs)
+    cfg_version = str(cfg.get("version", "") or "").strip()
 
     dataset_root, test_csv = resolve_paths(str(settings.input_path))
     df_test = pd.read_csv(test_csv)
@@ -1518,6 +1750,11 @@ def run_tabpfn_submission(
             tabpfn=tabpfn,
             subdir="ensemble",
             expected_targets=list(TARGETS_5D_ORDER),
+            expected_image_versions=[
+                str(mi.get("version")).strip()
+                for mi in models_eff
+                if isinstance(mi.get("version", None), str) and str(mi.get("version")).strip()
+            ],
         )
         D_ref: Optional[int] = None
 
@@ -1667,6 +1904,7 @@ def run_tabpfn_submission(
         tabpfn=tabpfn,
         subdir="single",
         expected_targets=list(TARGETS_5D_ORDER),
+        expected_image_versions=[cfg_version] if cfg_version else None,
     )
 
     print("[TABPFN] Loaded packaged fit-state (single).")

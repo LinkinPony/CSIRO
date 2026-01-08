@@ -43,6 +43,18 @@ def init_head_by_type(
     vitdet_dim: int,
     vitdet_patch_size: int,
     vitdet_scale_factors: List[float],
+    # EoMT-style query pooling config
+    eomt_num_queries: int = 16,
+    eomt_num_layers: int = 2,
+    eomt_num_heads: int = 8,
+    eomt_ffn_dim: int = 2048,
+    eomt_query_pool: str = "mean",
+    eomt_use_mean_query: bool = True,
+    eomt_use_mean_patch: bool = False,
+    eomt_use_cls_token: bool = False,
+    eomt_proj_dim: int = 0,
+    eomt_proj_activation: str = "relu",
+    eomt_proj_dropout: float = 0.0,
 ) -> int:
     """
     Initialize head-specific modules on `model` and return `bottleneck_dim`
@@ -106,6 +118,29 @@ def init_head_by_type(
             dropout=float(dropout),
         )
         init_vitdet_task_heads(model, bottleneck_dim=int(bottleneck_dim))
+        return int(bottleneck_dim)
+    if ht in ("eomt", "eomt_query", "query_pool", "qpool"):
+        from .eomt import init_eomt_head, init_eomt_task_heads
+
+        bottleneck_dim = init_eomt_head(
+            model,
+            embedding_dim=int(embedding_dim),
+            eomt_num_queries=int(eomt_num_queries),
+            eomt_num_layers=int(eomt_num_layers),
+            eomt_num_heads=int(eomt_num_heads),
+            eomt_ffn_dim=int(eomt_ffn_dim),
+            eomt_query_pool=str(eomt_query_pool),
+            eomt_use_mean_query=bool(eomt_use_mean_query),
+            eomt_use_mean_patch=bool(eomt_use_mean_patch),
+            eomt_use_cls_token=bool(eomt_use_cls_token),
+            eomt_proj_dim=int(eomt_proj_dim),
+            eomt_proj_activation=str(eomt_proj_activation),
+            eomt_proj_dropout=float(eomt_proj_dropout or 0.0),
+            hidden_dims=list(hidden_dims),
+            head_activation=str(head_activation),
+            dropout=float(dropout),
+        )
+        init_eomt_task_heads(model, bottleneck_dim=int(bottleneck_dim))
         return int(bottleneck_dim)
     raise RuntimeError(f"Unexpected head type: {ht!r}")
 
