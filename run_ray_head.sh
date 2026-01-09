@@ -24,6 +24,12 @@ RAY_METRICS_EXPORT_PORT="${RAY_METRICS_EXPORT_PORT:-18080}"
 RAY_MIN_WORKER_PORT="${RAY_MIN_WORKER_PORT:-10002}"
 RAY_MAX_WORKER_PORT="${RAY_MAX_WORKER_PORT:-10100}"
 
+# Ray writes its session state under a temp dir (defaults to /tmp/ray).
+# If this script was ever run with sudo, /tmp/ray can become root-owned and break
+# subsequent non-root runs with: PermissionError: [Errno 13] Permission denied: '/tmp/ray/session_*'
+RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray}"
+RAY_TEMP_DIR_FALLBACK="${RAY_TEMP_DIR_FALLBACK:-/tmp/ray_${USER}}"
+
 PROMETHEUS_HOST_PORT="${PROMETHEUS_HOST_PORT:-9091}"
 GRAFANA_HOST_PORT="${GRAFANA_HOST_PORT:-3000}"
 
@@ -82,15 +88,39 @@ stop_prometheus_if_running() {
   fi
 }
 
-start_prometheus() {
-  local prom_cfg="/tmp/ray/session_latest/metrics/prometheus/prometheus.yml"
-  local prom_cfg_patched="/tmp/ray/session_latest/metrics/prometheus/prometheus.patched.yml"
+ensure_ray_temp_dir() {
+  mkdir -p "${RAY_TEMP_DIR}" 2>/dev/null || true
 
-  # Pick a free port before starting Ray so Ray can generate Grafana datasource config correctly.
+  if [[ -w "${RAY_TEMP_DIR}" ]]; then
+    return 0
+  fi
+
+  echo "WARN: Ray temp dir is not writable: ${RAY_TEMP_DIR}" >&2
+  echo "  (common cause: /tmp/ray is root-owned from a previous sudo run)" >&2
+  echo "  Falling back to: ${RAY_TEMP_DIR_FALLBACK}" >&2
+
+  RAY_TEMP_DIR="${RAY_TEMP_DIR_FALLBACK}"
+  mkdir -p "${RAY_TEMP_DIR}"
+  chmod 700 "${RAY_TEMP_DIR}" 2>/dev/null || true
+
+  if [[ ! -w "${RAY_TEMP_DIR}" ]]; then
+    echo "ERROR: Ray temp dir still not writable: ${RAY_TEMP_DIR}" >&2
+    echo "  Fix: choose a writable directory, e.g. export RAY_TEMP_DIR=\$HOME/.ray_tmp" >&2
+    return 1
+  fi
+}
+
+start_prometheus() {
+  local prom_cfg="${RAY_TEMP_DIR}/session_latest/metrics/prometheus/prometheus.yml"
+  local prom_cfg_patched="${RAY_TEMP_DIR}/session_latest/metrics/prometheus/prometheus.patched.yml"
+
+  # IMPORTANT: PROMETHEUS_HOST_PORT is selected *before* starting Ray and exported via
+  # RAY_PROMETHEUS_HOST. Do NOT change the port here, otherwise Ray/Grafana will point
+  # to the wrong address. If the port is still busy, fail and ask the user to rerun.
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${PROMETHEUS_HOST_PORT}\$"; then
-    echo "Prometheus port ${PROMETHEUS_HOST_PORT} is in use; searching for a free port..."
-    PROMETHEUS_HOST_PORT="$(find_free_port 9091 9191)"
-    echo "Using Prometheus port ${PROMETHEUS_HOST_PORT}"
+    echo "ERROR: Prometheus port ${PROMETHEUS_HOST_PORT} is in use (after stopping previous Prometheus)." >&2
+    echo "  Hint: set PROMETHEUS_HOST_PORT=<free_port> and rerun ./run_ray_head.sh" >&2
+    return 1
   fi
 
   # Best-effort: find a Prometheus binary. Prefer repo-local extracted versions.
@@ -131,31 +161,74 @@ start_prometheus() {
 
   # Patch Prometheus config to inject `ray_io_cluster` label so Ray's Grafana dashboards work.
   # We write a separate file to avoid mutating Ray-managed configs.
-  python - <<PY
-import pathlib
-try:
-    import yaml
-except Exception as e:
-    raise SystemExit(f"PyYAML is required to patch prometheus config (import yaml failed): {e}")
+  PROM_CFG="${prom_cfg}" \
+  PROM_CFG_PATCHED="${prom_cfg_patched}" \
+  RAY_IO_CLUSTER_LABEL_VALUE="${RAY_IO_CLUSTER_LABEL_VALUE}" \
+  python - <<'PY'
+import json
+import os
+import re
+from pathlib import Path
 
-src = pathlib.Path("${prom_cfg}")
-dst = pathlib.Path("${prom_cfg_patched}")
-cfg = yaml.safe_load(src.read_text(encoding="utf-8"))
-if not isinstance(cfg, dict):
-    raise SystemExit("Unexpected prometheus.yml structure (expected a mapping).")
+src = Path(os.environ["PROM_CFG"])
+dst = Path(os.environ["PROM_CFG_PATCHED"])
+value = os.environ.get("RAY_IO_CLUSTER_LABEL_VALUE", "local")
 
-scrapes = cfg.get("scrape_configs") or []
-for sc in scrapes:
-    if sc.get("job_name") == "ray":
-        relabels = sc.get("relabel_configs") or []
-        # Avoid duplicates.
-        if not any(isinstance(r, dict) and r.get("target_label") == "ray_io_cluster" for r in relabels):
-            relabels.append({"target_label": "ray_io_cluster", "replacement": "${RAY_IO_CLUSTER_LABEL_VALUE}"})
-        sc["relabel_configs"] = relabels
+text = src.read_text(encoding="utf-8")
 
-cfg["scrape_configs"] = scrapes
-dst.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-print(f"Wrote patched Prometheus config: {dst} (ray_io_cluster={${RAY_IO_CLUSTER_LABEL_VALUE!r}})")
+# If the relabel already exists, keep the config unchanged.
+if re.search(r"\btarget_label:\s*ray_io_cluster\b", text):
+    dst.write_text(text, encoding="utf-8")
+    print(f"Wrote patched Prometheus config (already present): {dst} (ray_io_cluster={value!r})")
+    raise SystemExit(0)
+
+lines = text.splitlines()
+out = []
+in_ray_job = False
+job_indent = None
+inserted = False
+
+ray_job_re = re.compile(r"^(\s*)-\s*job_name:\s*['\"]?ray['\"]?\s*$")
+job_start_re = re.compile(r"^(\s*)-\s*job_name:\s*")
+
+def _emit_relabel_block(indent_spaces: int) -> list[str]:
+    indent = " " * indent_spaces
+    # Use JSON quoting to safely produce a YAML-compatible double-quoted string.
+    q = json.dumps(str(value))
+    return [
+        f"{indent}relabel_configs:",
+        f"{indent}- target_label: ray_io_cluster",
+        f"{indent}  replacement: {q}",
+    ]
+
+for line in lines:
+    m_ray = ray_job_re.match(line)
+    if m_ray:
+        in_ray_job = True
+        job_indent = len(m_ray.group(1))
+        out.append(line)
+        continue
+
+    m_job = job_start_re.match(line)
+    if in_ray_job and not inserted and m_job and len(m_job.group(1)) == (job_indent or 0):
+        # We are about to enter the next scrape_config job. Insert our relabel block
+        # at the end of the ray job (2 spaces deeper than the job list item).
+        out.extend(_emit_relabel_block((job_indent or 0) + 2))
+        inserted = True
+        in_ray_job = False
+        job_indent = None
+        out.append(line)
+        continue
+
+    out.append(line)
+
+# If the ray job was the last job in the file, append relabel block at EOF.
+if in_ray_job and not inserted:
+    out.extend(_emit_relabel_block((job_indent or 0) + 2))
+    inserted = True
+
+dst.write_text("\n".join(out) + "\n", encoding="utf-8")
+print(f"Wrote patched Prometheus config: {dst} (ray_io_cluster={value!r}, inserted={inserted})")
 PY
 
   echo "Starting Prometheus: ${prom_bin} (port=${PROMETHEUS_HOST_PORT})"
@@ -171,17 +244,29 @@ PY
 }
 
 start_grafana() {
-  # Pick a free port before starting Ray so Ray can expose the correct iframe host.
+  # IMPORTANT: GRAFANA_HOST_PORT is selected *before* starting Ray and exported via
+  # RAY_GRAFANA_HOST / RAY_GRAFANA_IFRAME_HOST. Do NOT change the port here.
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${GRAFANA_HOST_PORT}\$"; then
-    echo "Grafana port ${GRAFANA_HOST_PORT} is in use; searching for a free port..."
-    GRAFANA_HOST_PORT="$(find_free_port 3000 3099)"
-    echo "Using Grafana port ${GRAFANA_HOST_PORT}"
+    echo "ERROR: Grafana port ${GRAFANA_HOST_PORT} is in use." >&2
+    echo "  Hint: set GRAFANA_HOST_PORT=<free_port> and rerun ./run_ray_head.sh" >&2
+    return 1
   fi
 
   if ! command -v docker >/dev/null 2>&1; then
     echo "ERROR: Docker not found. Install Docker, or start Grafana manually with Ray's generated config:" >&2
-    echo "  grafana.ini: /tmp/ray/session_latest/metrics/grafana/grafana.ini" >&2
-    echo "  provisioning: /tmp/ray/session_latest/metrics/grafana/provisioning/" >&2
+    echo "  grafana.ini: ${RAY_TEMP_DIR}/session_latest/metrics/grafana/grafana.ini" >&2
+    echo "  provisioning: ${RAY_TEMP_DIR}/session_latest/metrics/grafana/provisioning/" >&2
+    return 1
+  fi
+
+  # Ensure we can actually talk to the Docker daemon (common failure: user not in docker group
+  # in the current shell session; requires re-login or `newgrp docker`).
+  if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: Docker is installed but not accessible (permission denied to /var/run/docker.sock)." >&2
+    echo "  Fix (pick one):" >&2
+    echo "    - Open a NEW shell / re-login so group membership refreshes (id -nG should include 'docker')" >&2
+    echo "    - Run: newgrp docker" >&2
+    echo "    - Or run with sudo (if configured): sudo ./run_ray_head.sh" >&2
     return 1
   fi
 
@@ -192,15 +277,18 @@ start_grafana() {
   echo "  (using host networking so Prometheus at ${RAY_PROMETHEUS_HOST} is reachable from Grafana)"
 
   # IMPORTANT:
-  # - Ray writes Grafana provisioning under /tmp/ray/session_latest/metrics/grafana/provisioning/
+  # - Ray writes Grafana provisioning under ${RAY_TEMP_DIR}/session_latest/metrics/grafana/provisioning/
   # - Grafana docker image defaults GF_PATHS_PROVISIONING to /etc/grafana/provisioning, which would
   #   ignore Ray's generated dashboards unless we override it.
   # - We use --network host so the provisioned datasource URL (127.0.0.1:<prom_port>) works.
+  # - We mount Ray's temp dir into the container at the SAME absolute path:
+  #   Ray creates session_latest as an absolute symlink (e.g. /tmp/ray_dl/session_latest -> /tmp/ray_dl/session_xxx),
+  #   so mounting to a different container path would break the symlink.
   docker run -d --name "${GRAFANA_CONTAINER_NAME}" --restart unless-stopped \
     --network host \
-    -v /tmp/ray:/tmp/ray \
-    -e GF_PATHS_CONFIG=/tmp/ray/session_latest/metrics/grafana/grafana.ini \
-    -e GF_PATHS_PROVISIONING=/tmp/ray/session_latest/metrics/grafana/provisioning \
+    -v "${RAY_TEMP_DIR}:${RAY_TEMP_DIR}" \
+    -e "GF_PATHS_CONFIG=${RAY_TEMP_DIR}/session_latest/metrics/grafana/grafana.ini" \
+    -e "GF_PATHS_PROVISIONING=${RAY_TEMP_DIR}/session_latest/metrics/grafana/provisioning" \
     -e GF_SERVER_HTTP_PORT="${GRAFANA_HOST_PORT}" \
     grafana/grafana-oss:latest >/dev/null
 }
@@ -217,6 +305,32 @@ except Exception as e:
     print("${url}", "ERR", e)
 PY
 }
+
+wait_for_http_ok() {
+  local url="$1"
+  local timeout_s="${2:-60}"
+  local t=0
+  while (( t < timeout_s )); do
+    if python - <<PY >/dev/null 2>&1
+import urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open("${url}", timeout=2) as r:
+    assert 200 <= r.status < 400
+PY
+    then
+      return 0
+    fi
+    sleep 1
+    t=$((t+1))
+  done
+  return 1
+}
+
+# --- 0) Stop previous monitoring processes (best-effort) ---
+# Stop Prometheus from a previous run so we can reuse the default port if available.
+stop_prometheus_if_running || true
+# Stop previous Grafana container (best-effort); ignore errors (e.g., no docker permission yet).
+(docker rm -f "${GRAFANA_CONTAINER_NAME}" >/dev/null 2>&1 || true)
 
 # --- 1) Choose ports + export env vars BEFORE starting Ray (required for dashboard detection) ---
 if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${PROMETHEUS_HOST_PORT}\$"; then
@@ -236,18 +350,22 @@ echo "  RAY_GRAFANA_HOST=${RAY_GRAFANA_HOST}"
 echo "  RAY_GRAFANA_IFRAME_HOST=${RAY_GRAFANA_IFRAME_HOST}"
 echo "  ray_io_cluster label=${RAY_IO_CLUSTER_LABEL_VALUE}"
 
+ensure_ray_temp_dir
+echo "  ray temp dir=${RAY_TEMP_DIR}"
+
 # --- 2) Start Ray head ---
 ray stop -f
 ray start --head \
   --node-ip-address="${HEAD_IP}" --port="${RAY_GCS_PORT}" \
+  --temp-dir="${RAY_TEMP_DIR}" \
   --dashboard-host=0.0.0.0 --dashboard-port="${RAY_DASHBOARD_PORT}" \
   --metrics-export-port="${RAY_METRICS_EXPORT_PORT}" \
   --num-gpus=1 \
   --min-worker-port="${RAY_MIN_WORKER_PORT}" --max-worker-port="${RAY_MAX_WORKER_PORT}"
 
 # --- 3) Wait for Ray to generate metrics configs ---
-wait_for_file "/tmp/ray/session_latest/metrics/prometheus/prometheus.yml" 60
-wait_for_file "/tmp/ray/session_latest/metrics/grafana/grafana.ini" 60
+wait_for_file "${RAY_TEMP_DIR}/session_latest/metrics/prometheus/prometheus.yml" 60
+wait_for_file "${RAY_TEMP_DIR}/session_latest/metrics/grafana/grafana.ini" 60
 
 # --- 4) Start Prometheus + Grafana ---
 start_prometheus
@@ -260,6 +378,10 @@ echo "  Prometheus    : http://${HEAD_IP}:${PROMETHEUS_HOST_PORT}"
 echo "  Grafana       : http://${HEAD_IP}:${GRAFANA_HOST_PORT}"
 echo ""
 echo "Healthchecks:"
+wait_for_http_ok "${RAY_PROMETHEUS_HOST}/-/healthy" 30 || true
+wait_for_http_ok "${RAY_GRAFANA_HOST}/api/health" 60 || true
+wait_for_http_ok "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/prometheus_health" 30 || true
+wait_for_http_ok "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/grafana_health" 60 || true
 healthcheck_http "${RAY_PROMETHEUS_HOST}/-/healthy"
 healthcheck_http "${RAY_GRAFANA_HOST}/api/health"
 healthcheck_http "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/prometheus_health"
