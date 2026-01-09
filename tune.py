@@ -62,14 +62,20 @@ def _build_search_space(spec: dict) -> dict:
 
 def _try_extract_final_metrics(
     log_dir: Path,
-) -> tuple[Optional[int], Optional[float], Optional[float]]:
+) -> tuple[Optional[int], dict[str, float]]:
     """
-    Best-effort: read Lightning CSVLogger metrics.csv under log_dir and return (val_loss, val_r2).
+    Best-effort: read Lightning CSVLogger metrics.csv under log_dir and return:
+      - epoch_end (1-based epochs completed)
+      - a dict of final validation metrics (keys match Lightning log names)
+
+    NOTE: Lightning's CSVLogger writes multiple rows per epoch (e.g., one with val_* fields
+    and another with train_* fields). We therefore select the last row where `val_loss`
+    is present, rather than naïvely taking the last row for an epoch.
     """
     try:
         import pandas as pd
     except Exception:
-        return None, None, None
+        return None, {}
 
     try:
         candidates: list[Path] = []
@@ -78,21 +84,37 @@ def _try_extract_final_metrics(
                 if name == "metrics.csv":
                     candidates.append(Path(root) / name)
         if not candidates:
-            return None, None, None
+            return None, {}
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         metrics_csv = candidates[0]
 
         df = pd.read_csv(str(metrics_csv))
         if "epoch" not in df.columns:
-            return None, None, None
-        gb = df.groupby("epoch").tail(1).reset_index(drop=True)
-        last = gb.iloc[-1]
+            return None, {}
+
+        # Keep only rows with a numeric epoch.
+        df = df[df["epoch"].notna()].reset_index(drop=True)
+        if len(df) < 1:
+            return None, {}
+
+        # Prefer the last row that actually has validation metrics.
+        if "val_loss" in df.columns:
+            df_val = df[df["val_loss"].notna()].reset_index(drop=True)
+        else:
+            df_val = df
+        if len(df_val) < 1:
+            df_val = df
+        last = df_val.iloc[-1]
 
         def pick(cols: list[str]) -> Optional[float]:
             for c in cols:
-                if c in gb.columns and last[c] is not None and str(last[c]) != "":
+                if c in df_val.columns and last[c] is not None and str(last[c]) != "":
                     try:
-                        return float(last[c])
+                        v = float(last[c])
+                        # Drop NaN/inf values (treat as missing).
+                        if v != v or v in (float("inf"), float("-inf")):
+                            continue
+                        return v
                     except Exception:
                         continue
             return None
@@ -105,11 +127,41 @@ def _try_extract_final_metrics(
         except Exception:
             epoch_end = None
 
-        val_loss = pick(["val_loss", "val_loss/dataloader_idx_0"])
-        val_r2 = pick(["val_r2", "val_r2/dataloader_idx_0"])
-        return epoch_end, val_loss, val_r2
+        metrics: dict[str, float] = {}
+        # Core metrics
+        v = pick(["val_loss", "val_loss/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_loss"] = v
+        v = pick(["val_r2", "val_r2/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_r2"] = v
+        v = pick(["val_r2_global", "val_r2_global/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_r2_global"] = v
+
+        # Common sub-losses useful for HPO
+        v = pick(["val_loss_reg3_mse", "val_loss_reg3_mse/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_loss_reg3_mse"] = v
+        v = pick(["val_loss_5d_weighted", "val_loss_5d_weighted/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_loss_5d_weighted"] = v
+        v = pick(["val_loss_ratio_mse", "val_loss_ratio_mse/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_loss_ratio_mse"] = v
+        v = pick(["val_loss_height", "val_loss_height/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_loss_height"] = v
+        v = pick(["val_loss_ndvi", "val_loss_ndvi/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_loss_ndvi"] = v
+        v = pick(["val_loss_state", "val_loss_state/dataloader_idx_0"])
+        if v is not None:
+            metrics["val_loss_state"] = v
+
+        return epoch_end, metrics
     except Exception:
-        return None, None, None
+        return None, {}
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="tune")
@@ -210,8 +262,8 @@ def main(cfg: DictConfig) -> None:
 
         from src.callbacks.ray_tune_report import RayTuneReportCallback
 
-        val_losses: list[float] = []
-        val_r2s: list[float] = []
+        # Aggregate final metrics across seeds (when multi-seed is enabled).
+        metrics_by_name: dict[str, list[float]] = {}
         epoch_ends: list[int] = []
 
         for si, seed in enumerate(seeds):
@@ -235,34 +287,42 @@ def main(cfg: DictConfig) -> None:
             )
 
             # Extract final metrics for aggregation; only emit per-seed reports when epoch reporting is disabled.
-            epoch_end, vloss, vr2 = _try_extract_final_metrics(log_dir)
+            epoch_end, final_metrics = _try_extract_final_metrics(log_dir)
             if epoch_end is not None:
                 epoch_ends.append(int(epoch_end))
-            if vloss is not None:
-                val_losses.append(float(vloss))
-            if vr2 is not None:
-                val_r2s.append(float(vr2))
+            for k, v in (final_metrics or {}).items():
+                try:
+                    metrics_by_name.setdefault(str(k), []).append(float(v))
+                except Exception:
+                    continue
 
-            if not enable_epoch_reporting and (epoch_end is not None) and (vloss is not None or vr2 is not None):
+            if not enable_epoch_reporting and (epoch_end is not None) and final_metrics:
                 per_seed_payload: dict[str, Any] = {"epoch": int(epoch_end), "seed": int(seed)}
-                if vloss is not None:
-                    per_seed_payload[f"val_loss_seed{si}"] = float(vloss)
-                if vr2 is not None:
-                    per_seed_payload[f"val_r2_seed{si}"] = float(vr2)
+                # Keep historical per-seed keys for the most common metrics.
+                if "val_loss" in final_metrics:
+                    per_seed_payload[f"val_loss_seed{si}"] = float(final_metrics["val_loss"])
+                if "val_r2" in final_metrics:
+                    per_seed_payload[f"val_r2_seed{si}"] = float(final_metrics["val_r2"])
+                if "val_r2_global" in final_metrics:
+                    per_seed_payload[f"val_r2_global_seed{si}"] = float(final_metrics["val_r2_global"])
                 session.report(per_seed_payload)
 
-        # Final aggregated report (the metric optimized by Tune is `val_loss`).
+        # Final aggregated report (the metric optimized by Tune is `metric` from the Tune config).
         max_epochs = int(cfg_trial.get("trainer", {}).get("max_epochs", 0) or 0)
         # Keep epoch 1-based for consistency with per-epoch reports.
         epoch_final = int(max(epoch_ends) if epoch_ends else max(0, max_epochs))
         payload: dict[str, Any] = {"epoch": int(epoch_final)}
-        if val_losses:
-            payload["val_loss"] = float(sum(val_losses) / len(val_losses))
-        if val_r2s:
-            payload["val_r2"] = float(sum(val_r2s) / len(val_r2s))
+        for k, vs in (metrics_by_name or {}).items():
+            if not vs:
+                continue
+            try:
+                payload[str(k)] = float(sum(vs) / len(vs))
+            except Exception:
+                continue
         if len(seeds) > 1:
             payload["num_seeds"] = int(len(seeds))
-        if "val_loss" in payload or "val_r2" in payload:
+        # Only report if we have at least one scalar metric in addition to epoch.
+        if len(payload) > 1:
             session.report(payload)
 
     trainable_wrapped = tune.with_resources(trainable, resources=resources_per_trial)

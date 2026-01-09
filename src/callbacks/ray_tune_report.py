@@ -57,8 +57,20 @@ class RayTuneReportCallback(Callback):
 
         metrics = dict(getattr(trainer, "callback_metrics", {}) or {})
 
+        # Core Tune metrics
         val_loss = _pick_metric(metrics, ["val_loss", "val_loss/dataloader_idx_0"])
         val_r2 = _pick_metric(metrics, ["val_r2", "val_r2/dataloader_idx_0"])
+
+        # Extra metrics for more flexible HPO (optional in config).
+        val_r2_global = _pick_metric(metrics, ["val_r2_global", "val_r2_global/dataloader_idx_0"])
+        val_loss_reg3_mse = _pick_metric(metrics, ["val_loss_reg3_mse", "val_loss_reg3_mse/dataloader_idx_0"])
+        val_loss_5d_weighted = _pick_metric(
+            metrics, ["val_loss_5d_weighted", "val_loss_5d_weighted/dataloader_idx_0"]
+        )
+        val_loss_ratio_mse = _pick_metric(metrics, ["val_loss_ratio_mse", "val_loss_ratio_mse/dataloader_idx_0"])
+        val_loss_height = _pick_metric(metrics, ["val_loss_height", "val_loss_height/dataloader_idx_0"])
+        val_loss_ndvi = _pick_metric(metrics, ["val_loss_ndvi", "val_loss_ndvi/dataloader_idx_0"])
+        val_loss_state = _pick_metric(metrics, ["val_loss_state", "val_loss_state/dataloader_idx_0"])
 
         # IMPORTANT: report epoch as 1-based "epochs completed" so Ray ASHA grace_period
         # semantics match user expectations (e.g., grace_period=15 => run at least 15 epochs).
@@ -67,6 +79,20 @@ class RayTuneReportCallback(Callback):
             payload["val_loss"] = float(val_loss)
         if val_r2 is not None:
             payload["val_r2"] = float(val_r2)
+        if val_r2_global is not None:
+            payload["val_r2_global"] = float(val_r2_global)
+        if val_loss_reg3_mse is not None:
+            payload["val_loss_reg3_mse"] = float(val_loss_reg3_mse)
+        if val_loss_5d_weighted is not None:
+            payload["val_loss_5d_weighted"] = float(val_loss_5d_weighted)
+        if val_loss_ratio_mse is not None:
+            payload["val_loss_ratio_mse"] = float(val_loss_ratio_mse)
+        if val_loss_height is not None:
+            payload["val_loss_height"] = float(val_loss_height)
+        if val_loss_ndvi is not None:
+            payload["val_loss_ndvi"] = float(val_loss_ndvi)
+        if val_loss_state is not None:
+            payload["val_loss_state"] = float(val_loss_state)
 
         if len(payload) > 1:
             session.report(payload)

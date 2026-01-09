@@ -47,7 +47,7 @@ ray:
   address: auto
 
 tune:
-  name: tune-v3
+  name: tune-v5
   # Resume an existing run (restore from storage) instead of starting a new one.
   # IMPORTANT: restoring assumes the experiment directory (including checkpoints/state)
   # is still present under shared storage. For NFS, this is typically:
@@ -64,7 +64,7 @@ tune:
   restart_errored: false
   # Where Ray Tune stores experiment results (relative paths resolved under repo root).
   storage_path: ray_results
-  metric: val_loss
+  metric: val_loss_5d_weighted
   mode: min
   num_samples: 20
   max_concurrent_trials: 2
@@ -87,12 +87,13 @@ tune:
   search_space:
     peft.last_k_blocks:
       type: choice
-      values: [4, 6, 8, 12]
+      values: [2, 4, 6, 8, 12]
     peft.target_modules:
       type: choice
       values:
         - [qkv, proj]
         - [qkv, proj, w1, w2, w3]
+        - [qkv]
     peft.lora_lr:
       type: loguniform
       lower: 1.0e-5
@@ -100,7 +101,7 @@ tune:
     optimizer.lr:
       type: loguniform
       lower: 1.0e-5
-      upper: 3.0e-3
+      upper: 3.0e-2
     optimizer.weight_decay:
       type: loguniform
       lower: 1.0e-6
@@ -108,7 +109,7 @@ tune:
     model.head.dropout:
       type: uniform
       lower: 0.0
-      upper: 0.4
+      upper: 0.5
     model.head.hidden_dims:
       type: choice
       values:
