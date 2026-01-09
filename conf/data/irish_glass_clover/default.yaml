@@ -1,0 +1,16 @@
+# @package irish_glass_clover
+
+enabled: true
+# When true, use Irish Glass Clover samples to supervise the biomass ratio head
+# (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) derived from dry_total_g_cm2 / dry_clover_g_cm2.
+supervise_ratio: true
+# Root directory containing data.csv and images/ for the Irish Glass Clover dataset
+root: data/irish_glass_clover
+csv: data.csv
+image_dir: images
+# Separate image size for this dataset in YAML is [W, H] (width, height); code parses it to (H, W).
+# Augmentation config is reused from `data.augment`.
+# You can adjust this to match the native resolution of the Irish images.
+image_size: [800, 800]
+
+

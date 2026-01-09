@@ -1,0 +1,18 @@
+# @package peft
+
+enabled: false
+method: lora
+use_dora: true
+r: 4
+lora_alpha: 4
+lora_dropout: 0.05
+init: true
+last_k_blocks: 0
+layers_pattern: blocks
+target_modules: [qkv, proj, w1, w2, w3]
+lora_lr: 0.0005
+lora_weight_decay: 0.0
+lora_llrd: 1.0
+lora_group_size: 1
+
+

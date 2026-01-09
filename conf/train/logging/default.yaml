@@ -1,0 +1,7 @@
+# @package logging
+
+log_dir: outputs
+ckpt_dir: outputs/checkpoints
+use_loguru: true
+
+

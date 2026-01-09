@@ -1,0 +1,95 @@
+defaults:
+  # Load the same training defaults at the global root and apply Tune-specific overrides below.
+  - experiment@_global_: baseline
+  # Enable LoRA for HPO runs (the baseline experiment keeps it disabled by default).
+  - override /train/peft: lora
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
+
+# Baseline overrides for hyperparameter search (kept intentionally lightweight).
+# You can override any of these from CLI, e.g.:
+#   python tune.py trainer.max_epochs=10 tune.num_samples=50
+#
+# HPO should run a single split by default (fast). After selecting best config,
+# rerun `train_hydra.py` with kfold/train_all enabled for the final model.
+#
+# NOTE on epoch budget:
+# - We do NOT tune `trainer.max_epochs` as a hyperparameter in the same Tune run.
+# - Treat it as a *budget knob* and run separate sweeps, e.g.:
+#     python tune.py trainer.max_epochs=15 tune.scheduler.max_epochs=15
+#     python tune.py trainer.max_epochs=30 tune.scheduler.max_epochs=30
+kfold:
+  enabled: false
+  folds: null
+train_all:
+  enabled: false
+trainer:
+  # Trial budget: start with something modest + ASHA early stopping.
+  max_epochs: 45
+  limit_train_batches: 300
+  log_every_n_steps: 10
+  checkpoint:
+    every_n_epochs: 1
+data:
+  # Reduce loader contention when running multiple trials across the 2 machines.
+  num_workers: 8
+  prefetch_factor: 2
+
+ray:
+  # For a Ray cluster started via `ray start ...`, use `auto`.
+  # For Ray Client, use: "ray://<head_ip>:10001"
+  address: auto
+
+tune:
+  name: tune-csiro
+  # Where Ray Tune stores experiment results (relative paths resolved under repo root).
+  storage_path: ray_results
+  metric: val_loss
+  mode: min
+  num_samples: 20
+  max_concurrent_trials: 2
+  resources_per_trial:
+    cpu: 8
+    gpu: 1
+  scheduler:
+    type: asha
+    max_epochs: ${trainer.max_epochs}
+    grace_period: 3
+    reduction_factor: 2
+  # Multi-seed is supported, but for ASHA-based HPO it is recommended to keep a single seed.
+  # After HPO, re-run best config with multiple seeds for robustness.
+  seeds: [42]
+  # When true (and seeds has length 1), report per epoch to enable ASHA early stopping.
+  report_per_epoch: true
+  # Search space spec. Keys are dotted paths into the training config.
+  search_space:
+    peft.lora_lr:
+      type: loguniform
+      lower: 1.0e-5
+      upper: 3.0e-3
+    optimizer.lr:
+      type: loguniform
+      lower: 1.0e-5
+      upper: 3.0e-3
+    optimizer.weight_decay:
+      type: loguniform
+      lower: 1.0e-6
+      upper: 1.0e-1
+    model.head.dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.4
+    model.head.hidden_dims:
+      type: choice
+      values:
+        - [640]
+        - [320]
+        - [1280]
+
+

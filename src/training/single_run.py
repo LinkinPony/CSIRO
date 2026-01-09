@@ -294,6 +294,7 @@ def train_single_split(
     train_all_mode: bool = False,
     num_species_classes: Optional[int] = None,
     num_state_classes: Optional[int] = None,
+    extra_callbacks: Optional[list] = None,
 ) -> None:
     """
     Train a single model on a given train/val split.
@@ -680,6 +681,12 @@ def train_single_split(
     callbacks.append(checkpoint_cb)
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
     callbacks.append(HeadCheckpoint(output_dir=str(head_ckpt_dir)))
+    if extra_callbacks:
+        try:
+            callbacks.extend(list(extra_callbacks))
+        except Exception:
+            # Best-effort; avoid failing training due to callback injection issues.
+            pass
 
     # Optional SWA to stabilize small-batch updates
     swa_cfg = cfg.get("trainer", {}).get("swa", {})

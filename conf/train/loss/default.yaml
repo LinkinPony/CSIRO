@@ -1,0 +1,8 @@
+# @package loss
+
+weighting: uw
+use_ratio_head: true
+use_5d_weighted_mse: true
+mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
+
+

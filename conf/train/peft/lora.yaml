@@ -1,0 +1,27 @@
+# @package peft
+#
+# LoRA enabled preset (DINOv3 backbone remains frozen; only LoRA adapters are trainable).
+#
+# Notes:
+# - `last_k_blocks`: how many *last* transformer blocks receive LoRA. 0 means "all blocks"
+#   (slow/heavy). Prefer a finite K for faster hyperparameter search.
+enabled: true
+method: lora
+use_dora: true
+r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+# PEFT's built-in init flag. This repo also has an (optional) EVA init helper,
+# but it is not required for normal training.
+init: true
+last_k_blocks: 8
+layers_pattern: blocks
+target_modules: [qkv, proj]
+lora_lr: 0.0005
+lora_weight_decay: 0.0
+# Layer-wise LR decay for LoRA params. 1.0 disables (single LR for all LoRA params).
+lora_llrd: 1.0
+# Optional: group N blocks into one optimizer group to reduce the number of LR curves logged.
+lora_group_size: 1
+
+

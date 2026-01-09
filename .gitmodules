@@ -58,3 +58,6 @@
 [submodule "third_party/eomt"]
 	path = third_party/eomt
 	url = git@github.com:tue-mps/eomt.git
+[submodule "third_party/ray"]
+	path = third_party/ray
+	url = git@github.com:ray-project/ray.git

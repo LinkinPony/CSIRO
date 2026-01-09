@@ -1,0 +1,31 @@
+defaults:
+  # --- Data ---
+  - /data: csiro
+  - /data/augment: legacy
+  - /data/normalization: imagenet
+  - /data/ndvi_dense: default
+  - /data/irish_glass_clover: default
+
+  # --- Model ---
+  - /model/backbone: dinov3_vith16plus
+  - /model/head: mlp
+  - /model/backbone_layers: multi
+
+  # --- Training ---
+  - /train/mtl: default
+  - /train/train_all: enabled
+  - /train/peft: disabled
+  - /train/loss: default
+  - /train/optimizer: adamw
+  - /train/pcgrad: primary_anchored
+  - /train/scheduler: cosine
+  - /train/kfold: default
+  - /train/trainer: default
+  - /train/logging: default
+
+  - _self_
+
+seed: 42
+version: mlp-v2-pcgrad-irish-no-peft
+
+

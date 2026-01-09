@@ -9,3 +9,7 @@ numpy>=1.24.0
 matplotlib>=3.7.0
 tensorboard>=2.13.0
 peft
+hydra-core>=1.3.2
+ray[tune]>=2.6.0
+ray[tune]
+hydra-core

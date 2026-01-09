@@ -1,0 +1,25 @@
+# @package model.head
+
+type: mlp
+
+# MLP settings
+hidden_dims: [320]
+activation: relu
+dropout: 0.2
+use_output_softplus: true
+
+# Global feature vector settings
+use_cls_token: false
+
+# Patch-mode reg3 (optional)
+use_patch_reg3: false
+
+# Dual-branch fusion (optional, for patch-mode)
+dual_branch:
+  enabled: false
+  alpha_init: 0.2
+
+# Biomass ratio head coupling mode
+ratio_head_mode: separate_mlp
+
+

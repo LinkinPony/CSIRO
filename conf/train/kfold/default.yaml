@@ -1,0 +1,8 @@
+# @package kfold
+
+enabled: true
+k: 5
+even_split: false
+folds: null
+
+

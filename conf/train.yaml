@@ -1,0 +1,15 @@
+defaults:
+  # Compose the training config from modular groups, but merge it at the global root.
+  - experiment@_global_: baseline
+  - _self_
+
+# Keep the working directory unchanged (important for relative paths such as `data/`).
+hydra:
+  job:
+    chdir: false
+  # Disable Hydra's own output subdir; we manage outputs via `logging.*` + `version`.
+  output_subdir: null
+  run:
+    dir: .
+
+

@@ -1,0 +1,7 @@
+# @package scheduler
+
+name: cosine
+warmup_epochs: 0
+warmup_start_factor: 0.1
+
+

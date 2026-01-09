@@ -1,0 +1,13 @@
+# @package mtl
+
+enabled: true
+tasks:
+  height: true
+  ndvi: true
+  ndvi_dense: false
+  species: false
+  state: true
+sample_ratio:
+  ndvi_dense: 0.0
+
+

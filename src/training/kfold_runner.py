@@ -14,6 +14,55 @@ from src.training.single_run import (
     train_single_split,
 )
 
+def _parse_selected_folds(kfold_cfg: Dict, *, num_folds: int) -> List[int]:
+    """
+    Parse optional fold selection from config.
+
+    Supported forms (kfold.folds):
+      - null / missing: run all folds
+      - int: single fold
+      - list/tuple/set of ints
+      - string: "0,2,4" (commas/spaces)
+    """
+    raw = None
+    try:
+        raw = kfold_cfg.get("folds", None)
+    except Exception:
+        raw = None
+
+    if raw is None:
+        return list(range(int(num_folds)))
+
+    folds: List[int] = []
+    if isinstance(raw, int):
+        folds = [int(raw)]
+    elif isinstance(raw, (list, tuple, set)):
+        folds = [int(x) for x in list(raw)]
+    elif isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("", "none", "null", "all"):
+            return list(range(int(num_folds)))
+        parts = [p for p in s.replace(",", " ").split() if p]
+        folds = [int(p) for p in parts]
+    else:
+        raise ValueError(
+            f"Unsupported kfold.folds type: {type(raw)} (value={raw!r}). "
+            "Use null, int, list of ints, or a comma-separated string."
+        )
+
+    if not folds:
+        raise ValueError("kfold.folds is empty. Use null to run all folds.")
+
+    # Validate, de-duplicate, and sort for stable behaviour.
+    bad = [f for f in folds if (f < 0 or f >= int(num_folds))]
+    if bad:
+        raise ValueError(
+            f"Invalid fold indices in kfold.folds={folds}. "
+            f"Valid range is [0, {int(num_folds) - 1}]. Bad: {bad}"
+        )
+    folds = sorted(set(int(f) for f in folds))
+    return folds
+
 
 def _find_latest_metrics_csv(log_dir: Path) -> Optional[Path]:
     """
@@ -72,7 +121,13 @@ def _extract_final_metrics(metrics_csv: Path) -> Dict[str, float]:
     return out
 
 
-def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
+def run_kfold(
+    cfg: Dict,
+    log_dir: Path,
+    ckpt_dir: Path,
+    *,
+    extra_callbacks: Optional[list] = None,
+) -> None:
     # Build once to get the full dataframe and other settings used for splitting.
     area_m2 = resolve_dataset_area_m2(cfg)
 
@@ -153,6 +208,15 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
     splits = build_kfold_splits(full_df, cfg)
     num_folds = int(len(splits))
 
+    # Optional fold selection for quick validation runs.
+    fold_indices = _parse_selected_folds(cfg.get("kfold", {}) or {}, num_folds=num_folds)
+    if len(fold_indices) != num_folds:
+        logger.info(
+            "k-fold: running a subset of folds for quick validation: {} (out of k={})",
+            fold_indices,
+            num_folds,
+        )
+
     # Export fold splits
     splits_root = log_dir / "folds"
     splits_root.mkdir(parents=True, exist_ok=True)
@@ -173,7 +237,7 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
 
     fold_summaries: List[Dict[str, float]] = []
 
-    for fold_idx in range(num_folds):
+    for fold_idx in fold_indices:
         train_idx, val_idx = splits[fold_idx]
 
         train_df = full_df.iloc[train_idx].reset_index(drop=True)
@@ -207,6 +271,7 @@ def run_kfold(cfg: Dict, log_dir: Path, ckpt_dir: Path) -> None:
             train_all_mode=False,
             num_species_classes=num_species_classes,
             num_state_classes=num_state_classes,
+            extra_callbacks=extra_callbacks,
         )
 
         # After training this fold, try to extract its final validation metrics.

@@ -1,0 +1,26 @@
+# @package trainer
+
+max_epochs: 30
+accelerator: auto
+devices: 1
+precision: 16-mixed
+limit_train_batches: 900
+limit_val_batches: 1
+log_every_n_steps: 1
+checkpoint:
+  every_n_epochs: 1
+resume_from: null
+accumulate_grad_batches: 8
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm
+swa:
+  enabled: true
+  swa_lrs: 0.0001
+  auto_lrs: true
+  freeze_lora: false
+  freeze_lora_lr: 0.0
+  swa_epoch_start: 0.8
+  annealing_epochs: 5
+  annealing_strategy: cos
+
+

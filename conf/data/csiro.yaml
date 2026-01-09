@@ -1,0 +1,32 @@
+root: data
+train_csv: train.csv
+# Optional: include offline-generated AIGC augmented images (Nano Banana Pro) during training.
+# The augmentation tool writes images + a manifest under `data/nano_banana_pro/train/` by default.
+aigc_aug:
+  enabled: false
+  # Directory UNDER `data.root` that contains generated images + manifest.
+  # Recommended: "nano_banana_pro/train" (so full path is data/nano_banana_pro/train).
+  subdir: nano_banana_pro/train
+  # Manifest filename (written by tools/nano_banana_pro/augment_train.py)
+  manifest: manifest.csv
+  # Optional subset of augmentation type names to use. null/[] => use all success rows.
+  types: null
+# Dataset selection and per-dataset physical area (meters)
+dataset: csiro
+datasets:
+  csiro:
+    width_m: 0.7
+    length_m: 0.3
+# NOTE: `image_size` in this YAML is [W, H] (width, height). The code parses it to (H, W)
+# for torchvision transforms (Resize/RandomResizedCrop), which expect (H, W).
+image_size: [960, 480]
+batch_size: 1
+val_batch_size: 1
+num_workers: 20
+prefetch_factor: 4
+val_split: 0.1
+shuffle: true
+# Primary regression targets for the main head.
+# In the new design we predict only Dry_Total_g directly and recover
+# the remaining components via a separate ratio head.
+target_order: [Dry_Total_g]

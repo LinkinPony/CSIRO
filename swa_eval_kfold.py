@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -51,7 +51,66 @@ def parse_args() -> argparse.Namespace:
         default="kfold_swa_metrics.json",
         help="Filename for the metrics JSON written under outputs/<version>/",
     )
+    p.add_argument(
+        "--folds",
+        type=str,
+        default=None,
+        help=(
+            "Optional fold indices to evaluate (0-based), e.g. '2' or '0,2,4'. "
+            "Overrides config kfold.folds when provided."
+        ),
+    )
     return p.parse_args()
+
+def _parse_selected_folds(
+    *,
+    kfold_cfg: Dict[str, Any],
+    num_folds: int,
+    override: Optional[Union[str, int, List[int]]] = None,
+) -> List[int]:
+    """
+    Parse fold selection for evaluation.
+
+    Source priority:
+      1) `override` (e.g. CLI --folds)
+      2) cfg.kfold.folds
+      3) all folds [0..k-1]
+    """
+    raw: Any
+    if override is not None:
+        raw = override
+    else:
+        raw = kfold_cfg.get("folds", None)
+
+    if raw is None:
+        return list(range(int(num_folds)))
+
+    folds: List[int] = []
+    if isinstance(raw, int):
+        folds = [int(raw)]
+    elif isinstance(raw, (list, tuple, set)):
+        folds = [int(x) for x in list(raw)]
+    elif isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("", "none", "null", "all"):
+            return list(range(int(num_folds)))
+        parts = [p for p in s.replace(",", " ").split() if p]
+        folds = [int(p) for p in parts]
+    else:
+        raise ValueError(
+            f"Unsupported fold selection type: {type(raw)} (value={raw!r}). "
+            "Use null, int, list of ints, or a comma-separated string."
+        )
+
+    if not folds:
+        raise ValueError("Fold selection is empty. Use null/all to evaluate all folds.")
+
+    bad = [f for f in folds if (f < 0 or f >= int(num_folds))]
+    if bad:
+        raise ValueError(
+            f"Invalid fold indices {bad}. Valid range is [0, {int(num_folds) - 1}]."
+        )
+    return sorted(set(int(f) for f in folds))
 
 
 def _select_device(device_arg: str) -> torch.device:
@@ -129,6 +188,7 @@ def run_swa_eval_for_kfold_cfg(
     *,
     device: str = "auto",
     output_name: str = "kfold_swa_metrics.json",
+    folds: Optional[Union[str, int, List[int]]] = None,
 ) -> None:
     """
     Run SWA-based k-fold validation evaluation for an in-memory training config.
@@ -142,6 +202,7 @@ def run_swa_eval_for_kfold_cfg(
 
     kfold_cfg = cfg.get("kfold", {})
     k = int(kfold_cfg.get("k", 5))
+    fold_indices = _parse_selected_folds(kfold_cfg=kfold_cfg or {}, num_folds=k, override=folds)
 
     fold_splits_root = log_dir / "folds"
     if not fold_splits_root.is_dir():
@@ -150,7 +211,10 @@ def run_swa_eval_for_kfold_cfg(
             "Ensure k-fold training has completed."
         )
 
-    print(f"[SWA-EVAL] Using log_dir={log_dir}  ckpt_dir={ckpt_dir}  k={k}")
+    print(
+        f"[SWA-EVAL] Using log_dir={log_dir}  ckpt_dir={ckpt_dir}  "
+        f"k={k}  folds={fold_indices}"
+    )
 
     # Build full dataframe once to provide global targets for R^2 baseline.
     full_df = _build_full_dataframe(cfg)
@@ -168,7 +232,7 @@ def run_swa_eval_for_kfold_cfg(
 
     per_fold_metrics: List[Dict[str, Any]] = []
 
-    for fold_idx in range(k):
+    for fold_idx in fold_indices:
         fold_ckpt_dir = ckpt_dir / f"fold_{fold_idx}"
         if not fold_ckpt_dir.is_dir():
             print(
@@ -378,6 +442,7 @@ def main() -> None:
         cfg,
         device=args.device,
         output_name=args.output_name,
+        folds=args.folds,
     )
 
 

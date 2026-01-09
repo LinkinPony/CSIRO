@@ -7,9 +7,20 @@ from loguru import logger
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 
 
+_LOGURU_FILE_SINK_ID = None
+
+
 def init_logging(log_dir: Path, use_loguru: bool = True) -> None:
     if use_loguru:
-        logger.add(log_dir / "train.log", rotation="10 MB", retention="7 days")
+        global _LOGURU_FILE_SINK_ID
+        try:
+            if _LOGURU_FILE_SINK_ID is not None:
+                logger.remove(_LOGURU_FILE_SINK_ID)
+        except Exception:
+            pass
+        _LOGURU_FILE_SINK_ID = logger.add(
+            log_dir / "train.log", rotation="10 MB", retention="7 days"
+        )
 
 
 def create_lightning_loggers(log_dir: Path) -> Tuple[CSVLogger, TensorBoardLogger]:

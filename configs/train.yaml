@@ -1,5 +1,5 @@
 seed: 42
-version: mlp-pcgrad
+version: mlp-v2-pcgrad-no-irish-no-peft
 data:
   root: data
   train_csv: train.csv
@@ -359,7 +359,7 @@ model:
       proj_dim: 640
       proj_activation: relu
       proj_dropout: 0.2
-    hidden_dims: [1280]
+    hidden_dims: [320]
     activation: relu
     dropout: 0.2
     use_output_softplus: true
@@ -371,7 +371,7 @@ model:
     # This flag affects the legacy/global path (use_patch_reg3: false) in both
     # single-layer and multi-layer training/inference. Patch-mode reg3 uses patch
     # tokens directly and is therefore unaffected.
-    use_cls_token: true
+    use_cls_token: false
     # When enabled, use a patch-based main regression path:
     #   - For each patch token, apply the shared MLP head (CLS concatenated with patch token),
     #   - Average per-patch predictions to obtain the image-level output.
@@ -392,7 +392,7 @@ model:
     # - separate_spatial : ratio uses a fully independent spatial head (pyramid/conv + MLP duplicated).
     #
     # NOTE: All modes still share the same DINOv3 backbone (+ LoRA adapters).
-    ratio_head_mode: shared
+    ratio_head_mode: separate_mlp
   backbone_layers:
     enabled: true
     # How to fuse predictions/features across selected backbone layers (multi-layer mode).
@@ -436,7 +436,7 @@ train_all:
   enabled: true
 
 peft:
-  enabled: true
+  enabled: false
   method: lora
   use_dora: true
   r: 4
@@ -489,7 +489,7 @@ pcgrad:
   # Gradient surgery mode:
   # - symmetric        : standard PCGrad (all selected tasks treated equally)
   # - primary_anchored : protect primary tasks; project auxiliary gradients only
-  mode: symmetric
+  mode: primary_anchored
   eps: 1.0e-8
   # How to combine per-task projected gradients: sum | mean
   reduction: sum
@@ -534,6 +534,11 @@ kfold:
   enabled: true
   k: 5
   even_split: false
+  # Optional: run only specific fold indices (0-based).
+  # - null  : run all folds (default)
+  # - [2]   : run only fold_2
+  # - [0,4] : run fold_0 and fold_4
+  folds: [2]
 
 trainer:
   max_epochs: 30

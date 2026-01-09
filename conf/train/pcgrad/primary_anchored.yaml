@@ -1,0 +1,17 @@
+# @package pcgrad
+
+enabled: true
+mode: primary_anchored
+eps: 1.0e-8
+reduction: sum
+shuffle_tasks: true
+seed: null
+primary_tasks: [reg3, ratio, biomass_5d]
+aux_tasks: null
+apply_to_group_types: [head]
+exclude_group_types: [uw]
+exclude_param_name_substrings: []
+include_tasks: null
+exclude_tasks: []
+
+
