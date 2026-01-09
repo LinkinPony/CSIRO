@@ -320,6 +320,10 @@ class PastureDataModule(LightningDataModule):
         irish_image_size: Optional[Union[int, Tuple[int, int]]] = None,
         # Seed for reproducible internal train/val split when predefined splits are not supplied
         random_seed: int = 42,
+        # Split policy: keep all samples from the same (Sampling_Date, State) group together
+        # when creating the single train/val split. This avoids metadata leakage and matches
+        # the project's k-fold semantics.
+        group_val_split_by_date_state: bool = True,
         # Optional Nano Banana Pro (AIGC) image augmentation (offline-generated images)
         aigc_aug_enabled: bool = False,
         aigc_aug_subdir: Optional[str] = None,
@@ -381,6 +385,7 @@ class PastureDataModule(LightningDataModule):
             self.random_seed: int = int(random_seed)
         except Exception:
             self.random_seed = 42
+        self.group_val_split_by_date_state: bool = bool(group_val_split_by_date_state)
         # AIGC augmentation config (images are generated offline; training only reads them)
         self.aigc_aug_enabled: bool = bool(aigc_aug_enabled)
         self.aigc_aug_subdir: str = str(aigc_aug_subdir or "nano_banana_pro/train")
@@ -426,12 +431,87 @@ class PastureDataModule(LightningDataModule):
             merged = self._read_and_pivot()
             rng = np.random.default_rng(seed=int(self.random_seed))
             indices = np.arange(len(merged))
-            rng.shuffle(indices)
-            n_val = max(1, int(len(indices) * self.val_split))
-            val_idx = indices[:n_val]
-            train_idx = indices[n_val:]
-            self.train_df = merged.iloc[train_idx].reset_index(drop=True)
-            self.val_df = merged.iloc[val_idx].reset_index(drop=True)
+
+            # IMPORTANT: avoid per-image random splitting. Default behaviour is to keep
+            # (Sampling_Date, State) groups together, matching k-fold grouping.
+            if self.group_val_split_by_date_state:
+                if ("Sampling_Date" not in merged.columns) or ("State" not in merged.columns):
+                    raise ValueError(
+                        "Grouped val split requested (group_val_split_by_date_state=True) "
+                        "but the dataframe is missing required columns: Sampling_Date and/or State."
+                    )
+
+                dates = merged["Sampling_Date"].astype(str).fillna("").to_numpy()
+                states = merged["State"].astype(str).fillna("").to_numpy()
+                group_labels = np.array(
+                    [f"{d}__{s}" for d, s in zip(dates, states)],
+                    dtype=object,
+                )
+                _unique_groups, group_indices = np.unique(group_labels, return_inverse=True)
+                n_groups = int(len(_unique_groups))
+                group_sizes = np.bincount(group_indices, minlength=n_groups)
+
+                group_order = np.arange(n_groups)
+                rng.shuffle(group_order)
+
+                n_samples = int(len(indices))
+                # Target #val samples (best-effort, but group sizes may cause slight deviation).
+                target_val = max(1, int(n_samples * float(self.val_split)))
+
+                val_groups: list[int] = []
+                val_count = 0
+                for g in group_order.tolist():
+                    s = int(group_sizes[int(g)])
+                    # Always pick at least one group to avoid empty val.
+                    if val_count == 0:
+                        val_groups.append(int(g))
+                        val_count += s
+                        continue
+
+                    # Prefer adding groups while we are under target.
+                    if val_count + s <= target_val:
+                        val_groups.append(int(g))
+                        val_count += s
+                        continue
+
+                    # Decide whether adding this group overshoots "less" than stopping.
+                    if abs((val_count + s) - target_val) < abs(val_count - target_val):
+                        val_groups.append(int(g))
+                        val_count += s
+                    break
+
+                val_mask = np.isin(group_indices, np.array(val_groups, dtype=int))
+                val_idx = np.where(val_mask)[0]
+                train_idx = np.where(~val_mask)[0]
+
+                # Guard rails: ensure both splits are non-empty.
+                if len(val_idx) == 0 or len(train_idx) == 0:
+                    # Fallback: move the largest group to train if val consumed everything.
+                    largest_group = int(np.argmax(group_sizes)) if n_groups > 0 else 0
+                    val_mask = np.isin(group_indices, np.array([largest_group], dtype=int))
+                    val_idx = np.where(val_mask)[0]
+                    train_idx = np.where(~val_mask)[0]
+
+                self.train_df = merged.iloc[train_idx].reset_index(drop=True)
+                self.val_df = merged.iloc[val_idx].reset_index(drop=True)
+
+                logger.info(
+                    "Single-split: grouped by (Sampling_Date, State). groups={} val_groups={} "
+                    "train={} val={} (target_val≈{})",
+                    n_groups,
+                    len(val_groups),
+                    len(train_idx),
+                    len(val_idx),
+                    target_val,
+                )
+            else:
+                # Legacy behaviour: per-image random split (NOT recommended due to metadata leakage).
+                rng.shuffle(indices)
+                n_val = max(1, int(len(indices) * self.val_split))
+                val_idx = indices[:n_val]
+                train_idx = indices[n_val:]
+                self.train_df = merged.iloc[train_idx].reset_index(drop=True)
+                self.val_df = merged.iloc[val_idx].reset_index(drop=True)
 
         # Compute z-score stats on the *base* train_df (before adding extra AIGC samples)
         self._compute_and_store_zscore_stats()

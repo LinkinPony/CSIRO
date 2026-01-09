@@ -137,7 +137,8 @@ def _build_datamodule(
     Build a PastureDataModule for a single train/val split.
 
     If train_df/val_df are provided, they are used as predefined splits.
-    Otherwise, random splitting is controlled by cfg['data']['val_split'].
+    Otherwise, the datamodule performs a grouped split by (Sampling_Date, State),
+    controlled by cfg['data']['val_split'] and seeded by cfg['seed'].
     """
     log_scale_targets_cfg = bool(cfg["model"].get("log_scale_targets", False))
     irish_cfg = cfg.get("irish_glass_clover", {})

@@ -60,7 +60,9 @@ class RayTuneReportCallback(Callback):
         val_loss = _pick_metric(metrics, ["val_loss", "val_loss/dataloader_idx_0"])
         val_r2 = _pick_metric(metrics, ["val_r2", "val_r2/dataloader_idx_0"])
 
-        payload: dict[str, Any] = {"epoch": int(getattr(trainer, "current_epoch", 0))}
+        # IMPORTANT: report epoch as 1-based "epochs completed" so Ray ASHA grace_period
+        # semantics match user expectations (e.g., grace_period=15 => run at least 15 epochs).
+        payload: dict[str, Any] = {"epoch": int(getattr(trainer, "current_epoch", 0)) + 1}
         if val_loss is not None:
             payload["val_loss"] = float(val_loss)
         if val_r2 is not None:

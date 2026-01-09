@@ -98,7 +98,10 @@ def _try_extract_final_metrics(
             return None
 
         try:
-            epoch_end = int(float(last["epoch"]))
+            # Lightning's CSV logger uses 0-based epoch indices. Convert to 1-based
+            # "epochs completed" to stay consistent with Ray Tune reporting.
+            epoch_end0 = int(float(last["epoch"]))
+            epoch_end = int(epoch_end0 + 1)
         except Exception:
             epoch_end = None
 
@@ -144,6 +147,12 @@ def main(cfg: DictConfig) -> None:
     seeds = seeds if seeds else [int(train_cfg.get("seed", 42))]
     seeds = [int(s) for s in seeds]
     report_per_epoch = bool(tune_cfg.get("report_per_epoch", True))
+    resume = bool(tune_cfg.get("resume", False))
+    restore_path_raw = tune_cfg.get("restore_path", None)
+    restore_path = str(restore_path_raw).strip() if restore_path_raw not in (None, "", "null") else ""
+    resume_unfinished = bool(tune_cfg.get("resume_unfinished", True))
+    resume_errored = bool(tune_cfg.get("resume_errored", False))
+    restart_errored = bool(tune_cfg.get("restart_errored", False))
 
     # Build Ray Tune search space
     space_spec = dict(tune_cfg.get("search_space", {}) or {})
@@ -175,8 +184,6 @@ def main(cfg: DictConfig) -> None:
         reduction_factor = int(sched_cfg.get("reduction_factor", 2))
         scheduler = ASHAScheduler(
             time_attr="epoch",
-            metric=metric,
-            mode=mode,
             max_t=max_epochs,
             grace_period=grace_period,
             reduction_factor=reduction_factor,
@@ -246,7 +253,8 @@ def main(cfg: DictConfig) -> None:
 
         # Final aggregated report (the metric optimized by Tune is `val_loss`).
         max_epochs = int(cfg_trial.get("trainer", {}).get("max_epochs", 0) or 0)
-        epoch_final = (max(epoch_ends) if epoch_ends else max(0, max_epochs - 1))
+        # Keep epoch 1-based for consistency with per-epoch reports.
+        epoch_final = int(max(epoch_ends) if epoch_ends else max(0, max_epochs))
         payload: dict[str, Any] = {"epoch": int(epoch_final)}
         if val_losses:
             payload["val_loss"] = float(sum(val_losses) / len(val_losses))
@@ -259,21 +267,75 @@ def main(cfg: DictConfig) -> None:
 
     trainable_wrapped = tune.with_resources(trainable, resources=resources_per_trial)
 
-    tuner = tune.Tuner(
-        trainable_wrapped,
-        param_space=param_space,
-        tune_config=tune.TuneConfig(
-            metric=metric,
-            mode=mode,
-            num_samples=num_samples,
-            max_concurrent_trials=max_concurrent_trials,
-            scheduler=scheduler,
-        ),
-        run_config=air.RunConfig(
-            name=name,
-            storage_path=str(storage_path),
-        ),
-    )
+    # Construct a new Tuner or restore an existing run.
+    #
+    # NOTE: Restoring expects the experiment directory (including checkpoints/state) to be present.
+    # For local/NFS storage this is typically: <storage_path>/<name>.
+    if resume:
+        exp_path = restore_path or str(storage_path / name)
+        # Auto-fallback: if the restore path doesn't exist yet, start a new run instead.
+        # This keeps UX simple when users always enable resume (e.g., in a wrapper script).
+        exp_exists = True
+        try:
+            # Best-effort: only check local filesystem paths (NFS counts as local here).
+            if "://" not in exp_path:
+                exp_exists = Path(exp_path).exists()
+        except Exception:
+            exp_exists = True
+
+        if exp_exists:
+            logger.info(
+                "Restoring Tune run from: {} (resume_unfinished={}, resume_errored={}, restart_errored={})",
+                exp_path,
+                resume_unfinished,
+                resume_errored,
+                restart_errored,
+            )
+            tuner = tune.Tuner.restore(
+                exp_path,
+                trainable=trainable_wrapped,
+                resume_unfinished=resume_unfinished,
+                resume_errored=resume_errored,
+                restart_errored=restart_errored,
+                # Re-specify param_space for safety (must be unmodified for restore).
+                param_space=param_space,
+            )
+        else:
+            logger.info(
+                "Resume requested but restore path does not exist yet: {}. Starting a new run instead.",
+                exp_path,
+            )
+            tuner = tune.Tuner(
+                trainable_wrapped,
+                param_space=param_space,
+                tune_config=tune.TuneConfig(
+                    metric=metric,
+                    mode=mode,
+                    num_samples=num_samples,
+                    max_concurrent_trials=max_concurrent_trials,
+                    scheduler=scheduler,
+                ),
+                run_config=air.RunConfig(
+                    name=name,
+                    storage_path=str(storage_path),
+                ),
+            )
+    else:
+        tuner = tune.Tuner(
+            trainable_wrapped,
+            param_space=param_space,
+            tune_config=tune.TuneConfig(
+                metric=metric,
+                mode=mode,
+                num_samples=num_samples,
+                max_concurrent_trials=max_concurrent_trials,
+                scheduler=scheduler,
+            ),
+            run_config=air.RunConfig(
+                name=name,
+                storage_path=str(storage_path),
+            ),
+        )
 
     logger.info(
         "Starting Tune run: name={}, metric={}({}), num_samples={}, max_concurrent_trials={}, storage_path={}",
@@ -293,7 +355,10 @@ def main(cfg: DictConfig) -> None:
         best_cfg = copy.deepcopy(train_cfg)
         for k, v in best_overrides.items():
             _set_by_dotted_path(best_cfg, str(k), v)
-        out_path = storage_path / name / "best_train_cfg.yaml"
+        # Prefer the experiment directory reported by Tune (handles any internal naming/suffixing).
+        exp_path = str(getattr(results, "experiment_path", "") or "").strip()
+        out_dir = Path(exp_path) if exp_path else (storage_path / name)
+        out_path = out_dir / "best_train_cfg.yaml"
         import yaml
 
         with open(out_path, "w", encoding="utf-8") as f:

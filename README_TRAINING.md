@@ -118,6 +118,13 @@ Tune uses `conf/tune.yaml` (it composes the training config at the root and defi
 python tune.py tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
 ```
 
+Alternatively, use the convenience wrapper:
+
+```bash
+# Start a new run with an explicit name (recommended for versioning)
+./tune.sh tune-csiro-20260109_1500 tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
+```
+
 Common overrides:
 
 ```bash
@@ -134,11 +141,26 @@ python tune.py tune.seeds='[42,43,44]' tune.scheduler.type=fifo tune.report_per_
 # Open: `http://192.168.10.14:8265`
 ```
 
+Resume after interruption:
+
+```bash
+# Re-run after interruption: it will auto-resume by default (keep the same tune.name and search space)
+./tune.sh tune-csiro-20260109_1500 tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
+
+# Force a fresh run (do NOT restore)
+RESUME=0 ./tune.sh tune-csiro-20260109_1500 tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
+```
+
 Outputs:
 - Ray results go under `tune.storage_path` (default: `ray_results/`).
 - The script writes a convenience resolved config for the best result to:
-  `ray_results/<tune.name>/best_train_cfg.yaml`
-  (you can feed it into `python train.py --config ...` for a final full training run, if desired).
+  `best_train_cfg.yaml` inside the experiment directory on persistent storage
+  (typically: `ray_results/<tune.name>/best_train_cfg.yaml`).
+  You can feed it into `python train.py --config ...` for a final full training run.
+
+Versioning guidance:
+- Use a unique `tune.name` per search run (include date/time and optionally git commit).
+- Do **not** change the search space (or code) and then try to resume the old run. Start a new run instead (new `tune.name`).
 
 
 python tools/nano_banana_pro/augment_train.py --config configs/nano_banana_pro_augment.yaml --limit 20

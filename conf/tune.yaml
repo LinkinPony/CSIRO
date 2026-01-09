@@ -1,6 +1,6 @@
 defaults:
   # Load the same training defaults at the global root and apply Tune-specific overrides below.
-  - experiment@_global_: baseline
+  - experiment@_global_: baseline_no_irish
   # Enable LoRA for HPO runs (the baseline experiment keeps it disabled by default).
   - override /train/peft: lora
   - _self_
@@ -47,7 +47,21 @@ ray:
   address: auto
 
 tune:
-  name: tune-csiro
+  name: tune-csiro-no-irish
+  # Resume an existing run (restore from storage) instead of starting a new one.
+  # IMPORTANT: restoring assumes the experiment directory (including checkpoints/state)
+  # is still present under shared storage. For NFS, this is typically:
+  #   <tune.storage_path>/<tune.name>
+  resume: false
+  # Optional explicit restore path. When null, defaults to <storage_path>/<name>.
+  restore_path: null
+  # Restore behaviour:
+  # - resume_unfinished: continue trials that were running/pending when interrupted
+  # - resume_errored   : try to resume failed trials from their latest checkpoints
+  # - restart_errored  : restart failed trials from scratch (ignoring checkpoints)
+  resume_unfinished: true
+  resume_errored: true
+  restart_errored: false
   # Where Ray Tune stores experiment results (relative paths resolved under repo root).
   storage_path: ray_results
   metric: val_loss
@@ -60,7 +74,9 @@ tune:
   scheduler:
     type: asha
     max_epochs: ${trainer.max_epochs}
-    grace_period: 3
+    # Do not eliminate trials too early. With epoch reporting (1-based), this means
+    # each trial will run at least 15 epochs before any ASHA pruning can happen.
+    grace_period: 15
     reduction_factor: 2
   # Multi-seed is supported, but for ASHA-based HPO it is recommended to keep a single seed.
   # After HPO, re-run best config with multiple seeds for robustness.
@@ -69,6 +85,14 @@ tune:
   report_per_epoch: true
   # Search space spec. Keys are dotted paths into the training config.
   search_space:
+    peft.last_k_blocks:
+      type: choice
+      values: [4, 6, 8, 12]
+    peft.target_modules:
+      type: choice
+      values:
+        - [qkv, proj]
+        - [qkv, proj, w1, w2, w3]
     peft.lora_lr:
       type: loguniform
       lower: 1.0e-5

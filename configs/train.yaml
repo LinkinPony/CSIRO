@@ -1,167 +1,113 @@
-seed: 42
-version: mlp-v2-pcgrad-no-irish-no-peft
 data:
   root: data
   train_csv: train.csv
-  # Optional: include offline-generated AIGC augmented images (Nano Banana Pro) during training.
-  # The augmentation tool writes images + a manifest under `data/nano_banana_pro/train/` by default.
   aigc_aug:
     enabled: false
-    # Directory UNDER `data.root` that contains generated images + manifest.
-    # Recommended: "nano_banana_pro/train" (so full path is data/nano_banana_pro/train).
     subdir: nano_banana_pro/train
-    # Manifest filename (written by tools/nano_banana_pro/augment_train.py)
     manifest: manifest.csv
-    # Optional subset of augmentation type names to use. null/[] => use all success rows.
     types: null
-  # Dataset selection and per-dataset physical area (meters)
   dataset: csiro
   datasets:
     csiro:
       width_m: 0.7
       length_m: 0.3
-  # NOTE: `image_size` in this YAML is [W, H] (width, height). The code parses it to (H, W)
-  # for torchvision transforms (Resize/RandomResizedCrop), which expect (H, W).
-  image_size: [960, 480]
+  image_size:
+  - 960
+  - 480
   batch_size: 1
   val_batch_size: 1
-  num_workers: 20
-  prefetch_factor: 4
+  num_workers: 8
+  prefetch_factor: 2
   val_split: 0.1
   shuffle: true
-  # Primary regression targets for the main head.
-  # In the new design we predict only Dry_Total_g directly and recover
-  # the remaining components via a separate ratio head.
-  target_order: [Dry_Total_g]
+  target_order:
+  - Dry_Total_g
   augment:
-    # Augmentation policy switch:
-    # - legacy: handcrafted torchvision pipeline (flip/affine/jitter/blur/noise/erasing + overlays)
-    # - augmix: AugMix (single-output tensor; no JSD tuple) + optional overlays
     policy: legacy
-    # Debug: dump the *final* images fed to the model (after CutMix) for quick sanity checks.
-    # Saved under: outputs/<version>/debug/inputs/ (unless out_dir is overridden).
     debug_dump:
       enabled: false
-      stages: [train]
-      # Dump cadence: dump once every N global steps (optimizer steps).
+      stages:
+      - train
       every_n_steps: 50
-      # Total cap across the whole run.
       max_images: 32
-      # How many images to save from each selected batch.
       num_images_per_step: 4
-      # Save viewable RGB (de-normalized back from mean/std). If false, saves normalized tensors mapped to 0..1.
       denormalize: true
-      # Output format: png | jpeg | webp
       format: jpeg
-      # Optional format knobs:
       png_compress_level: 6
       jpeg_quality: 90
       webp_quality: 90
-      # Optional override (relative paths are resolved under run_log_dir):
-      # out_dir: debug/inputs
     augmix:
       enabled: false
-      # AugMix knobs (reference-style):
-      # - severity: 1..10 (higher => stronger ops)
-      # - width   : number of augmentation chains mixed
-      # - depth   : chain depth; -1 => random in [1, 3]
-      # - alpha   : Dirichlet/Beta concentration (mixing strength)
       severity: 2
       width: 2
       depth: -1
       alpha: 0.5
-      # When true, include color/contrast/brightness/sharpness ops in addition to the base ops.
       all_ops: false
-      # Consistency regularization (AugMix-style multi-view):
-      # When enabled, the train transform returns (clean, aug1, aug2) and training adds:
-      #  - reg3 consistency (MSE to the mean prediction)
-      #  - ratio consistency (JSD on softmax probabilities)
-      # Manifold mixup remains enabled and is applied in a view-consistent way (same lam/perm across views).
       consistency:
         enabled: false
-        # When loss.weighting=uw, treat the *combined* consistency loss as an independent UW task.
         uw_task: true
-        # Whether augmented views (aug1/aug2) also contribute to the *supervised* loss.
-        #
-        # - true : supervised loss is computed on (clean + aug views) and averaged across views
-        # - false: supervised loss is computed on clean only; aug views contribute via consistency only
         supervise_aug_views: true
-        # Number of augmented views in addition to clean: 1 => (clean, aug1), 2 => (clean, aug1, aug2)
         num_aug: 2
-        # Weights for consistency terms added to the supervised loss.
         weight_reg3: 1.0
         weight_ratio_jsd: 1.0
-        # Numeric clamp epsilon for JSD mixture log.
-        eps: 1.0e-7
-    # RandomResizedCrop is disabled by default.
-    #
-    # On CSIRO images (native ~2:1 aspect ratio), torchvision's default ratio range (3/4..4/3)
-    # combined with a high `random_resized_crop_scale` (e.g. >=0.8) can make sampling impossible.
-    # In that case RandomResizedCrop silently falls back to a deterministic center-crop, which is
-    # usually undesirable. Recommendation: keep this OFF unless you tune scale/ratio for your data.
+        eps: 1.0e-07
     random_resized_crop_enabled: true
-    random_resized_crop_scale: [0.8, 1.0]
-    # Jitter-crop (recommended): crop -> resize back to `data.image_size` while preserving aspect ratio.
-    #
-    # Implemented as a *pre-AuGMix* PIL transform (runs BEFORE AugMix), so it affects both:
-    #   - the clean view and the augmented views consistently (when augmix.consistency.enabled=true)
-    #   - the legacy (non-AuGMix) pipeline as the first geometric op
-    #
-    # Two crop strategies can be mixed to increase diversity:
-    # - center: center-biased crop (small random jitter around image center)  -> usually safer for labels
-    # - random: fully random crop placement                                   -> more diversity
-    #
-    # When both are enabled, one is chosen per-image according to their `prob` weights.
+    random_resized_crop_scale:
+    - 0.8
+    - 1.0
     jitter_crop:
       enabled: false
-      # Overall probability of applying jitter-crop. When skipped, we still Resize to `data.image_size`.
       prob: 1.0
-      # Crop area fraction relative to the *largest crop that matches the target aspect ratio*
-      # (by default, the aspect ratio of `data.image_size`).
-      scale: [0.8, 1.2]
-      # Optional fixed crop aspect ratio (w/h). null => uses output ratio derived from image_size.
+      scale:
+      - 0.8
+      - 1.2
       ratio: null
-      # Resize interpolation after crop (torchvision enum name): nearest|bilinear|bicubic|...
       interpolation: bicubic
       center:
         enabled: true
         prob: 0.5
-        # Max center offset as fraction of original image size (x, y). Crop is clamped to fit.
-        max_offset_frac: [0.2, 0.1]
+        max_offset_frac:
+        - 0.2
+        - 0.1
       random:
         enabled: true
         prob: 0.5
     horizontal_flip_prob: 0.5
     color_jitter:
-      # NOTE: ignored when policy=augmix (AugMix provides its own color/contrast ops when all_ops=true).
       enabled: true
       prob: 0.8
       brightness: 0.2
       contrast: 0.2
       saturation: 0.1
-      hue: 0.00
+      hue: 0.0
     vertical_flip:
-      # NOTE: ignored when policy=augmix.
       enabled: true
       prob: 0.5
     random_affine:
-      # NOTE: ignored when policy=augmix.
       enabled: true
       degrees: 5.0
-      translate: [0.02, 0.02]
-      scale: [0.95, 1.05]
-      shear: [0.02, 0.02]
+      translate:
+      - 0.02
+      - 0.02
+      scale:
+      - 0.95
+      - 1.05
+      shear:
+      - 0.02
+      - 0.02
       interpolation: bilinear
       fill: 0
     gaussian_blur:
-      # NOTE: ignored when policy=augmix.
       enabled: true
       kernel_size: 3
-      kernel_size_range: [3, 7]
+      kernel_size_range:
+      - 3
+      - 7
       prob: 0.5
-      sigma: [0.1, 1.0]
+      sigma:
+      - 0.1
+      - 1.0
     gaussian_noise:
-      # NOTE: ignored when policy=augmix.
       enabled: true
       mean: 0.0
       std: 0.01
@@ -169,256 +115,204 @@ data:
     watermark:
       enabled: true
       prob: 0.3
-      # Camera-like timestamp watermark (matches typical CSIRO photos):
-      # - larger, bottom-right anchored
-      # - orange digits with a subtle black shadow (no gray "bar"/edge artifacts)
       style: random
-      # Add variability: mostly bottom-right, sometimes other corners (still "camera-like").
       position: random
-      position_choices: [bottom_right, bottom_left, top_right, top_left]
-      position_probs: [0.7, 0.15, 0.10, 0.05]
+      position_choices:
+      - bottom_right
+      - bottom_left
+      - top_right
+      - top_left
+      position_probs:
+      - 0.7
+      - 0.15
+      - 0.1
+      - 0.05
       timestamp_prob: 0.5
-      timestamp_format: "%d %m %Y %H:%M"
-      margin_frac_range: [0.008, 0.05]
-      font_size_frac_range: [0.04, 0.12]
-      alpha_range: [128, 200]
-      # Multiple timestamp colors + small RGB jitter for natural variance.
+      timestamp_format: '%d %m %Y %H:%M'
+      margin_frac_range:
+      - 0.008
+      - 0.05
+      font_size_frac_range:
+      - 0.04
+      - 0.12
+      alpha_range:
+      - 128
+      - 200
       color_choices:
-        - [255, 140, 0]
-        - [255, 120, 0]
-        - [255, 170, 40]
-        - [255, 200, 0]
-        - [255, 255, 255]
+      - - 255
+        - 140
+        - 0
+      - - 255
+        - 120
+        - 0
+      - - 255
+        - 170
+        - 40
+      - - 255
+        - 200
+        - 0
+      - - 255
+        - 255
+        - 255
       color_jitter: 50
       render_mode: shadow
-      shadow_color: [0, 0, 0]
-      shadow_alpha_range: [160, 255]
-      shadow_offset_frac_range: [0.03, 0.07]
-      # Optional: set a specific TTF for exact look; otherwise a system TTF (e.g. DejaVuSans-Bold) is auto-detected.
-      # font_path: /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
-      # For random string watermark instead of timestamp:
-      # style: random
+      shadow_color:
+      - 0
+      - 0
+      - 0
+      shadow_alpha_range:
+      - 160
+      - 255
+      shadow_offset_frac_range:
+      - 0.03
+      - 0.07
       texts: []
       use_random_text: true
-      random_text_length_range: [3, 20]
+      random_text_length_range:
+      - 3
+      - 20
     light_spot:
       enabled: true
-      # NDVI hand-held device artifacts often look like a small *red* flare (strong core + soft halo).
-      # Use flare-style blending (preserve texture) instead of the legacy flat-color composite.
-      blend_mode: composite   # one of: composite | screen | additive
+      blend_mode: composite
       prob: 0.3
-      # Size tuned for CSIRO 2:1 images (~2000x1000). Typical red hotspot core radius ~0.02-0.06 of min dim.
-      radius_frac_range: [0.06, 0.18]
-      # Strength (0..1). Higher => more saturated/overexposed center.
-      alpha_range: [0.2, 0.6]
-      # Red flare tint (roughly matches ID1963715583.jpg: (230,31,62))
-      color: [255, 255, 220]
-      # Legacy blur_frac is still used as the halo blur fraction in flare mode (core blur is separate).
+      radius_frac_range:
+      - 0.06
+      - 0.18
+      alpha_range:
+      - 0.2
+      - 0.6
+      color:
+      - 255
+      - 255
+      - 220
       blur_frac: 0.5
       core_blur_frac: 0.15
       halo_enabled: false
-      halo_scale_range: [1.0, 3.5]
-      halo_alpha_mult_range: [0.06, 0.20]
-      # New: multi-spot grid (rows x cols) to mimic repeated device flares.
-      # When enabled, the transform generates a small grid of red flares with slight jitter.
+      halo_scale_range:
+      - 1.0
+      - 3.5
+      halo_alpha_mult_range:
+      - 0.06
+      - 0.2
       grid_enabled: false
-      grid_rows_range: [2, 4]
-      grid_cols_range: [2, 5]
-      # Spacing is sampled as a multiple of the core radius (r). Larger => more separated spots.
-      grid_spacing_mul_range: [5.0, 9.0]
+      grid_rows_range:
+      - 2
+      - 4
+      grid_cols_range:
+      - 2
+      - 5
+      grid_spacing_mul_range:
+      - 5.0
+      - 9.0
       grid_jitter_frac: 0.12
-      # Optional: randomly drop some cells to avoid a perfectly regular grid.
       grid_cell_dropout_prob: 0.1
-      # When true, all spots share the same sampled radius/alpha; when false, sample per spot.
       grid_share_params: true
-      # Optional: if your spots are mostly near the top, uncomment to bias the center:
-      # center_y_frac_range: [0.0, 0.6]
     random_erasing:
-      # NOTE: ignored when policy=augmix.
       enabled: true
       p: 0.25
-      scale: [0.02, 0.1]
-      ratio: [0.3, 3.3]
+      scale:
+      - 0.02
+      - 0.1
+      ratio:
+      - 0.3
+      - 3.3
       value: random
-    # Feature-level manifold mixup.
-    #
-    # - MLP/global heads: applied on the shared bottleneck representation z
-    # - FPN head        : applied on DINO patch tokens (B,N,C) (or stacked (B,L,N,C))
-    # - DPT head        : applied on DINO patch tokens; when model.head.dpt_readout=project,
-    #                    CLS+patch tokens are mixed together **regardless** of mix_cls_token.
     manifold_mixup:
       enabled: true
       prob: 1.0
       alpha: 2.0
       apply_on: tokens
       detach_pair: true
-      # When true (default), manifold mixup is applied to the full feature vector,
-      # including the CLS token when model.head.use_cls_token=true.
-      #
-      # When false (and model.head.use_cls_token=true), only patch features are mixed
-      # and CLS stays unchanged.
-      #
-      # NOTE (DPT head): when model.head.type=dpt and model.head.dpt_readout=project,
-      # CLS is always mixed with patch tokens to keep the project-readout consistent.
       mix_cls_token: false
     cutmix:
       enabled: false
       alpha: 0.5
-      # minmax: [0.3, 0.7]  # optional clamp for bbox size; comment to disable
       use_prev_for_bsz1: true
     no_augment_prob: 0.1
   normalization:
-    mean: [0.485, 0.456, 0.406]
-    std: [0.229, 0.224, 0.225]
-
+    mean:
+    - 0.485
+    - 0.456
+    - 0.406
+    std:
+    - 0.229
+    - 0.224
+    - 0.225
+ndvi_dense:
+  enabled: false
+  root: data/NDVI
+  tile_size: 640
+  tile_stride: 448
+  batch_size: 1
+  num_workers: 8
+  normalization:
+    mean:
+    - 0.485
+    - 0.456
+    - 0.406
+    std:
+    - 0.229
+    - 0.224
+    - 0.225
+  augment:
+    horizontal_flip_prob: 0.5
+    cutmix:
+      enabled: true
+      prob: 0.5
+      alpha: 0.3
+      use_prev_for_bsz1: true
+    vertical_flip_prob: 0.0
+irish_glass_clover:
+  enabled: true
+  supervise_ratio: true
+  root: data/irish_glass_clover
+  csv: data.csv
+  image_dir: images
+  image_size:
+  - 800
+  - 800
 model:
-  # DINOv3 backbone selector (implemented via vendored `third_party/dinov3`).
-  # Common options:
-  # - dinov3_vitl16     (embed_dim=1024, depth=24)
-  # - dinov3_vith16plus (embed_dim=1280, depth=32)
-  # - dinov3_vit7b16    (embed_dim=4096, depth=40)  # VERY large; requires a lot of VRAM
   backbone: dinov3_vith16plus
-  # If weights_url is provided, it will be used to load the checkpoint.
-  # Otherwise the official default weights are used via torch.hub.
   weights_url: null
-  # Provide a local path to an offline checkpoint to avoid any network access.
-  # Example (vith16plus): /path/to/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth
-  # Example (vit7b16):    /path/to/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth
-  weights_path: /media/dl/dataset/Git/CSIRO/dinov3_weights/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pt
+  weights_path: dinov3_weights/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pt
   pretrained: true
   freeze_backbone: true
-  # Cast *frozen* backbone weights to lower precision to save VRAM.
-  # This is different from Lightning AMP (`trainer.precision: 16-mixed`), which does NOT
-  # change parameter storage dtype by default.
-  #
-  # Options:
-  # - fp32 (default): keep frozen backbone weights in float32
-  # - fp16          : cast frozen backbone weights to float16 (best VRAM savings)
-  # - bf16          : cast frozen backbone weights to bfloat16
-  #
-  # NOTE: trainable params (LoRA adapters / heads) stay fp32 for optimizer stability.
   backbone_weights_dtype: fp32
-  # Enable activation/gradient checkpointing on DINOv3 transformer blocks to reduce VRAM
-  # at the cost of a slower backward pass. Useful when training LoRA with limited GPU memory.
   gradient_checkpointing: false
-  # IMPORTANT: must match backbone's embed_dim:
-  # - dinov3_vitl16     -> 1024
-  # - dinov3_vith16plus -> 1280
-  # - dinov3_vit7b16    -> 4096
   embedding_dim: 1280
   log_scale_targets: false
   head:
-    # Head architecture:
-    # - mlp (legacy global scalar head)
-    # - fpn (Phase A spatial pyramid head)
-    # - dpt (Dense Prediction Transformers-style head -> GAP -> MLP -> Linear)
-    # - vitdet (ViTDet SimpleFeaturePyramid-style head from *single-layer* patch tokens;
-    #           when model.backbone_layers.enabled=true, builds one independent head per selected layer
-    #           and averages the final outputs)
-    # - eomt (EoMT-inspired query pooling head: learn Q query tokens and pool patch tokens via cross-attention)
     type: mlp
-    # ViTDet settings (SimpleFeaturePyramid-style):
-    vitdet_dim: 320
-    vitdet_patch_size: 16
-    # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
-    vitdet_scale_factors: [4.0, 2.0, 1.0, 0.5]
-    # FPN settings (Phase A): spatial pyramid built from ViT patch tokens
-    fpn_dim: 256
-    fpn_num_levels: 3
-    fpn_patch_size: 16
-    # When true (default), assign deeper backbone layers (larger indices) to *higher-resolution*
-    # FPN levels (less downsampling). Concretely: the group containing the largest layer indices
-    # becomes level 0 (no downsample), and the smallest-index group becomes the most downsampled level.
-    fpn_reverse_level_order: true
-    # DPT settings (dense prediction head):
-    # - readout supports only: ignore | project
-    # - project readout consumes CLS + patch tokens and therefore forces CLS+patch manifold mixup.
-    dpt_features: 256
-    dpt_patch_size: 16
-    dpt_readout: ignore
-    # EoMT-style injected-query settings (only used when model.head.type=eomt)
-    eomt:
-      # Number of learnable query tokens (Q). Small Q keeps compute ~O(QN) where N is #patch tokens.
-      num_queries: 16
-      # Number of LAST backbone blocks (k) to run jointly with injected queries.
-      # This matches `third_party/eomt`'s `num_blocks` concept.
-      num_blocks: 4
-      # Query pooling strategy: mean | first
-      query_pool: mean
-      # Which token sources to fuse into a single global representation (configurable):
-      # - mean_query : mean pooled injected query outputs
-      # - mean_patch : mean pooled patch tokens (after the injected last-k blocks)
-      # - cls_token  : CLS token (after the injected last-k blocks)
-      #
-      # Recommended: enable all three and project back to embedding_dim.
-      use_mean_query: true
-      use_mean_patch: true
-      use_cls_token: true
-      # After concatenation (dim = embedding_dim * num_enabled_sources), project down to this dim.
-      # Set to `model.embedding_dim` for a clean drop-in replacement (e.g. 1280 for dinov3_vith16plus).
-      proj_dim: 640
-      proj_activation: relu
-      proj_dropout: 0.2
-    hidden_dims: [320]
+    hidden_dims:
+    - 320
     activation: relu
-    dropout: 0.2
+    dropout: 0.10704045352454923
     use_output_softplus: true
-    # Whether to include the ViT/DINO CLS token in the *global* feature vector.
-    #
-    # - true  (default): global feature = [CLS ; mean(patch)] with shape (B, 2C)
-    # - false:          global feature = mean(patch) with shape (B, C)
-    #
-    # This flag affects the legacy/global path (use_patch_reg3: false) in both
-    # single-layer and multi-layer training/inference. Patch-mode reg3 uses patch
-    # tokens directly and is therefore unaffected.
     use_cls_token: false
-    # When enabled, use a patch-based main regression path:
-    #   - For each patch token, apply the shared MLP head (CLS concatenated with patch token),
-    #   - Average per-patch predictions to obtain the image-level output.
-    # Auxiliary tasks (height/NDVI/species/state) and ratio/5D losses continue to use
-    # the global CLS + mean(patch) bottleneck.
     use_patch_reg3: false
-    # Dual-branch fusion (recommended A for MLP patch-mode):
-    # combine the patch-based prediction with a global prediction from CLS+mean(patch).
     dual_branch:
       enabled: false
-      # Initial global-branch weight a in: y = a*y_global + (1-a)*y_patch
       alpha_init: 0.2
-    # Biomass ratio head coupling mode.
-    #
-    # Options:
-    # - shared          : ratio shares the same spatial head + scalar MLP trunk as reg3 (default).
-    # - separate_mlp     : ratio uses an independent scalar MLP branch (pyramid/conv still shared).
-    # - separate_spatial : ratio uses a fully independent spatial head (pyramid/conv + MLP duplicated).
-    #
-    # NOTE: All modes still share the same DINOv3 backbone (+ LoRA adapters).
     ratio_head_mode: separate_mlp
   backbone_layers:
     enabled: true
-    # How to fuse predictions/features across selected backbone layers (multi-layer mode).
-    # Options:
-    # - mean    : uniform average (legacy behavior)
-    # - learned : learn softmax weights over layers (recommended)
     layer_fusion: mean
-    # When true, each selected backbone layer uses its own bottleneck MLP.
-    # When false, all layers share a single bottleneck (legacy behavior).
     separate_bottlenecks: true
-    # Indices refer to DINOv3 transformer blocks (0-based).
-    # Depth depends on backbone:
-    # - dinov3_vitl16     : 24 blocks -> valid indices [0, 23]
-    # - dinov3_vith16plus : 32 blocks -> valid indices [0, 31]
-    # - dinov3_vit7b16    : 40 blocks -> valid indices [0, 39]
-    # Provide either:
-    # - indices: explicit list (highest priority), OR
-    # - indices_by_backbone: map keyed by backbone name (avoids manual edits when switching backbones)
-    #
-    # Recommended DPT-style 4-layer hooks:
     indices_by_backbone:
-      dinov3_vitl16: [5, 11, 17, 23]
-      dinov3_vith16plus: [12,24,31]
-      dinov3_vit7b16: [9, 19, 29, 39]
-
-
+      dinov3_vitl16:
+      - 5
+      - 11
+      - 17
+      - 23
+      dinov3_vith16plus:
+      - 12
+      - 24
+      - 31
+      dinov3_vit7b16:
+      - 9
+      - 19
+      - 29
+      - 39
 mtl:
   enabled: true
   tasks:
@@ -427,133 +321,83 @@ mtl:
     ndvi_dense: false
     species: false
     state: true
-  # Per-step sampling ratio within an epoch (expected proportion).
-  # ndvi_dense: probability to include NDVI-dense loss on a training step.
   sample_ratio:
     ndvi_dense: 0.0
-
 train_all:
   enabled: true
-
 peft:
-  enabled: false
+  enabled: true
   method: lora
   use_dora: true
-  r: 4
-  lora_alpha: 4
+  r: 8
+  lora_alpha: 16
   lora_dropout: 0.05
   init: true
-  last_k_blocks: 0
+  last_k_blocks: 8
   layers_pattern: blocks
-  target_modules: [qkv, proj, w1, w2, w3]
-  lora_lr: 0.0005
+  target_modules:
+  - qkv
+  - proj
+  lora_lr: 0.0007154344027944539
   lora_weight_decay: 0.0
-  # Layer-wise LR decay (LLRD) for LoRA params.
-  # - 1.0: disable (legacy single LR for all LoRA params)
-  # - <1:  earlier blocks get smaller LR; later blocks get larger LR
   lora_llrd: 1.0
-  # Optional: group N blocks into one optimizer group to reduce the number of logged LR curves.
-  # Keep 1 for true per-block LR.
   lora_group_size: 1
-
 loss:
   weighting: uw
-  # Enable/disable the biomass ratio head (Dry_Clover_g, Dry_Dead_g, Dry_Green_g)
   use_ratio_head: true
-  # Enable/disable 5D weighted MSE loss computed on:
-  # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
   use_5d_weighted_mse: true
-  # Per-component weights for the 5D MSE term.
-  mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
-
+  mse_5d_weights_per_target:
+  - 0.1
+  - 0.1
+  - 0.1
+  - 0.2
+  - 0.5
 optimizer:
   name: adamw
-  lr: 0.001
-  weight_decay: 0.01
+  lr: 8.303445569435868e-05
+  weight_decay: 1.0904180881045244e-06
   uw_lr: 0.01
   uw_weight_decay: 0.0
-  # SAM optimizer (Sharpness-Aware Minimization) configuration.
-  # To enable SAM, either set `name: sam` or `use_sam: true`.
   use_sam: false
   sam_rho: 0.05
   sam_adaptive: true
-
-# PCGrad (Projected Conflicting Gradients) to reduce gradient conflicts between tasks (reg3/ratio/5D/aux).
-#
-# Notes:
-# - When enabled, PCGrad is applied only to selected optimizer param groups (default: head + LoRA).
-# - UW (uncertainty-weighting) parameters are excluded by default to avoid injecting task gradients
-#   into log-variance weights.
 pcgrad:
   enabled: true
-  # Gradient surgery mode:
-  # - symmetric        : standard PCGrad (all selected tasks treated equally)
-  # - primary_anchored : protect primary tasks; project auxiliary gradients only
   mode: primary_anchored
-  eps: 1.0e-8
-  # How to combine per-task projected gradients: sum | mean
+  eps: 1.0e-08
   reduction: sum
-  # PCGrad paper default: randomize projection order.
   shuffle_tasks: true
-  # Optional deterministic seed for shuffling (null => use global RNG).
   seed: null
-  # Primary/Aux task specification (used only when mode=primary_anchored).
-  # If aux_tasks is null, it defaults to "all tasks except primary_tasks".
-  #
-  # Available task names (can be used in primary_tasks/aux_tasks/include_tasks/exclude_tasks):
-  # - reg3        : main regression loss
-  # - ratio       : biomass ratio head loss (when loss.use_ratio_head=true)
-  # - biomass_5d  : 5D weighted biomass loss (when loss.use_5d_weighted_mse=true)
-  # - consistency : AugMix consistency regularization (when data.augment.augmix.consistency.enabled=true)
-  # - height      : auxiliary height regression (mtl.tasks.height=true)
-  # - ndvi        : auxiliary NDVI regression (mtl.tasks.ndvi=true or NDVI-only batches)
-  # - species     : auxiliary species classification (mtl.tasks.species=true)
-  # - state       : auxiliary state classification (mtl.tasks.state=true)
-  # Note (mode=primary_anchored): if primary_tasks has multiple entries, we first apply symmetric PCGrad
-  # among the primary tasks to build the anchor, then project auxiliary task gradients against that anchor.
-  primary_tasks: [reg3, ratio, biomass_5d]
+  primary_tasks:
+  - reg3
+  - ratio
+  - biomass_5d
   aux_tasks: null
-  # Apply PCGrad only to optimizer param groups with these `group_type` labels.
-  # Available group_type values in this repo: head | uw | lora
-  apply_to_group_types: [head]
-  # Explicit group_type exclusions (recommended: exclude UW).
-  exclude_group_types: [uw]
-  # Optional param-name substring exclusions (applied after group filtering).
+  apply_to_group_types:
+  - head
+  exclude_group_types:
+  - uw
   exclude_param_name_substrings: []
-  # Optional task filtering. If include_tasks is non-null, only those tasks are projected.
   include_tasks: null
-  # Otherwise, exclude_tasks are removed from PCGrad projection but still contribute normally to the loss.
   exclude_tasks: []
-
 scheduler:
   name: cosine
   warmup_epochs: 0
   warmup_start_factor: 0.1
-
 kfold:
-  enabled: true
+  enabled: false
   k: 5
   even_split: false
-  # Optional: run only specific fold indices (0-based).
-  # - null  : run all folds (default)
-  # - [2]   : run only fold_2
-  # - [0,4] : run fold_0 and fold_4
-  folds: [2]
-
+  folds: null
 trainer:
-  max_epochs: 30
+  max_epochs: 45
   accelerator: auto
   devices: 1
   precision: 16-mixed
-  # Control per-epoch steps. Accepts int (absolute batches) or float (fraction).
-  limit_train_batches: 900
-  # With train_all enabled, we default to 1 so that validation uses only the dummy batch.
+  limit_train_batches: 1500
   limit_val_batches: 1
-  log_every_n_steps: 1
-  # Lightning checkpoint cadence (for `outputs/checkpoints/<version>/last.ckpt`).
-  # We only keep `last.ckpt` (no top-k / best checkpoints).
+  log_every_n_steps: 10
   checkpoint:
-    # Save `last.ckpt` once per epoch (0 => disabled).
     every_n_epochs: 1
   resume_from: null
   accumulate_grad_batches: 8
@@ -561,58 +405,16 @@ trainer:
   gradient_clip_algorithm: norm
   swa:
     enabled: true
-    # Base SWA LR for head/other params. When auto_lrs=true, this is used for the head group.
     swa_lrs: 0.0001
-    # build per-parameter-group SWA LRs (head/UW/LoRA) automatically.
     auto_lrs: true
-    # freeze LoRA during SWA (requires_grad=False + lr=0 for LoRA param groups).
     freeze_lora: false
-    # Optional: override SWA LR for UW params (defaults to swa_lrs when omitted).
-    # uw_swa_lr: 0.0001
-    # Optional: if freeze_lora=false, you can set a non-zero LoRA SWA LR here.
-    # lora_swa_lr: 0.00005
-    # Hard-set LoRA lr to this value when SWA starts (default: 0).
     freeze_lora_lr: 0.0
     swa_epoch_start: 0.8
     annealing_epochs: 5
     annealing_strategy: cos
-
 logging:
   log_dir: outputs
   ckpt_dir: outputs/checkpoints
   use_loguru: true
-
-# Dense NDVI task configuration (tiles from large PNGs under data/NDVI/{carrot,onion}/)
-ndvi_dense:
-  enabled: false
-  root: /media/dl/dataset/Git/CSIRO/data/NDVI
-  tile_size: 640
-  tile_stride: 448
-  batch_size: 1
-  num_workers: 8
-  normalization:
-    mean: [0.485, 0.456, 0.406]
-    std: [0.229, 0.224, 0.225]
-  augment:
-    horizontal_flip_prob: 0.5
-    # Optional per-task CutMix (falls back to data.augment.cutmix if omitted)
-    cutmix:
-      enabled: true
-      prob: 0.5
-      alpha: 0.3
-      use_prev_for_bsz1: true
-    vertical_flip_prob: 0.0
-
-irish_glass_clover:
-  enabled: false
-  # When true, use Irish Glass Clover samples to supervise the biomass ratio head
-  # (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) derived from dry_total_g_cm2 / dry_clover_g_cm2.
-  supervise_ratio: true
-  # Root directory containing data.csv and images/ for the Irish Glass Clover dataset
-  root: data/irish_glass_clover
-  csv: data.csv
-  image_dir: images
-  # Separate image size for this dataset in YAML is [W, H] (width, height); code parses it to (H, W).
-  # Augmentation config is reused from `data.augment`.
-  # You can adjust this to match the native resolution of the Irish images.
-  image_size: [800, 800]
+seed: 42
+version: ray-v1

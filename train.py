@@ -53,7 +53,7 @@ def main():
         source_config_path=args.config,
         extra_callbacks=None,
         enable_post_kfold_swa_eval=True,
-    )
+            )
 
 
 if __name__ == "__main__":
