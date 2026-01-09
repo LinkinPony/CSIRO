@@ -27,6 +27,12 @@ RAY_MAX_WORKER_PORT="${RAY_MAX_WORKER_PORT:-10100}"
 PROMETHEUS_HOST_PORT="${PROMETHEUS_HOST_PORT:-9091}"
 GRAFANA_HOST_PORT="${GRAFANA_HOST_PORT:-3000}"
 
+# Ray's built-in Grafana dashboards filter on `ray_io_cluster=~"$Cluster"` by default.
+# On bare-metal Ray (non-KubeRay), the `ray_io_cluster` label is usually absent, which
+# makes the dashboards look empty even though metrics exist. We fix this by injecting
+# a constant `ray_io_cluster` label at scrape time.
+RAY_IO_CLUSTER_LABEL_VALUE="${RAY_IO_CLUSTER_LABEL_VALUE:-local}"
+
 PROM_PID_FILE="${PROM_PID_FILE:-/tmp/ray_prometheus.pid}"
 PROM_LOG_FILE="${PROM_LOG_FILE:-/tmp/ray_prometheus.log}"
 PROM_DATA_DIR="${PROM_DATA_DIR:-/tmp/ray_prometheus_data}"
@@ -78,6 +84,7 @@ stop_prometheus_if_running() {
 
 start_prometheus() {
   local prom_cfg="/tmp/ray/session_latest/metrics/prometheus/prometheus.yml"
+  local prom_cfg_patched="/tmp/ray/session_latest/metrics/prometheus/prometheus.patched.yml"
 
   # Pick a free port before starting Ray so Ray can generate Grafana datasource config correctly.
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${PROMETHEUS_HOST_PORT}\$"; then
@@ -122,11 +129,40 @@ start_prometheus() {
   stop_prometheus_if_running
   mkdir -p "${PROM_DATA_DIR}"
 
+  # Patch Prometheus config to inject `ray_io_cluster` label so Ray's Grafana dashboards work.
+  # We write a separate file to avoid mutating Ray-managed configs.
+  python - <<PY
+import pathlib
+try:
+    import yaml
+except Exception as e:
+    raise SystemExit(f"PyYAML is required to patch prometheus config (import yaml failed): {e}")
+
+src = pathlib.Path("${prom_cfg}")
+dst = pathlib.Path("${prom_cfg_patched}")
+cfg = yaml.safe_load(src.read_text(encoding="utf-8"))
+if not isinstance(cfg, dict):
+    raise SystemExit("Unexpected prometheus.yml structure (expected a mapping).")
+
+scrapes = cfg.get("scrape_configs") or []
+for sc in scrapes:
+    if sc.get("job_name") == "ray":
+        relabels = sc.get("relabel_configs") or []
+        # Avoid duplicates.
+        if not any(isinstance(r, dict) and r.get("target_label") == "ray_io_cluster" for r in relabels):
+            relabels.append({"target_label": "ray_io_cluster", "replacement": "${RAY_IO_CLUSTER_LABEL_VALUE}"})
+        sc["relabel_configs"] = relabels
+
+cfg["scrape_configs"] = scrapes
+dst.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+print(f"Wrote patched Prometheus config: {dst} (ray_io_cluster={${RAY_IO_CLUSTER_LABEL_VALUE!r}})")
+PY
+
   echo "Starting Prometheus: ${prom_bin} (port=${PROMETHEUS_HOST_PORT})"
-  echo "  config: ${prom_cfg}"
+  echo "  config: ${prom_cfg_patched}"
   echo "  log   : ${PROM_LOG_FILE}"
   nohup "${prom_bin}" \
-    --config.file="${prom_cfg}" \
+    --config.file="${prom_cfg_patched}" \
     --web.listen-address="0.0.0.0:${PROMETHEUS_HOST_PORT}" \
     --storage.tsdb.path="${PROM_DATA_DIR}" \
     --web.enable-lifecycle \
@@ -198,6 +234,7 @@ echo "Ray metrics integration:"
 echo "  RAY_PROMETHEUS_HOST=${RAY_PROMETHEUS_HOST}"
 echo "  RAY_GRAFANA_HOST=${RAY_GRAFANA_HOST}"
 echo "  RAY_GRAFANA_IFRAME_HOST=${RAY_GRAFANA_IFRAME_HOST}"
+echo "  ray_io_cluster label=${RAY_IO_CLUSTER_LABEL_VALUE}"
 
 # --- 2) Start Ray head ---
 ray stop -f
