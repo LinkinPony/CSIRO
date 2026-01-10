@@ -15,6 +15,10 @@ gradient_clip_val: 1.0
 gradient_clip_algorithm: norm
 swa:
   enabled: true
+  # When true (default), SWA target LRs are set at SWA start to the optimizer's *current*
+  # per-param-group LRs (after warmup/cosine scheduling). This avoids an LR "jump" when
+  # using HPO (or very small base LRs) and keeps SWA stable across runs.
+  adaptive_lrs: true
   swa_lrs: 0.0001
   auto_lrs: true
   freeze_lora: false

@@ -1,15 +1,3 @@
-# --- Ray Tune best-so-far export ---
-# metric: val_loss_5d_weighted
-# mode: min
-# scope: best
-# min_epoch: 1
-# best_val_loss_5d_weighted: 0.11776233464479446
-# epoch: 31
-# done: False
-# trial_id: d9a15_00042
-# trial_dir: /media/dl/dataset/ray_results/tune-vitdet-v1-12h/trainable_d9a15_00042_42_model_backbone_layers_layer_fusion=mean,model_head_activation=silu,model_head_dropout=0.2090,model_head_h_2026-01-10_10-19-19
-# ----------------------------------
-
 data:
   root: data
   train_csv: train.csv
@@ -285,25 +273,18 @@ model:
   embedding_dim: 1280
   log_scale_targets: false
   head:
-    type: vitdet
-    vitdet_dim: 320
-    vitdet_patch_size: 16
-    vitdet_scale_factors:
-    - 2.0
-    - 1.0
-    - 0.5
+    type: mlp
     hidden_dims:
-    - 512
-    - 256
-    activation: silu
-    dropout: 0.2089777330012721
-    ratio_head_mode: separate_spatial
+    - 320
+    activation: relu
+    dropout: 0.3313352841048768
     use_output_softplus: true
     use_cls_token: false
     use_patch_reg3: false
     dual_branch:
       enabled: false
       alpha_init: 0.2
+    ratio_head_mode: separate_mlp
   backbone_layers:
     enabled: true
     layer_fusion: mean
@@ -340,10 +321,10 @@ peft:
   method: lora
   use_dora: true
   r: 8
-  lora_alpha: 32
-  lora_dropout: 0.149704740852944
+  lora_alpha: 16
+  lora_dropout: 0.05
   init: true
-  last_k_blocks: 4
+  last_k_blocks: 6
   layers_pattern: blocks
   target_modules:
   - qkv
@@ -351,9 +332,9 @@ peft:
   - w1
   - w2
   - w3
-  lora_lr: 0.0006487573903040899
+  lora_lr: 2.6586240353335924e-05
   lora_weight_decay: 0.0
-  lora_llrd: 0.945198463734411
+  lora_llrd: 1.0
   lora_group_size: 1
 loss:
   weighting: uw
@@ -367,8 +348,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 4.4036623128462054e-05
-  weight_decay: 4.722348155739709e-05
+  lr: 0.0006714090428821457
+  weight_decay: 0.04349247331822701
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -395,13 +376,13 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 5
+  warmup_epochs: 0
   warmup_start_factor: 0.1
 kfold:
-  enabled: true
+  enabled: false
   k: 5
   even_split: false
-  folds: [0]
+  folds: null
 trainer:
   max_epochs: 45
   accelerator: auto
@@ -431,4 +412,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: vitdet-finetune-42
+version: tune-v5

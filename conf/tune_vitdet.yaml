@@ -1,0 +1,158 @@
+defaults:
+  # Base training config (same as other Tune runs)
+  - experiment@_global_: baseline_no_irish
+  # Switch to ViTDet-style head for this sweep
+  - override /model/head: vitdet
+  # Enable LoRA for HPO runs (the baseline experiment keeps it disabled by default).
+  - override /train/peft: lora
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
+
+# HPO should run a single split by default (fast). After selecting best config,
+# rerun `train.py --config <best_cfg.yaml>` (or `train_hydra.py`) with train_all/kfold enabled.
+kfold:
+  enabled: false
+  folds: null
+train_all:
+  enabled: false
+
+trainer:
+  # Keep the same per-trial training budget as the previous tune; longer wall time is achieved
+  # by increasing `tune.num_samples`.
+  max_epochs: 45
+  limit_train_batches: 1500
+  log_every_n_steps: 10
+  checkpoint:
+    every_n_epochs: 1
+
+data:
+  # Reduce loader contention when running multiple trials across the 2 machines.
+  num_workers: 8
+  prefetch_factor: 2
+
+ray:
+  # For a Ray cluster started via `ray start ...`, use `auto`.
+  # For Ray Client, use: "ray://<head_ip>:10001"
+  address: auto
+
+tune:
+  # Target wall time (~12h): previous sweep used 20 samples (~4h); 60 ~= 3x trials ~= 3x time.
+  name: tune-vitdet-v1-12h
+  resume: false
+  restore_path: null
+  resume_unfinished: true
+  resume_errored: true
+  restart_errored: false
+  storage_path: ray_results
+
+  metric: val_loss_5d_weighted
+  mode: min
+
+  num_samples: 60
+  max_concurrent_trials: 2
+  resources_per_trial:
+    cpu: 8
+    gpu: 1
+
+  scheduler:
+    type: asha
+    max_epochs: ${trainer.max_epochs}
+    # Keep a decent minimum training length before pruning (epoch reporting is 1-based).
+    grace_period: 15
+    reduction_factor: 2
+
+  seeds: [42]
+  report_per_epoch: true
+
+  # Search space spec. Keys are dotted paths into the training config.
+  # Notes:
+  # - We avoid very heavy ViTDet pyramids (e.g. scale 4.0) to reduce OOM risk in HPO.
+  search_space:
+    # ---- ViTDet head (spatial pyramid + pooled MLP) ----
+    model.head.vitdet_dim:
+      type: choice
+      values: [256, 320, 512, 640]
+    model.head.vitdet_scale_factors:
+      type: choice
+      values:
+        - [2.0, 1.0, 0.5]
+        - [2.0, 1.0]
+        - [1.0, 0.5, 0.25]
+        - [2.0, 1.0, 0.5, 0.25]
+    model.head.hidden_dims:
+      type: choice
+      values:
+        - []          # linear head on pooled pyramid features
+        - [256]
+        - [512]
+        - [1024]
+        - [512, 256]
+        - [1024, 512]
+        - [1280]
+    model.head.activation:
+      type: choice
+      values: [relu, gelu, silu]
+    model.head.dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.5
+    model.head.ratio_head_mode:
+      type: choice
+      values: [shared, separate_mlp, separate_spatial]
+
+    # Multi-layer fusion when `model.backbone_layers.enabled=true` (baseline uses multi-layer).
+    model.backbone_layers.layer_fusion:
+      type: choice
+      values: [mean, learned]
+
+    # ---- LoRA (backbone adapters) ----
+    peft.last_k_blocks:
+      type: choice
+      values: [2, 4, 6, 8, 12, 16]
+    peft.target_modules:
+      type: choice
+      values:
+        - [qkv, proj]
+        - [qkv, proj, w1, w2, w3]
+        - [qkv]
+    peft.use_dora:
+      type: choice
+      values: [true, false]
+    peft.r:
+      type: choice
+      values: [4, 8, 16]
+    peft.lora_alpha:
+      type: choice
+      values: [8, 16, 32]
+    peft.lora_dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.15
+    peft.lora_llrd:
+      type: uniform
+      lower: 0.8
+      upper: 1.0
+    peft.lora_lr:
+      type: loguniform
+      lower: 1.0e-5
+      upper: 3.0e-3
+
+    # ---- Optimizer / scheduler ----
+    optimizer.lr:
+      type: loguniform
+      lower: 1.0e-5
+      upper: 3.0e-2
+    optimizer.weight_decay:
+      type: loguniform
+      lower: 1.0e-6
+      upper: 1.0e-1
+    scheduler.warmup_epochs:
+      type: choice
+      values: [0, 1, 2, 3, 5]
+

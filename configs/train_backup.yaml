@@ -561,6 +561,9 @@ trainer:
   gradient_clip_algorithm: norm
   swa:
     enabled: true
+    # When true (default), SWA target LRs follow the optimizer's current per-param-group LRs
+    # at SWA start (avoids LR jumps late in training).
+    adaptive_lrs: true
     # Base SWA LR for head/other params. When auto_lrs=true, this is used for the head group.
     swa_lrs: 0.0001
     # build per-parameter-group SWA LRs (head/UW/LoRA) automatically.

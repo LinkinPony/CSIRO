@@ -3,11 +3,11 @@
 # mode: min
 # scope: best
 # min_epoch: 1
-# best_val_loss_5d_weighted: 0.11776233464479446
-# epoch: 31
+# best_val_loss_5d_weighted: 0.1695544421672821
+# epoch: 24
 # done: False
-# trial_id: d9a15_00042
-# trial_dir: /media/dl/dataset/ray_results/tune-vitdet-v1-12h/trainable_d9a15_00042_42_model_backbone_layers_layer_fusion=mean,model_head_activation=silu,model_head_dropout=0.2090,model_head_h_2026-01-10_10-19-19
+# trial_id: d9a15_00057
+# trial_dir: /media/dl/dataset/ray_results/tune-vitdet-v1-12h/trainable_d9a15_00057_57_model_backbone_layers_layer_fusion=learned,model_head_activation=silu,model_head_dropout=0.1805,model_hea_2026-01-10_13-42-00
 # ----------------------------------
 
 data:
@@ -286,18 +286,19 @@ model:
   log_scale_targets: false
   head:
     type: vitdet
-    vitdet_dim: 320
+    vitdet_dim: 640
     vitdet_patch_size: 16
     vitdet_scale_factors:
     - 2.0
     - 1.0
     - 0.5
+    - 0.25
     hidden_dims:
+    - 1024
     - 512
-    - 256
     activation: silu
-    dropout: 0.2089777330012721
-    ratio_head_mode: separate_spatial
+    dropout: 0.1804547835243886
+    ratio_head_mode: separate_mlp
     use_output_softplus: true
     use_cls_token: false
     use_patch_reg3: false
@@ -306,7 +307,7 @@ model:
       alpha_init: 0.2
   backbone_layers:
     enabled: true
-    layer_fusion: mean
+    layer_fusion: learned
     separate_bottlenecks: true
     indices_by_backbone:
       dinov3_vitl16:
@@ -339,9 +340,9 @@ peft:
   enabled: true
   method: lora
   use_dora: true
-  r: 8
+  r: 4
   lora_alpha: 32
-  lora_dropout: 0.149704740852944
+  lora_dropout: 0.12695945587261495
   init: true
   last_k_blocks: 4
   layers_pattern: blocks
@@ -351,9 +352,9 @@ peft:
   - w1
   - w2
   - w3
-  lora_lr: 0.0006487573903040899
+  lora_lr: 0.0005164782968633161
   lora_weight_decay: 0.0
-  lora_llrd: 0.945198463734411
+  lora_llrd: 0.8653040002855305
   lora_group_size: 1
 loss:
   weighting: uw
@@ -367,8 +368,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 4.4036623128462054e-05
-  weight_decay: 4.722348155739709e-05
+  lr: 4.893336823527469e-05
+  weight_decay: 1.0163659600958655e-05
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -395,13 +396,13 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 5
+  warmup_epochs: 1
   warmup_start_factor: 0.1
 kfold:
   enabled: true
   k: 5
   even_split: false
-  folds: [0]
+  folds: null
 trainer:
   max_epochs: 45
   accelerator: auto
@@ -431,4 +432,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: vitdet-finetune-42
+version: vitdet-finetune

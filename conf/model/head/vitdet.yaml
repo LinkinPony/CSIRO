@@ -1,0 +1,30 @@
+# @package model.head
+
+type: vitdet
+
+# ViTDet (SimpleFeaturePyramid-style) settings.
+# NOTE: `vitdet_patch_size` must match the backbone patch size (DINOv3 ViT-*16 => 16).
+vitdet_dim: 320
+vitdet_patch_size: 16
+# Default: [2.0, 1.0, 0.5] (lighter than including 4.0)
+vitdet_scale_factors: [2.0, 1.0, 0.5]
+
+# Scalar bottleneck MLP on pooled pyramid features (GAP -> concat -> MLP -> Linear).
+hidden_dims: [512]
+activation: relu
+dropout: 0.2
+
+# Biomass ratio head coupling mode:
+# - shared          : ratio shares spatial head + scalar MLP trunk (default)
+# - separate_mlp     : ratio uses an independent scalar MLP branch (shared pyramid)
+# - separate_spatial : ratio uses a fully independent spatial head (duplicate pyramid + MLP)
+ratio_head_mode: shared
+
+# The following are MLP-only options kept for backward compatibility; ignored by vitdet head.
+use_output_softplus: true
+use_cls_token: false
+use_patch_reg3: false
+dual_branch:
+  enabled: false
+  alpha_init: 0.2
+

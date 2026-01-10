@@ -222,6 +222,7 @@ def main(cfg: DictConfig) -> None:
         raise RuntimeError(f"Failed to init Ray (address={ray_address!r}): {e}") from e
 
     from ray import air, tune
+    from ray.tune import CLIReporter
     from ray.tune.schedulers import ASHAScheduler
 
     param_space = _build_search_space(space_spec)
@@ -244,6 +245,32 @@ def main(cfg: DictConfig) -> None:
         scheduler = None
     else:
         raise ValueError(f"Unsupported scheduler.type: {scheduler_type!r}")
+
+    # Progress reporting (CLI). The Ray Dashboard also shows metrics per-trial, but this gives
+    # a quick view of the current/best objective during execution (useful when watching logs).
+    try:
+        metric_cols: dict[str, str] = {
+            "epoch": "epoch",
+            str(metric): "obj",
+            "val_loss": "val_loss",
+            "val_r2": "val_r2",
+            "val_r2_global": "val_r2_g",
+        }
+        param_cols: dict[str, str] = {}
+        for k in sorted((space_spec or {}).keys()):
+            kk = str(k)
+            # Dotted keys are verbose; use the leaf name as the displayed column header.
+            disp = kk.split(".")[-1] if "." in kk else kk
+            param_cols[kk] = disp
+        progress_reporter = CLIReporter(
+            metric_columns=metric_cols,
+            parameter_columns=param_cols,
+            metric=str(metric),
+            mode=str(mode),
+            sort_by_metric=True,
+        )
+    except Exception:
+        progress_reporter = None
 
     def trainable(config: dict) -> None:
         # Note: executed on Ray workers.
@@ -360,6 +387,17 @@ def main(cfg: DictConfig) -> None:
                 # Re-specify param_space for safety (must be unmodified for restore).
                 param_space=param_space,
             )
+            # Best-effort: inject the progress reporter for restored runs too.
+            # Ray's public `Tuner.restore()` API doesn't accept a RunConfig override.
+            if progress_reporter is not None:
+                try:
+                    local_tuner = getattr(tuner, "_local_tuner", None)
+                    if local_tuner is not None:
+                        rc = getattr(local_tuner, "_run_config", None)
+                        if rc is not None:
+                            rc.progress_reporter = progress_reporter
+                except Exception:
+                    pass
         else:
             logger.info(
                 "Resume requested but restore path does not exist yet: {}. Starting a new run instead.",
@@ -378,6 +416,7 @@ def main(cfg: DictConfig) -> None:
                 run_config=air.RunConfig(
                     name=name,
                     storage_path=str(storage_path),
+                    progress_reporter=progress_reporter,
                 ),
             )
     else:
@@ -394,6 +433,7 @@ def main(cfg: DictConfig) -> None:
             run_config=air.RunConfig(
                 name=name,
                 storage_path=str(storage_path),
+                progress_reporter=progress_reporter,
             ),
         )
 
@@ -408,9 +448,49 @@ def main(cfg: DictConfig) -> None:
     )
     results = tuner.fit()
 
-    # Save best config as a resolved training config YAML for convenience.
+    # Save best config as a resolved training config YAML for convenience and log best metrics.
     try:
         best = results.get_best_result(metric=metric, mode=mode)
+        best_metrics: dict[str, Any] = {}
+        try:
+            raw = getattr(best, "metrics", None)
+            if isinstance(raw, dict):
+                best_metrics = dict(raw)
+        except Exception:
+            best_metrics = {}
+
+        best_value = best_metrics.get(str(metric), None)
+        best_epoch = best_metrics.get("epoch", None)
+
+        best_trial_dir = ""
+        try:
+            p = getattr(best, "path", None)
+            best_trial_dir = str(p) if p is not None else ""
+        except Exception:
+            best_trial_dir = ""
+        if not best_trial_dir:
+            try:
+                best_trial_dir = str(getattr(best, "log_dir", "") or "")
+            except Exception:
+                best_trial_dir = ""
+
+        best_trial_id = best_metrics.get("trial_id", None)
+        if best_trial_id is None:
+            try:
+                best_trial_id = getattr(best, "trial_id", None)
+            except Exception:
+                best_trial_id = None
+
+        logger.info(
+            "Tune best: metric={}({}) -> {} (epoch={}, trial_id={}, trial_dir={})",
+            metric,
+            mode,
+            best_value,
+            best_epoch,
+            best_trial_id,
+            best_trial_dir,
+        )
+
         best_overrides = dict(best.config or {})
         best_cfg = copy.deepcopy(train_cfg)
         for k, v in best_overrides.items():
@@ -422,6 +502,23 @@ def main(cfg: DictConfig) -> None:
         import yaml
 
         with open(out_path, "w", encoding="utf-8") as f:
+            # Prepend a short summary as YAML comments so the best metric is visible
+            # when browsing the config file directly.
+            header_lines = [
+                "# --- Ray Tune best result ---",
+                f"# metric: {metric}",
+                f"# mode: {mode}",
+            ]
+            if best_value is not None:
+                header_lines.append(f"# best_{metric}: {best_value}")
+            if best_epoch is not None:
+                header_lines.append(f"# epoch: {best_epoch}")
+            if best_trial_id not in (None, "", "null"):
+                header_lines.append(f"# trial_id: {best_trial_id}")
+            if best_trial_dir:
+                header_lines.append(f"# trial_dir: {best_trial_dir}")
+            header_lines.append("# ----------------------------")
+            f.write("\n".join(header_lines) + "\n\n")
             yaml.safe_dump(best_cfg, f, sort_keys=False, allow_unicode=True)
         logger.info("Saved best resolved training config -> {}", out_path)
     except Exception as e:

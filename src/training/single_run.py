@@ -11,6 +11,7 @@ from lightning.pytorch.callbacks import (
 )
 from loguru import logger
 
+from src.callbacks.adaptive_swa_lrs import AdaptiveSwaLrsOnStart
 from src.callbacks.freeze_lora_on_swa import FreezeLoraOnSwaStart
 from src.callbacks.head_checkpoint import HeadCheckpoint
 from src.data.datamodule import PastureDataModule
@@ -693,6 +694,7 @@ def train_single_split(
     swa_cfg = cfg.get("trainer", {}).get("swa", {})
     if bool(swa_cfg.get("enabled", False)):
         try:
+            adaptive_lrs = bool(swa_cfg.get("adaptive_lrs", True))
             # 方案 B: build SWA per-param-group LRs (head/UW/LoRA) instead of forcing a single scalar LR.
             auto_lrs = bool(swa_cfg.get("auto_lrs", True))
             freeze_lora = bool(swa_cfg.get("freeze_lora", True))
@@ -723,6 +725,10 @@ def train_single_split(
                 annealing_epochs=int(swa_cfg.get("annealing_epochs", 5)),
                 annealing_strategy=str(swa_cfg.get("annealing_strategy", "cos")),
             )
+            # IMPORTANT: add adaptive LR patcher BEFORE SWA callback, so it can update
+            # SWA's internal target LRs before SWA initializes its scheduler.
+            if adaptive_lrs:
+                callbacks.append(AdaptiveSwaLrsOnStart(swa_callback=swa_cb))
             callbacks.append(swa_cb)
             # 方案 C: freeze LoRA during SWA (hard stop on grads + lr=0).
             #

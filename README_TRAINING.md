@@ -158,6 +158,22 @@ Outputs:
   (typically: `ray_results/<tune.name>/best_train_cfg.yaml`).
   You can feed it into `python train.py --config ...` for a final full training run.
 
+Export best-so-far **during** a running Tune (no need to wait for `tune.py` to finish):
+```bash
+# Export "best so far" by scanning per-trial progress.csv/params.json under the experiment dir.
+# Tip: set --min-epoch to match ASHA grace_period (e.g. 15) to avoid picking very early noisy results.
+python tools/export_best_tune_cfg.py \
+  --config-name tune_vitdet \
+  --exp-dir /mnt/csiro_nfs/ray_results/tune-vitdet-v1-12h \
+  --scope best \
+  --min-epoch 15
+
+# Or export the config for a specific trial directory (useful when you spot a good run in ray_results/).
+python tools/export_best_tune_cfg.py \
+  --config-name tune_vitdet \
+  --trial-dir /mnt/csiro_nfs/ray_results/tune-vitdet-v1-12h/<trial_dir_name>
+```
+
 Versioning guidance:
 - Use a unique `tune.name` per search run (include date/time and optionally git commit).
 - Do **not** change the search space (or code) and then try to resume the old run. Start a new run instead (new `tune.name`).
