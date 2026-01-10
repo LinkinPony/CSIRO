@@ -77,8 +77,21 @@ class RayTuneReportCallback(Callback):
         payload: dict[str, Any] = {"epoch": int(getattr(trainer, "current_epoch", 0)) + 1}
         if val_loss is not None:
             payload["val_loss"] = float(val_loss)
-        if val_r2 is not None:
-            payload["val_r2"] = float(val_r2)
+        # NOTE (Ray strict metric checking):
+        # When `tune.metric=val_r2`, Ray requires every `session.report()` call to include `val_r2`.
+        # In this repo, `val_r2` is logged in the LightningModule's `on_validation_epoch_end`,
+        # which can occur *after* callback hooks in some Lightning versions. This can cause the
+        # very first reported result (epoch=1) to miss `val_r2`, crashing Tune.
+        #
+        # To make Tune robust, always include `val_r2`:
+        # - Prefer the true `val_r2` when available.
+        # - Fall back to `val_r2_global` if present.
+        # - Otherwise emit a conservative sentinel (very low r²) so Ray can proceed.
+        if val_r2 is None:
+            val_r2 = val_r2_global
+        if val_r2 is None:
+            val_r2 = -1.0e9
+        payload["val_r2"] = float(val_r2)
         if val_r2_global is not None:
             payload["val_r2_global"] = float(val_r2_global)
         if val_loss_reg3_mse is not None:
@@ -94,7 +107,6 @@ class RayTuneReportCallback(Callback):
         if val_loss_state is not None:
             payload["val_loss_state"] = float(val_loss_state)
 
-        if len(payload) > 1:
-            session.report(payload)
+        session.report(payload)
 
 
