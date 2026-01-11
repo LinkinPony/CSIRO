@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -105,9 +105,125 @@ def load_head_state(pt_path: str) -> Tuple[dict, dict, Optional[dict]]:
         raise FileNotFoundError(f"Head weights not found: {pt_path}")
     obj = torch_load_cpu(pt_path, mmap=None, weights_only=True)
     if isinstance(obj, dict) and "state_dict" in obj:
-        return obj["state_dict"], obj.get("meta", {}), obj.get("peft", None)
+        state = obj["state_dict"]
+        meta_raw = obj.get("meta", {})
+        meta: Dict[str, Any] = dict(meta_raw) if isinstance(meta_raw, dict) else {}
+        return state, _reconcile_head_meta_with_state_dict(meta, state), obj.get("peft", None)
     if isinstance(obj, dict):
         return obj, {}, obj.get("peft", None)
     raise RuntimeError("Unsupported head weights file format. Expect a dict with 'state_dict'.")
+
+
+def _infer_sequential_linear_hidden_dims_from_state_dict(
+    state_dict: Dict[str, Any],
+    *,
+    root_prefix: Tuple[str, ...],
+    seq_name: str,
+) -> List[int]:
+    """
+    Best-effort infer MLP hidden dims from Sequential Linear weights in a state_dict.
+
+    We look for keys like:
+      - scalar_mlp.<idx>.weight
+      - heads.0.scalar_mlp.<idx>.weight
+
+    Returns:
+      A list of out_features in ascending module index order, e.g. [512, 256].
+      Returns [] if no matching Linear weights are found.
+    """
+    dims_by_idx: Dict[int, int] = {}
+    for k, v in state_dict.items():
+        if not isinstance(k, str):
+            continue
+        if not (isinstance(v, torch.Tensor) and v.ndim == 2):
+            continue
+        parts = k.split(".")
+        # Apply optional prefix (e.g., ("heads","0") for ViTDetMultiLayerScalarHead)
+        if root_prefix:
+            if tuple(parts[: len(root_prefix)]) != tuple(root_prefix):
+                continue
+            parts = parts[len(root_prefix) :]
+        # Expect: <seq_name>.<idx>.weight
+        if len(parts) != 3:
+            continue
+        if parts[0] != seq_name:
+            continue
+        if parts[2] != "weight":
+            continue
+        idx_s = parts[1]
+        if not idx_s.isdigit():
+            continue
+        dims_by_idx[int(idx_s)] = int(v.shape[0])
+    if not dims_by_idx:
+        return []
+    return [dims_by_idx[i] for i in sorted(dims_by_idx)]
+
+
+def _infer_vitdet_head_hidden_dims(state_dict: Dict[str, Any]) -> List[int]:
+    """
+    Infer ViTDet head bottleneck hidden_dims from the exported state_dict.
+
+    This is used for backward compatibility with older exported heads where
+    `meta['head_hidden_dims']` was recorded as [] but the actual head weights
+    include an MLP (e.g., 960 -> 512 -> 256).
+    """
+    # Prefer the first sub-head if this is a multi-layer wrapper.
+    head_idxs: List[int] = []
+    for k in state_dict.keys():
+        if not isinstance(k, str):
+            continue
+        parts = k.split(".")
+        if len(parts) >= 3 and parts[0] == "heads" and parts[1].isdigit() and parts[2] == "scalar_mlp":
+            try:
+                head_idxs.append(int(parts[1]))
+            except Exception:
+                continue
+    root_prefix: Tuple[str, ...]
+    if head_idxs:
+        root_prefix = ("heads", str(min(head_idxs)))
+    else:
+        root_prefix = ()
+    return _infer_sequential_linear_hidden_dims_from_state_dict(state_dict, root_prefix=root_prefix, seq_name="scalar_mlp")
+
+
+def _reconcile_head_meta_with_state_dict(meta: Dict[str, Any], state_dict: dict) -> Dict[str, Any]:
+    """
+    Backward-compatible meta reconciliation for strict head loading.
+
+    Problem we guard against:
+      - Some older training runs treated `head_hidden_dims=[]` as "unset" and silently
+        fell back to the default [512, 256] *during model construction*.
+      - The exported head checkpoint stored the actual weights (with the MLP) but wrote
+        meta `head_hidden_dims: []`, causing strict load failures in inference/packaging.
+
+    Strategy:
+      - For ViTDet heads only, if meta declares an empty `head_hidden_dims` but the state_dict
+        contains Linear weights inside `scalar_mlp`, infer the hidden dims and override meta.
+      - If there are no `scalar_mlp` Linear weights, keep [] (this corresponds to a true linear head).
+    """
+    try:
+        head_type = str(meta.get("head_type", "") or "").strip().lower()
+    except Exception:
+        head_type = ""
+    if head_type != "vitdet":
+        return meta
+
+    hd = meta.get("head_hidden_dims", None)
+    try:
+        hd_list = list(hd) if isinstance(hd, (list, tuple)) else None
+    except Exception:
+        hd_list = None
+
+    # Only override when meta *explicitly* says "no hidden dims" but weights clearly contain an MLP.
+    if hd_list is not None and len(hd_list) == 0 and isinstance(state_dict, dict):
+        inferred = _infer_vitdet_head_hidden_dims(state_dict)
+        if inferred:
+            meta2 = dict(meta)
+            meta2["head_hidden_dims"] = [int(x) for x in inferred]
+            # Optional breadcrumb for debugging (not relied upon by inference code)
+            meta2["head_hidden_dims_inferred_from_state_dict"] = True
+            return meta2
+
+    return meta
 
 

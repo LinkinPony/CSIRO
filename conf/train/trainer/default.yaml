@@ -14,7 +14,9 @@ accumulate_grad_batches: 8
 gradient_clip_val: 1.0
 gradient_clip_algorithm: norm
 swa:
-  enabled: true
+  # NOTE: EMA is now the preferred averaging strategy in this repo.
+  # Keep SWA config for backward compatibility, but disable it by default.
+  enabled: false
   # When true (default), SWA target LRs are set at SWA start to the optimizer's *current*
   # per-param-group LRs (after warmup/cosine scheduling). This avoids an LR "jump" when
   # using HPO (or very small base LRs) and keeps SWA stable across runs.
@@ -26,5 +28,17 @@ swa:
   swa_epoch_start: 0.8
   annealing_epochs: 5
   annealing_strategy: cos
+
+ema:
+  # Exponential Moving Average of weights. When enabled with eval_with_ema=true,
+  # validation metrics (including val_r2) reflect the averaged model, which aligns
+  # HPO selection with the final exported weights.
+  enabled: true
+  decay: 0.999
+  update_every_n_steps: 1
+  start_step: 0
+  eval_with_ema: true
+  apply_at_end: true
+  trainable_only: true
 
 

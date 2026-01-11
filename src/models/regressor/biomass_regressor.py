@@ -574,7 +574,17 @@ class BiomassRegressor(
         # --------------------
         # Head-type initialization (mlp/fpn/dpt)
         # --------------------
-        hidden_dims: List[int] = list(head_hidden_dims or [512, 256])
+        # IMPORTANT semantic note:
+        # - For ViTDet heads, an explicit empty list `[]` is meaningful and disables the bottleneck MLP
+        #   (linear heads on pooled pyramid features).
+        # - For other head types, we keep legacy behavior where "unset" (None/[]) falls back to [512, 256].
+        ht = str(self._head_type or "mlp").strip().lower()
+        if head_hidden_dims is None:
+            hidden_dims: List[int] = [512, 256]
+        elif ht == "vitdet":
+            hidden_dims = list(head_hidden_dims)
+        else:
+            hidden_dims = list(head_hidden_dims or [512, 256])
         bottleneck_dim = init_head_by_type(
             self,
             head_type=str(self._head_type),

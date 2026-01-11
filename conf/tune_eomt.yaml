@@ -1,8 +1,8 @@
 defaults:
   # Base training config (same as other Tune runs)
   - experiment@_global_: baseline_no_irish
-  # Switch to ViTDet-style head for this sweep
-  - override /model/head: vitdet
+  # Switch to EoMT-style head for this sweep
+  - override /model/head: eomt
   # Enable LoRA for HPO runs (the baseline experiment keeps it disabled by default).
   - override /train/peft: lora
   - _self_
@@ -23,7 +23,7 @@ train_all:
   enabled: false
 
 trainer:
-  max_epochs: 45
+  max_epochs: 40
   limit_train_batches: 1500
   log_every_n_steps: 10
   checkpoint:
@@ -53,16 +53,15 @@ ray:
   # For Ray Client, use: "ray://<head_ip>:10001"
   address: auto
 
-# Fixed (non-search) defaults based on the r^2 analysis of the previous sweep:
-# - Avoid GELU (high failure rate at larger LRs)
-# - Prefer qkv-only LoRA modules (best mean r^2)
-# - Disable DoRA (small negative average effect)
-# - Fix ViTDet scale factors to the strongest mean choice
+# Fixed (non-search) defaults.
 model:
   backbone_layers:
     layer_fusion: learned
   head:
-    vitdet_scale_factors: [2.0, 1.0, 0.5]
+    eomt:
+      # Keep the legacy (cheap) representation by default: use mean pooled query output.
+      # Additional sources (mean_patch/cls) can be enabled via Tune search_space below.
+      use_mean_query: true
 
 peft:
   use_dora: false
@@ -73,7 +72,7 @@ peft:
   lora_llrd: 0.9
 
 tune:
-  name: tune-vitdet-v4
+  name: tune-eomt-v1
   resume: false
   restore_path: null
   resume_unfinished: true
@@ -82,7 +81,7 @@ tune:
   storage_path: ray_results
 
   # Optimize r^2 directly (Ray metric name matches Lightning log name).
-  metric: val_r2
+  metric: val_loss_5d_weighted
   mode: max
 
   # Smaller search space => fewer samples needed; override from CLI if you want longer.
@@ -103,9 +102,8 @@ tune:
   report_per_epoch: true
 
   # Two-stage filtering (best cost/perf):
-  # - Stage 1 (cheap): single split HPO (this file already sets kfold.enabled=false).
-  # - Stage 2 (expensive): take the top-N configs from stage 1 and rerun them with k-fold enabled
-  #   (more reliable selection, better aligned with Kaggle/LB correlation).
+  # - Stage 1 (cheap): single split HPO (this file sets kfold.enabled=false).
+  # - Stage 2 (expensive): take the top-N configs from stage 1 and rerun them with k-fold enabled.
   two_stage:
     enabled: true
 
@@ -122,7 +120,6 @@ tune:
     name_suffix: "-stage2-kfold"
 
     # Optional: optimize a different metric in stage 2 (defaults to tune.metric/mode).
-    # This can improve correlation with Kaggle when using a more LB-aligned metric (e.g. val_r2_global).
     # stage2_metric: val_r2_global
     # stage2_mode: max
 
@@ -138,7 +135,6 @@ tune:
     resources_per_trial: ${tune.resources_per_trial}
 
     # Fixed training overrides applied during stage 2 (on top of base config + sampled params).
-    # You can restrict folds by setting `kfold.folds: "0,1,2"` (or an int / list).
     train_overrides:
       kfold.enabled: true
       kfold.k: 5
@@ -153,7 +149,7 @@ tune:
     optimizer.lr:
       type: loguniform
       lower: 1.0e-5
-      upper: 3.0e-3   # prune unstable high-LR region from previous sweep
+      upper: 3.0e-3
     optimizer.weight_decay:
       type: loguniform
       lower: 1.0e-6
@@ -162,21 +158,15 @@ tune:
       type: choice
       values: [1, 3, 5]
 
-    # ---- ViTDet head ----
-    model.head.vitdet_dim:
-      type: choice
-      values: [256, 320]
+    # ---- EoMT head ----
+    # EoMT uses an injected-query head + a scalar MLP on pooled features.
     model.head.hidden_dims:
       type: choice
       values:
-        # NOTE: `[]` is meaningful for ViTDet: it disables the bottleneck MLP (linear heads on pooled pyramid features).
-        # Historically, training treated empty lists as "unset" and silently fell back to [512, 256], which made
-        # exported head meta disagree with the actual weight shapes and could break strict head loading in packaging
-        # (e.g. TabPFN feature extraction in `package_artifacts.py`).
-        - []
-        # Explicit bottleneck dims (also the training default). Keep this explicit in configs to avoid ambiguity.
         - [512, 256]
         - [1024, 512]
+        - [512]
+        - [1024]
     model.head.activation:
       type: choice
       values: [relu, silu]
@@ -184,19 +174,44 @@ tune:
       type: uniform
       lower: 0.05
       upper: 0.35
-    model.head.ratio_head_mode:
+
+    model.head.eomt.num_queries:
       type: choice
-      values: [shared, separate_mlp, separate_spatial]
+      values: [1, 8, 16, 32, 64]
+    model.head.eomt.num_blocks:
+      type: choice
+      values: [1, 2, 4, 6, 8]
+    model.head.eomt.query_pool:
+      type: choice
+      values: [mean, first]
+
+    # Enable extra pooled sources on top of mean_query (kept enabled via fixed defaults above).
+    model.head.eomt.use_mean_patch:
+      type: choice
+      values: [false, true]
+    model.head.eomt.use_cls_token:
+      type: choice
+      values: [false, true]
+
+    # Projection for concatenated sources before the scalar MLP.
+    model.head.eomt.proj_dim:
+      type: choice
+      values: [0, 256, 512, 640, 1280]
+    model.head.eomt.proj_activation:
+      type: choice
+      values: [relu, silu]
+    model.head.eomt.proj_dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.2
 
     # ---- LoRA ----
     peft.last_k_blocks:
       type: choice
-      values: [4, 6, 12, 16]
-    # LoRA capacity (rank) + scaling (alpha). These two together control adapter expressivity
-    # and effective update scale (alpha/r). Keep the range small for fast ASHA pruning.
+      values: [2, 4, 6, 12, 16]
     peft.r:
       type: choice
-      values: [4, 8, 16]
+      values: [2, 4, 8, 16]
     peft.lora_alpha:
       type: choice
       values: [4, 8, 16]
@@ -204,14 +219,11 @@ tune:
       type: loguniform
       lower: 3.0e-5
       upper: 3.0e-3
-    # Regularization / stability knobs (often high impact for regression generalization).
     peft.lora_dropout:
       type: uniform
       lower: 0.0
       upper: 0.1
-    # LoRA layer-wise LR decay (1.0 disables). Helps when adapting many blocks.
     peft.lora_llrd:
       type: choice
       values: [1.0, 0.9, 0.8]
-
 

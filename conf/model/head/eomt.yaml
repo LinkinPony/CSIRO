@@ -1,0 +1,45 @@
+# @package model.head
+
+type: eomt
+
+# EoMT (injected-query) settings.
+# This matches `src/models/eomt_injected_head.py`:
+# - Run the backbone up to (depth - k) blocks WITHOUT queries
+# - Prepend Q learnable query tokens
+# - Run the last k blocks jointly and pool query outputs into a global vector
+eomt:
+  num_queries: 16
+  # Number of last backbone blocks to run with injected queries (k).
+  num_blocks: 4
+  # Pooling strategy over query outputs: "mean" | "first"
+  query_pool: mean
+
+  # Global representation sources (concatenated before optional projection).
+  # Default keeps legacy behavior: mean pooled query output only.
+  use_mean_query: true
+  use_mean_patch: false
+  use_cls_token: false
+
+  # Project concatenated sources down to this dim before the scalar MLP:
+  # - 0: auto (identity in single-source mode; defaults to embedding_dim in multi-source mode)
+  proj_dim: 0
+  proj_activation: relu
+  proj_dropout: 0.0
+
+# Scalar bottleneck MLP after pooling/projection.
+hidden_dims: [512]
+activation: relu
+dropout: 0.2
+
+# Ratio head coupling mode is kept for config/ckpt compatibility.
+# NOTE: for EoMT, ratio logits are produced *inside* the EoMT head (no separate ratio branches).
+ratio_head_mode: shared
+
+# The following are MLP-only options kept for backward compatibility; ignored by eomt head.
+use_output_softplus: true
+use_cls_token: false
+use_patch_reg3: false
+dual_branch:
+  enabled: false
+  alpha_init: 0.2
+

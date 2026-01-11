@@ -12,6 +12,7 @@ from lightning.pytorch.callbacks import (
 from loguru import logger
 
 from src.callbacks.adaptive_swa_lrs import AdaptiveSwaLrsOnStart
+from src.callbacks.ema import ExponentialMovingAverage
 from src.callbacks.freeze_lora_on_swa import FreezeLoraOnSwaStart
 from src.callbacks.head_checkpoint import HeadCheckpoint
 from src.data.datamodule import PastureDataModule
@@ -690,9 +691,30 @@ def train_single_split(
             # Best-effort; avoid failing training due to callback injection issues.
             pass
 
+    # Optional EMA to smooth weights and (optionally) evaluate/report metrics using EMA weights.
+    # This is particularly useful for HPO: Ray Tune will see `val_r2` computed with EMA weights
+    # when `trainer.ema.eval_with_ema=true`, aligning the selection metric with final exported weights.
+    ema_cfg = cfg.get("trainer", {}).get("ema", {}) or {}
+    ema_enabled = bool(ema_cfg.get("enabled", False))
+    if ema_enabled:
+        try:
+            callbacks.append(
+                ExponentialMovingAverage(
+                    decay=float(ema_cfg.get("decay", 0.999)),
+                    update_every_n_steps=int(ema_cfg.get("update_every_n_steps", 1)),
+                    start_step=int(ema_cfg.get("start_step", 0)),
+                    eval_with_ema=bool(ema_cfg.get("eval_with_ema", True)),
+                    apply_at_end=bool(ema_cfg.get("apply_at_end", True)),
+                    trainable_only=bool(ema_cfg.get("trainable_only", True)),
+                )
+            )
+        except Exception as e:
+            logger.warning(f"EMA callback creation failed, continuing without EMA: {e}")
+            ema_enabled = False
+
     # Optional SWA to stabilize small-batch updates
     swa_cfg = cfg.get("trainer", {}).get("swa", {})
-    if bool(swa_cfg.get("enabled", False)):
+    if bool(swa_cfg.get("enabled", False)) and not ema_enabled:
         try:
             adaptive_lrs = bool(swa_cfg.get("adaptive_lrs", True))
             # 方案 B: build SWA per-param-group LRs (head/UW/LoRA) instead of forcing a single scalar LR.
@@ -745,6 +767,8 @@ def train_single_split(
             logger.warning(
                 f"SWA callback creation failed, continuing without SWA: {e}"
             )
+    elif bool(swa_cfg.get("enabled", False)) and ema_enabled:
+        logger.warning("Both EMA and SWA are enabled; ignoring SWA and using EMA only.")
 
     csv_logger, tb_logger = create_lightning_loggers(log_dir)
 
