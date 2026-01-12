@@ -467,6 +467,138 @@ def load_dinov3_vitl16(
     return model
 
 
+def load_dinov3_vits16(
+    pretrained: bool = True,
+    weights_url: Optional[str] = None,
+    weights_path: Optional[str] = None,
+    check_hash: bool = False,
+) -> nn.Module:
+    """
+    DINOv3 ViT-S/16 backbone (embed_dim=384, depth=12).
+
+    Official LVD1689M pretrain weights filename:
+      dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+    """
+    # Prefer importing the vendored `dinov3` package directly to avoid TorchHub
+    # trying to reach GitHub in offline environments (e.g. Kaggle).
+    try:
+        from dinov3.hub.backbones import dinov3_vits16 as _dinov3_vits16  # type: ignore
+
+        if weights_path:
+            model = _dinov3_vits16(pretrained=False, check_hash=check_hash)
+            state = torch.load(weights_path, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            model.load_state_dict(state, strict=False)
+            return model
+
+        if weights_url:
+            return _dinov3_vits16(pretrained=pretrained, weights=weights_url, check_hash=check_hash)
+
+        return _dinov3_vits16(pretrained=pretrained, check_hash=check_hash)
+    except Exception:
+        pass
+
+    # Prefer explicit offline weights if provided
+    if weights_path:
+        model = torch.hub.load(
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
+            model="dinov3_vits16",
+            source=_DINOV3_HUB_SOURCE,
+            pretrained=False,
+        )
+        state = torch.load(weights_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state, strict=False)
+        return model
+
+    if weights_url:
+        model = torch.hub.load(
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
+            model="dinov3_vits16",
+            source=_DINOV3_HUB_SOURCE,
+            pretrained=pretrained,
+            weights=weights_url,
+            check_hash=check_hash,
+        )
+        return model
+
+    model = torch.hub.load(
+        repo_or_dir=_DINOV3_REPO_OR_DIR,
+        model="dinov3_vits16",
+        source=_DINOV3_HUB_SOURCE,
+        pretrained=pretrained,
+    )
+    return model
+
+
+def load_dinov3_vits16plus(
+    pretrained: bool = True,
+    weights_url: Optional[str] = None,
+    weights_path: Optional[str] = None,
+    check_hash: bool = False,
+) -> nn.Module:
+    """
+    DINOv3 ViT-S/16+ backbone (embed_dim=384, depth=12).
+
+    Official LVD1689M pretrain weights filename:
+      dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth
+    """
+    # Prefer importing the vendored `dinov3` package directly to avoid TorchHub
+    # trying to reach GitHub in offline environments (e.g. Kaggle).
+    try:
+        from dinov3.hub.backbones import dinov3_vits16plus as _dinov3_vits16plus  # type: ignore
+
+        if weights_path:
+            model = _dinov3_vits16plus(pretrained=False, check_hash=check_hash)
+            state = torch.load(weights_path, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state:
+                state = state["state_dict"]
+            model.load_state_dict(state, strict=False)
+            return model
+
+        if weights_url:
+            return _dinov3_vits16plus(pretrained=pretrained, weights=weights_url, check_hash=check_hash)
+
+        return _dinov3_vits16plus(pretrained=pretrained, check_hash=check_hash)
+    except Exception:
+        pass
+
+    # Prefer explicit offline weights if provided
+    if weights_path:
+        model = torch.hub.load(
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
+            model="dinov3_vits16plus",
+            source=_DINOV3_HUB_SOURCE,
+            pretrained=False,
+        )
+        state = torch.load(weights_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state, strict=False)
+        return model
+
+    if weights_url:
+        model = torch.hub.load(
+            repo_or_dir=_DINOV3_REPO_OR_DIR,
+            model="dinov3_vits16plus",
+            source=_DINOV3_HUB_SOURCE,
+            pretrained=pretrained,
+            weights=weights_url,
+            check_hash=check_hash,
+        )
+        return model
+
+    model = torch.hub.load(
+        repo_or_dir=_DINOV3_REPO_OR_DIR,
+        model="dinov3_vits16plus",
+        source=_DINOV3_HUB_SOURCE,
+        pretrained=pretrained,
+    )
+    return model
+
+
 def load_dinov3_vith16plus(
     pretrained: bool = True,
     weights_url: Optional[str] = None,
@@ -735,7 +867,19 @@ def build_feature_extractor(
 
     # When weights_path is provided, force pretrained=False to avoid online fetch
     use_pretrained = False if weights_path else pretrained
-    if backbone_name == "dinov3_vitl16":
+    if backbone_name == "dinov3_vits16":
+        backbone = load_dinov3_vits16(
+            pretrained=use_pretrained,
+            weights_url=weights_url if not weights_path else None,
+            weights_path=weights_path,
+        )
+    elif backbone_name == "dinov3_vits16plus":
+        backbone = load_dinov3_vits16plus(
+            pretrained=use_pretrained,
+            weights_url=weights_url if not weights_path else None,
+            weights_path=weights_path,
+        )
+    elif backbone_name == "dinov3_vitl16":
         backbone = load_dinov3_vitl16(
             pretrained=use_pretrained,
             weights_url=weights_url if not weights_path else None,

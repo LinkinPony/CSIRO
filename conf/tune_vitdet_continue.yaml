@@ -1,3 +1,20 @@
+# Continued Ray Tune sweep based on `configs/train.yaml` (best-so-far export).
+# This tune config keeps the rest of the training config fixed and continues searching:
+# 1) optimizer.lr / optimizer.weight_decay
+# 2) ViTDet head: vitdet_dim / hidden_dims / vitdet_scale_factors
+# 3) backbone_layers: separate_bottlenecks / indices_by_backbone
+# 4) model.log_scale_targets
+# 5) model.head.ratio_head_mode
+# 6) mtl.tasks.ndvi
+# 7) peft.last_k_blocks / peft.r
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
+
 data:
   root: data
   train_csv: train.csv
@@ -18,7 +35,7 @@ data:
   val_batch_size: 1
   num_workers: 8
   prefetch_factor: 2
-  val_split: 0.1
+  val_split: 0.2
   shuffle: true
   target_order:
   - Dry_Total_g
@@ -238,6 +255,7 @@ data:
     - 0.229
     - 0.224
     - 0.225
+
 ndvi_dense:
   enabled: false
   root: data/NDVI
@@ -262,6 +280,7 @@ ndvi_dense:
       alpha: 0.3
       use_prev_for_bsz1: true
     vertical_flip_prob: 0.0
+
 model:
   backbone: dinov3_vith16plus
   weights_url: null
@@ -279,11 +298,12 @@ model:
     vitdet_scale_factors:
     - 2.0
     - 1.0
+    - 0.5
     hidden_dims:
     - 512
     - 256
-    activation: relu
-    dropout: 0.060578247072550495
+    activation: silu
+    dropout: 0.2089777330012721
     ratio_head_mode: separate_spatial
     use_output_softplus: true
     use_cls_token: false
@@ -293,7 +313,7 @@ model:
       alpha_init: 0.2
   backbone_layers:
     enabled: true
-    layer_fusion: learned
+    layer_fusion: mean
     separate_bottlenecks: true
     indices_by_backbone:
       dinov3_vitl16:
@@ -310,35 +330,43 @@ model:
       - 19
       - 29
       - 39
+
 mtl:
   enabled: true
   tasks:
-    height: true
+    height: false
     ndvi: true
     ndvi_dense: false
     species: false
-    state: true
+    state: false
   sample_ratio:
     ndvi_dense: 0.0
+
 train_all:
-  enabled: true
+  # IMPORTANT: disable train_all for Tune so val metrics are meaningful.
+  enabled: false
+
 peft:
   enabled: true
   method: lora
   use_dora: true
-  r: 16
-  lora_alpha: 16
-  lora_dropout: 0.08459329530700273
+  r: 8
+  lora_alpha: 32
+  lora_dropout: 0.149704740852944
   init: true
-  last_k_blocks: 12
+  last_k_blocks: 4
   layers_pattern: blocks
   target_modules:
   - qkv
   - proj
-  lora_lr: 0.00027612045077434134
+  - w1
+  - w2
+  - w3
+  lora_lr: 0.0006487573903040899
   lora_weight_decay: 0.0
-  lora_llrd: 0.8628539593898326
+  lora_llrd: 0.945198463734411
   lora_group_size: 1
+
 loss:
   weighting: uw
   use_ratio_head: true
@@ -349,15 +377,17 @@ loss:
   - 0.1
   - 0.2
   - 0.5
+
 optimizer:
   name: adamw
-  lr: 1.0043864678010286e-05
-  weight_decay: 2.156782477676959e-06
+  lr: 4.4036623128462054e-05
+  weight_decay: 4.722348155739709e-05
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
   sam_rho: 0.05
   sam_adaptive: true
+
 pcgrad:
   enabled: true
   mode: primary_anchored
@@ -377,17 +407,21 @@ pcgrad:
   exclude_param_name_substrings: []
   include_tasks: null
   exclude_tasks: []
+
 scheduler:
   name: cosine
-  warmup_epochs: 1
+  warmup_epochs: 5
   warmup_start_factor: 0.1
+
 kfold:
+  # IMPORTANT: disable kfold for Tune; do kfold only after selecting best config.
   enabled: false
   k: 5
   even_split: false
   folds: null
+
 trainer:
-  max_epochs: 45
+  max_epochs: 30
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -401,7 +435,8 @@ trainer:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   swa:
-    enabled: true
+    enabled: false
+    adaptive_lrs: true
     swa_lrs: 0.0001
     auto_lrs: true
     freeze_lora: false
@@ -409,9 +444,120 @@ trainer:
     swa_epoch_start: 0.8
     annealing_epochs: 5
     annealing_strategy: cos
+  ema:
+    enabled: true
+    decay: 0.999
+    update_every_n_steps: 1
+    start_step: 0
+    eval_with_ema: true
+    apply_at_end: true
+    trainable_only: true
+
 logging:
   log_dir: outputs
   ckpt_dir: outputs/checkpoints
   use_loguru: true
+
 seed: 42
-version: tune-vitdet-v1-12h-39
+version: vitdet-finetune-42
+
+ray:
+  address: auto
+
+tune:
+  name: tune-vitdet-new
+  resume: false
+  restore_path: null
+  resume_unfinished: true
+  resume_errored: true
+  restart_errored: false
+  storage_path: ray_results
+
+  metric: val_loss_5d_weighted
+  mode: min
+
+  num_samples: 200
+  max_concurrent_trials: 2
+  resources_per_trial:
+    cpu: 8
+    gpu: 1
+
+  scheduler:
+    type: asha
+    max_epochs: ${trainer.max_epochs}
+    grace_period: 10
+    reduction_factor: 3
+
+  seeds: [42]
+  report_per_epoch: true
+
+  # Keys are dotted paths into the training config.
+  search_space:
+    # 1) Optimizer
+    optimizer.lr:
+      type: loguniform
+      lower: 1.0e-5
+      upper: 0.01
+    optimizer.weight_decay:
+      type: loguniform
+      lower: 1.0e-6
+      upper: 3.0e-3
+
+    # 2) ViTDet architecture
+    model.head.vitdet_dim:
+      type: choice
+      values: [80, 160, 320, 640]
+    model.head.hidden_dims:
+      type: choice
+      values:
+        - []
+        - [320]
+        - [640]
+        - [1280]
+        - [320,160]
+        - [640,320]
+    model.head.vitdet_scale_factors:
+      type: choice
+      values:
+        - [4.0, 2.0, 1.0, 0.5]
+        - [2.0, 1.0, 0.5]
+        - [2.0, 1.0]
+        - [1.0, 0.5, 0.25]
+
+    # 3) Backbone layers
+    model.backbone_layers.separate_bottlenecks:
+      type: choice
+      values: [true, false]
+    model.backbone_layers.indices_by_backbone.dinov3_vith16plus:
+      type: choice
+      values:
+        - [31]
+        - [25, 31]
+        - [30, 31]
+        - [12, 24, 31]
+        - [8, 16, 31]
+
+    # 4) Log-scale regression targets
+    model.log_scale_targets:
+      type: choice
+      values: [false, true]
+
+    # 5) Ratio head mode
+    model.head.ratio_head_mode:
+      type: choice
+      values: [shared, separate_mlp, separate_spatial]
+
+    # 6) MTL NDVI task
+    mtl.tasks.ndvi:
+      type: choice
+      values: [true, false]
+
+    # 7) LoRA capacity knobs
+    peft.last_k_blocks:
+      type: choice
+      values: [4, 8, 16, 0]
+    peft.r:
+      type: choice
+      values: [4, 8, 16]
+
+

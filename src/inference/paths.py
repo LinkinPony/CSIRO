@@ -104,6 +104,10 @@ def find_dino_weights_in_dir(dir_path: str, backbone: str) -> str:
     exact_bases: List[str] = []
     if bn2 in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"):
         exact_bases.append("dinov3_vit7b16_pretrain_lvd1689m-a955f4ea")
+    elif bn2 == "dinov3_vits16":
+        exact_bases.append("dinov3_vits16_pretrain_lvd1689m-08c60483")
+    elif bn2 == "dinov3_vits16plus":
+        exact_bases.append("dinov3_vits16plus_pretrain_lvd1689m-4057cbaa")
     elif bn2 == "dinov3_vith16plus":
         exact_bases.append("dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5")
     elif bn2 == "dinov3_vitl16":
@@ -118,6 +122,10 @@ def find_dino_weights_in_dir(dir_path: str, backbone: str) -> str:
     patterns2: List[str] = []
     if bn2 in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"):
         patterns2.extend(["dinov3_vit7b16_pretrain_*.pt", "dinov3_vit7b16_pretrain_*.pth"])
+    elif bn2 == "dinov3_vits16":
+        patterns2.extend(["dinov3_vits16_pretrain_*.pt", "dinov3_vits16_pretrain_*.pth"])
+    elif bn2 == "dinov3_vits16plus":
+        patterns2.extend(["dinov3_vits16plus_pretrain_*.pt", "dinov3_vits16plus_pretrain_*.pth"])
     elif bn2 == "dinov3_vith16plus":
         patterns2.extend(["dinov3_vith16plus_pretrain_*.pt", "dinov3_vith16plus_pretrain_*.pth"])
     elif bn2 == "dinov3_vitl16":

@@ -1,0 +1,13 @@
+# @package model
+
+backbone: dinov3_vits16
+weights_url: null
+weights_path: dinov3_weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pt
+pretrained: true
+freeze_backbone: true
+backbone_weights_dtype: fp32
+gradient_checkpointing: false
+embedding_dim: 384
+log_scale_targets: false
+
+

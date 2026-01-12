@@ -1,3 +1,12 @@
+# --- Ray Tune best result ---
+# metric: val_r2
+# mode: max
+# best_val_r2: 0.6778343915939331
+# epoch: 45
+# trial_id: be358_00008
+# trial_dir: /mnt/csiro_nfs/ray_results/tune-vitdet-v4/trainable_be358_00008_8_model_head_activation=silu,model_head_dropout=0.2036,model_head_hidden_dims=,model_head_ratio_head_mode=se_2026-01-11_00-45-35
+# ----------------------------
+
 data:
   root: data
   train_csv: train.csv
@@ -18,7 +27,7 @@ data:
   val_batch_size: 1
   num_workers: 8
   prefetch_factor: 2
-  val_split: 0.1
+  val_split: 0.2
   shuffle: true
   target_order:
   - Dry_Total_g
@@ -279,11 +288,12 @@ model:
     vitdet_scale_factors:
     - 2.0
     - 1.0
-    hidden_dims:
-    - 512
-    - 256
-    activation: relu
-    dropout: 0.060578247072550495
+    - 0.5
+    # NOTE: For ViTDet heads, `hidden_dims: []` means "no bottleneck MLP" (linear heads on pooled pyramid features).
+    # We set this explicitly to match the exported head weights and avoid config/meta mismatches during packaging.
+    hidden_dims: [512, 256]
+    activation: silu
+    dropout: 0.20358545733942285
     ratio_head_mode: separate_spatial
     use_output_softplus: true
     use_cls_token: false
@@ -325,19 +335,18 @@ train_all:
 peft:
   enabled: true
   method: lora
-  use_dora: true
+  use_dora: false
   r: 16
-  lora_alpha: 16
-  lora_dropout: 0.08459329530700273
+  lora_alpha: 4
+  lora_dropout: 0.004609854168810957
   init: true
-  last_k_blocks: 12
+  last_k_blocks: 4
   layers_pattern: blocks
   target_modules:
   - qkv
-  - proj
-  lora_lr: 0.00027612045077434134
+  lora_lr: 0.002489169873449903
   lora_weight_decay: 0.0
-  lora_llrd: 0.8628539593898326
+  lora_llrd: 0.8
   lora_group_size: 1
 loss:
   weighting: uw
@@ -351,8 +360,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 1.0043864678010286e-05
-  weight_decay: 2.156782477676959e-06
+  lr: 4.4191024189650714e-05
+  weight_decay: 1.921507258384722e-05
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -379,15 +388,15 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 1
+  warmup_epochs: 3
   warmup_start_factor: 0.1
 kfold:
-  enabled: false
+  enabled: true
   k: 5
   even_split: false
-  folds: null
+  folds: [0]
 trainer:
-  max_epochs: 45
+  max_epochs: 161
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -401,7 +410,8 @@ trainer:
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   swa:
-    enabled: true
+    enabled: false
+    adaptive_lrs: true
     swa_lrs: 0.0001
     auto_lrs: true
     freeze_lora: false
@@ -409,9 +419,17 @@ trainer:
     swa_epoch_start: 0.8
     annealing_epochs: 5
     annealing_strategy: cos
+  ema:
+    enabled: true
+    decay: 0.999
+    update_every_n_steps: 1
+    start_step: 0
+    eval_with_ema: true
+    apply_at_end: true
+    trainable_only: true
 logging:
   log_dir: outputs
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-vitdet-v1-12h-39
+version: vitdet-tune-ema

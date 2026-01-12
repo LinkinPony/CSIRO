@@ -13,6 +13,8 @@ separate_bottlenecks: true
 
 # Indices refer to DINOv3 transformer blocks (0-based).
 indices_by_backbone:
+  dinov3_vits16: [2, 5, 8, 11]
+  dinov3_vits16plus: [2, 5, 8, 11]
   dinov3_vitl16: [5, 11, 17, 23]
   dinov3_vith16plus: [12, 24, 31]
   dinov3_vit7b16: [9, 19, 29, 39]

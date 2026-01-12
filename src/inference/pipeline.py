@@ -309,6 +309,10 @@ def resolve_dino_weights_path_for_model(
                 bn_l = str(backbone_name or "").strip().lower()
                 if bn_l in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"):
                     token = "vit7b"
+                elif bn_l == "dinov3_vits16":
+                    token = "vits16"
+                elif bn_l == "dinov3_vits16plus":
+                    token = "vits16plus"
                 elif bn_l == "dinov3_vith16plus":
                     token = "vith16plus"
                 elif bn_l == "dinov3_vitl16":
@@ -547,6 +551,10 @@ def infer_components_5d_for_model(
     try:
         if backbone_name == "dinov3_vith16plus":
             from dinov3.hub.backbones import dinov3_vith16plus as _make_backbone  # type: ignore
+        elif backbone_name == "dinov3_vits16":
+            from dinov3.hub.backbones import dinov3_vits16 as _make_backbone  # type: ignore
+        elif backbone_name == "dinov3_vits16plus":
+            from dinov3.hub.backbones import dinov3_vits16plus as _make_backbone  # type: ignore
         elif backbone_name == "dinov3_vitl16":
             from dinov3.hub.backbones import dinov3_vitl16 as _make_backbone  # type: ignore
         elif backbone_name in ("dinov3_vit7b16", "dinov3_vit7b", "vit7b16", "vit7b"):
