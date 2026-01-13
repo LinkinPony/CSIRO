@@ -2,6 +2,7 @@ import { fetchJson } from "./client";
 import type {
   ExperimentSummary,
   LightningMetricsResponse,
+  TrainYamlResponse,
   TrialFileEntry,
   TrialFileResponse,
   TrialSummary,
@@ -64,6 +65,14 @@ export async function readTrialFile(
     `/api/experiments/${encodeURIComponent(expName)}/trials/${encodeURIComponent(
       trialDirname,
     )}/file?${params.toString()}`,
+  );
+}
+
+export async function getTrialTrainYaml(expName: string, trialDirname: string): Promise<TrainYamlResponse> {
+  return await fetchJson<TrainYamlResponse>(
+    `/api/experiments/${encodeURIComponent(expName)}/trials/${encodeURIComponent(
+      trialDirname,
+    )}/train-yaml`,
   );
 }
 

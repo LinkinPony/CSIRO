@@ -383,9 +383,19 @@ def _infer_param_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in fixed and not c.startswith("val_")]
 
 
-def _param_effect_table(df: pd.DataFrame, *, y_col: str, param_cols: list[str]) -> pd.DataFrame:
+def _param_effect_table(
+    df: pd.DataFrame, *, y_col: str, param_cols: list[str], mode: str
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    mode_n = str(mode).strip().lower()
+    if mode_n not in ("min", "max"):
+        mode_n = "max"
+
+    # For numeric params, we want the correlation direction to reflect "better" consistently:
+    # - mode=max: higher metric is better
+    # - mode=min: lower metric is better -> use (-metric) so "higher is better" still holds
     y = pd.to_numeric(df[y_col], errors="coerce")
+    y_eff = (-y) if mode_n == "min" else y
     for col in param_cols:
         s = df[col]
         if s.dropna().empty:
@@ -396,12 +406,18 @@ def _param_effect_table(df: pd.DataFrame, *, y_col: str, param_cols: list[str]) 
         is_categorical = (s.dtype == object) or nunique <= 12
         if is_categorical:
             g = df.groupby(col, dropna=True)[y_col].agg(["count", "mean", "median", "max", "min"])
-            g = g.sort_values("mean", ascending=False)
+            # Drop groups where the metric is missing for all rows (mean=NaN).
+            g = g[g["mean"].notna()]
+            # IMPORTANT: for loss-like objectives (mode=min), the best value is the *lowest* mean.
+            g = g.sort_values("mean", ascending=(mode_n == "min"))
             if g.empty:
                 continue
             best_val = g.index[0]
             worst_val = g.index[-1]
-            delta_mean = float(g["mean"].iloc[0] - g["mean"].iloc[-1])
+            mean_best = float(g["mean"].iloc[0])
+            mean_worst = float(g["mean"].iloc[-1])
+            # Express delta as a positive "best beats worst by this much" in the native metric units.
+            delta_mean = float(mean_worst - mean_best) if mode_n == "min" else float(mean_best - mean_worst)
             rows.append(
                 {
                     "param": col,
@@ -409,30 +425,95 @@ def _param_effect_table(df: pd.DataFrame, *, y_col: str, param_cols: list[str]) 
                     "n_unique": nunique,
                     "best_value": str(best_val),
                     "worst_value": str(worst_val),
-                    "mean_best": float(g["mean"].iloc[0]),
-                    "mean_worst": float(g["mean"].iloc[-1]),
+                    "mean_best": mean_best,
+                    "mean_worst": mean_worst,
                     "delta_mean": delta_mean,
                     "n_best": int(g["count"].iloc[0]),
                 }
             )
         else:
             x = pd.to_numeric(s, errors="coerce")
-            if x.dropna().empty or y.dropna().empty:
+            if x.dropna().empty or y_eff.dropna().empty:
                 continue
             # Spearman correlation is more robust than Pearson for loguniform params.
             x_eff = x.copy()
             if bool((x_eff > 0).all()):
                 x_eff = np.log10(x_eff)
-            corr = pd.concat([x_eff, y], axis=1).corr(method="spearman").iloc[0, 1]
+            corr = pd.concat([x_eff, y_eff], axis=1).corr(method="spearman").iloc[0, 1]
+
+            # Also compute a simple "low vs high" split on the original x scale so we can show
+            # best_value / worst_value and avoid NaNs in the markdown table.
+            try:
+                x_median = float(x.median())
+            except Exception:
+                x_median = float("nan")
+
+            mean_low = None
+            mean_high = None
+            n_low = 0
+            n_high = 0
+            if x_median == x_median:  # not NaN
+                low_mask = x <= x_median
+                high_mask = x > x_median
+                n_low = int(low_mask.sum())
+                n_high = int(high_mask.sum())
+                try:
+                    ml = pd.to_numeric(y[low_mask], errors="coerce").dropna()
+                    mh = pd.to_numeric(y[high_mask], errors="coerce").dropna()
+                    mean_low = (None if ml.empty else float(ml.mean()))
+                    mean_high = (None if mh.empty else float(mh.mean()))
+                except Exception:
+                    mean_low, mean_high = None, None
+
+            # Decide which end is "best" using the split means when possible; fall back to corr sign.
+            best_end: Optional[str] = None  # "low" | "high"
+            if (mean_low is not None) and (mean_high is not None):
+                if mode_n == "min":
+                    best_end = "low" if mean_low <= mean_high else "high"
+                else:
+                    best_end = "high" if mean_high >= mean_low else "low"
+            else:
+                if corr is not None and np.isfinite(corr):
+                    best_end = "high" if float(corr) > 0.0 else "low"
+
+            x_min_val = (None if x.dropna().empty else float(x.min()))
+            x_max_val = (None if x.dropna().empty else float(x.max()))
+
+            best_x: Optional[float] = None
+            worst_x: Optional[float] = None
+            if best_end == "low":
+                best_x, worst_x = x_min_val, x_max_val
+            elif best_end == "high":
+                best_x, worst_x = x_max_val, x_min_val
+
+            # Express delta as a positive "best beats worst" gap in native metric units (same as categorical).
+            mean_best = None
+            mean_worst = None
+            delta_mean = None
+            if best_end is not None and mean_low is not None and mean_high is not None:
+                if best_end == "low":
+                    mean_best, mean_worst = mean_low, mean_high
+                else:
+                    mean_best, mean_worst = mean_high, mean_low
+                if mean_best is not None and mean_worst is not None:
+                    delta_mean = float(mean_worst - mean_best) if mode_n == "min" else float(mean_best - mean_worst)
+
             rows.append(
                 {
                     "param": col,
                     "kind": "numeric",
                     "n_unique": nunique,
+                    # Provide these so markdown tables don't show NaN in "best_value"/"mean_best" columns.
+                    "best_value": ("" if best_x is None else float(best_x)),
+                    "worst_value": ("" if worst_x is None else float(worst_x)),
+                    "mean_best": ("" if mean_best is None else float(mean_best)),
+                    "mean_worst": ("" if mean_worst is None else float(mean_worst)),
+                    "delta_mean": ("" if delta_mean is None else float(delta_mean)),
+                    "n_best": ("" if best_end is None else int(n_low if best_end == "low" else n_high)),
                     "spearman": (None if not np.isfinite(corr) else float(corr)),
                     "x_log10": bool((x > 0).all()),
-                    "x_min": (None if x.dropna().empty else float(x.min())),
-                    "x_max": (None if x.dropna().empty else float(x.max())),
+                    "x_min": x_min_val,
+                    "x_max": x_max_val,
                 }
             )
     out = pd.DataFrame(rows)
@@ -544,7 +625,7 @@ def main() -> None:
     ]
     param_cols = sorted(set(param_cols))
 
-    effects = _param_effect_table(df_sorted, y_col=y_col, param_cols=param_cols)
+    effects = _param_effect_table(df_sorted, y_col=y_col, param_cols=param_cols, mode=env.mode)
 
     # Persist outputs.
     summary_csv = out_dir / "trial_summary.csv"
@@ -556,7 +637,7 @@ def main() -> None:
     report_md = out_dir / "report.md"
     top_k = 15
     with open(report_md, "w", encoding="utf-8") as f:
-        f.write("# Ray Tune R^2 analysis\n\n")
+        f.write("# Ray Tune analysis\n\n")
         f.write(f"- exp_dir: `{exp_dir}`\n")
         f.write(f"- metric/mode: **{env.metric} / {env.mode}**\n")
         f.write(f"- trainer.max_epochs: **{env.max_epochs}**\n")
@@ -606,7 +687,9 @@ def main() -> None:
         if not effects.empty:
             f.write("## Hyperparameter effects (rough ranking)\n\n")
             f.write(
-                "This is a lightweight ranking: categorical params use Δ(mean) across values; numeric params use |Spearman|.\n\n"
+                "This is a lightweight ranking:\n"
+                "- categorical params: compare mean metric across values (best respects mode=min|max)\n"
+                "- numeric params: rank by |Spearman| between x and an objective-aligned y (mode=max: y=metric, mode=min: y=-metric)\n\n"
             )
             f.write(effects.head(25).to_markdown(index=False))
             f.write("\n\n")

@@ -78,6 +78,19 @@ export type TrialFileResponse = {
   content: string;
 };
 
+export type TrainYamlResponse = {
+  exp_name: string;
+  trial_dirname: string;
+  trial_dir: string;
+  yaml: string;
+  inferred: boolean;
+  source_kind: string | null;
+  source_trial_dirname: string | null;
+  source_relpath: string | null;
+  applied_params: boolean;
+  applied_params_count: number;
+};
+
 export type LightningMetricsResponse = {
   exp_name: string;
   trial_dirname: string;

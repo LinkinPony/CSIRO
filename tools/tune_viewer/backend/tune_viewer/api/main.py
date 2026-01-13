@@ -89,6 +89,18 @@ def create_app() -> FastAPI:
             max_points=int(max_points),
         )
 
+    @app.get("/api/experiments/{exp_name}/trials/{trial_dirname}/train-yaml")
+    def trial_train_yaml(exp_name: str, trial_dirname: str) -> dict[str, Any]:
+        try:
+            _ = resolve_under_root(root=settings.results_root, rel_path=f"{exp_name}/{trial_dirname}")
+        except PathTraversalError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return index.get_trial_train_yaml(
+            exp_name=str(exp_name),
+            trial_dirname=str(trial_dirname),
+            max_bytes=int(settings.max_file_bytes),
+        )
+
     def _list_files_under(dir_path: Path, *, max_entries: int = 2000) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         queue: list[Path] = [dir_path]

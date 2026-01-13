@@ -724,3 +724,205 @@ class TuneResultsIndex:
             "points": points,
         }
 
+    def get_trial_train_yaml(
+        self,
+        *,
+        exp_name: str,
+        trial_dirname: str,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        """
+        Return a trial's `train.yaml` snapshot.
+
+        - Primary location (single-seed):   <trial>/run/logs/train.yaml
+        - Multi-seed fallback:              <trial>/seed_*/logs/train.yaml  (first one)
+        - If missing, infer from another trial in the same experiment that has a snapshot,
+          and apply this trial's sampled params.json (dotted keys) onto that config.
+        """
+        trial_dir = (self.results_root / exp_name / trial_dirname).resolve()
+        if not _is_trial_dir(trial_dir):
+            return {
+                "exp_name": exp_name,
+                "trial_dirname": trial_dirname,
+                "trial_dir": str(trial_dir),
+                "yaml": "",
+                "inferred": False,
+                "source_kind": None,
+                "source_trial_dirname": None,
+                "source_relpath": None,
+                "applied_params": False,
+                "applied_params_count": 0,
+            }
+
+        def _read_text(path: Path) -> str:
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return ""
+            if max_bytes and len(raw.encode("utf-8", errors="replace")) > int(max_bytes):
+                # Mirror the API's cap behavior roughly (bytes are approximate due to encoding).
+                # We keep it simple here to avoid depending on tune_viewer.core.fs from parsing/.
+                b = raw.encode("utf-8", errors="replace")[: int(max_bytes)]
+                return b.decode("utf-8", errors="replace")
+            return raw
+
+        def _find_train_yaml(td: Path) -> tuple[Optional[Path], Optional[str], Optional[str]]:
+            p = td / "run" / "logs" / "train.yaml"
+            if p.is_file():
+                return p, "run/logs/train.yaml", "run"
+            # Multi-seed trials: seed_*/logs/train.yaml
+            try:
+                seed_paths = sorted(td.glob("seed_*/logs/train.yaml"))
+            except Exception:
+                seed_paths = []
+            for sp in seed_paths:
+                if sp.is_file():
+                    try:
+                        rel = str(sp.relative_to(td))
+                    except Exception:
+                        rel = str(sp.name)
+                    return sp, rel, "seed"
+            return None, None, None
+
+        # 1) Use this trial's own snapshot if present.
+        p_self, rel_self, kind_self = _find_train_yaml(trial_dir)
+        if p_self is not None:
+            return {
+                "exp_name": exp_name,
+                "trial_dirname": trial_dirname,
+                "trial_dir": str(trial_dir),
+                "yaml": _read_text(p_self),
+                "inferred": False,
+                "source_kind": str(kind_self or "self"),
+                "source_trial_dirname": str(trial_dirname),
+                "source_relpath": rel_self,
+                "applied_params": False,
+                "applied_params_count": 0,
+            }
+
+        # 2) Infer from another trial in the same experiment.
+        params = self._load_params_cached(trial_dir)
+        exp_dir = (self.results_root / exp_name).resolve()
+
+        def _set_by_dotted_path(d: dict, path: str, value: Any) -> bool:
+            parts = [p for p in str(path).split(".") if p]
+            if not parts:
+                return False
+            cur: Any = d
+            for p in parts[:-1]:
+                if not isinstance(cur, dict):
+                    return False
+                if p not in cur or not isinstance(cur[p], dict):
+                    cur[p] = {}
+                cur = cur[p]
+            if isinstance(cur, dict):
+                cur[parts[-1]] = value
+                return True
+            return False
+
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            yaml = None  # type: ignore[assignment]
+
+        if yaml is not None and exp_dir.is_dir():
+            for other_td in _iter_trial_dirs(exp_dir):
+                if other_td.name == str(trial_dirname):
+                    continue
+                p_other, rel_other, kind_other = _find_train_yaml(other_td)
+                if p_other is None:
+                    continue
+                base_text = _read_text(p_other)
+                if not base_text.strip():
+                    continue
+                try:
+                    base_cfg = yaml.safe_load(base_text)
+                except Exception:
+                    continue
+                if not isinstance(base_cfg, dict):
+                    continue
+
+                applied = 0
+                for k, v in (params or {}).items():
+                    if _set_by_dotted_path(base_cfg, str(k), v):
+                        applied += 1
+
+                try:
+                    out_yaml = yaml.safe_dump(base_cfg, sort_keys=False, allow_unicode=True)
+                except Exception:
+                    continue
+
+                return {
+                    "exp_name": exp_name,
+                    "trial_dirname": trial_dirname,
+                    "trial_dir": str(trial_dir),
+                    "yaml": str(out_yaml or ""),
+                    "inferred": True,
+                    "source_kind": "other_trial",
+                    "source_trial_dirname": str(other_td.name),
+                    "source_relpath": rel_other,
+                    "applied_params": True,
+                    "applied_params_count": int(applied),
+                }
+
+            # Repo fallback: if the experiment has no other snapshots, fall back to configs/train.yaml
+            # (best-effort; may not include all Hydra overrides for the Tune experiment).
+            repo_root = self.conf_dir.parent
+            for cfg_path in [
+                repo_root / "configs" / "train.yaml",
+                repo_root / "configs" / "train_backup.yaml",
+            ]:
+                if not cfg_path.is_file():
+                    continue
+                base_text = _read_text(cfg_path)
+                if not base_text.strip():
+                    continue
+                try:
+                    base_cfg = yaml.safe_load(base_text)
+                except Exception:
+                    continue
+                if not isinstance(base_cfg, dict):
+                    continue
+
+                applied = 0
+                for k, v in (params or {}).items():
+                    if _set_by_dotted_path(base_cfg, str(k), v):
+                        applied += 1
+
+                try:
+                    out_yaml = yaml.safe_dump(base_cfg, sort_keys=False, allow_unicode=True)
+                except Exception:
+                    continue
+
+                rel_cfg = None
+                try:
+                    rel_cfg = str(cfg_path.relative_to(repo_root))
+                except Exception:
+                    rel_cfg = str(cfg_path.name)
+
+                return {
+                    "exp_name": exp_name,
+                    "trial_dirname": trial_dirname,
+                    "trial_dir": str(trial_dir),
+                    "yaml": str(out_yaml or ""),
+                    "inferred": True,
+                    "source_kind": "repo_config",
+                    "source_trial_dirname": None,
+                    "source_relpath": rel_cfg,
+                    "applied_params": True,
+                    "applied_params_count": int(applied),
+                }
+
+        return {
+            "exp_name": exp_name,
+            "trial_dirname": trial_dirname,
+            "trial_dir": str(trial_dir),
+            "yaml": "",
+            "inferred": False,
+            "source_kind": None,
+            "source_trial_dirname": None,
+            "source_relpath": None,
+            "applied_params": False,
+            "applied_params_count": 0,
+        }
+

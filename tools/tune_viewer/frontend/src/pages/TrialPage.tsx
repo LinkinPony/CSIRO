@@ -15,6 +15,7 @@ import {
 import {
   getHealth,
   getLightningMetrics,
+  getTrialTrainYaml,
   getTrialTimeseries,
   listTrialFiles,
   readTrialFile,
@@ -58,6 +59,9 @@ export default function TrialPage() {
 
   const [files, setFiles] = useState<TrialFileEntry[]>([]);
   const [trainYamlRaw, setTrainYamlRaw] = useState<string>("");
+  const [trainYamlSource, setTrainYamlSource] = useState<string>("");
+  const [trainYamlInferred, setTrainYamlInferred] = useState<boolean>(false);
+  const [trainYamlAppliedParamsCount, setTrainYamlAppliedParamsCount] = useState<number>(0);
   const [trainLogTail, setTrainLogTail] = useState<string>("");
   const [openFilePath, setOpenFilePath] = useState<string>("");
   const [openFileContent, setOpenFileContent] = useState<string>("");
@@ -171,10 +175,22 @@ export default function TrialPage() {
     const refresh = async () => {
       if (!exp || !td) return;
       try {
-        const r = await readTrialFile(exp, td, "run/logs/train.yaml");
-        if (!cancelled) setTrainYamlRaw(r.content || "");
+        const r = await getTrialTrainYaml(exp, td);
+        if (cancelled) return;
+        setTrainYamlRaw(r.yaml || "");
+        const srcParts: string[] = [];
+        if (r.source_kind) srcParts.push(r.source_kind);
+        if (r.source_trial_dirname && r.source_trial_dirname !== td) srcParts.push(r.source_trial_dirname);
+        if (r.source_relpath) srcParts.push(r.source_relpath);
+        setTrainYamlSource(srcParts.length ? srcParts.join(" :: ") : "");
+        setTrainYamlInferred(Boolean(r.inferred));
+        setTrainYamlAppliedParamsCount(Number(r.applied_params_count ?? 0));
       } catch {
-        if (!cancelled) setTrainYamlRaw("");
+        if (cancelled) return;
+        setTrainYamlRaw("");
+        setTrainYamlSource("");
+        setTrainYamlInferred(false);
+        setTrainYamlAppliedParamsCount(0);
       }
     };
     void refresh();
@@ -239,6 +255,38 @@ export default function TrialPage() {
     } catch (e: unknown) {
       setOpenFileContent(e instanceof Error ? e.message : String(e || "Failed to read file"));
     }
+  };
+
+  const copyTrainYaml = async () => {
+    if (!trainYamlRaw.trim()) return;
+    try {
+      await navigator.clipboard.writeText(trainYamlRaw);
+    } catch {
+      // Fallback for older browsers / permissions.
+      const ta = document.createElement("textarea");
+      ta.value = trainYamlRaw;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+  };
+
+  const downloadTrainYaml = () => {
+    if (!trainYamlRaw.trim()) return;
+    const safeName = (s: string) => s.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 160);
+    const filename = `${safeName(exp || "exp")}__${safeName(td || "trial")}__train.yaml`;
+    const blob = new Blob([trainYamlRaw], { type: "text/yaml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   };
 
   const ltGroups = useMemo(() => {
@@ -506,8 +554,38 @@ export default function TrialPage() {
         </div>
 
         <div className="card">
-          <div style={{ fontWeight: 700 }}>Resolved train config (run/logs/train.yaml)</div>
-          {trainYamlRaw ? (
+            <div className="row" style={{ alignItems: "center" }}>
+              <div style={{ fontWeight: 700 }}>Resolved train config (train.yaml)</div>
+              <div style={{ flex: 1 }} />
+              {trainYamlInferred ? <span className="pill">inferred</span> : null}
+              {trainYamlAppliedParamsCount ? (
+                <span className="pill">params_applied: {trainYamlAppliedParamsCount}</span>
+              ) : null}
+              <button
+                onClick={() => void copyTrainYaml()}
+                disabled={!trainYamlRaw.trim()}
+                style={{ padding: "6px 10px", borderRadius: 8, cursor: "pointer" }}
+                title="Copy to clipboard"
+              >
+                Copy
+              </button>
+              <button
+                onClick={downloadTrainYaml}
+                disabled={!trainYamlRaw.trim()}
+                style={{ padding: "6px 10px", borderRadius: 8, cursor: "pointer" }}
+                title="Download as train.yaml"
+              >
+                Download
+              </button>
+            </div>
+
+            {trainYamlSource ? (
+              <div className="muted" style={{ marginTop: 6 }}>
+                source: <span className="mono">{trainYamlSource}</span>
+              </div>
+            ) : null}
+
+            {trainYamlRaw ? (
             <>
               <div className="muted" style={{ marginTop: 6 }}>
                 Raw YAML (truncated by backend max bytes if huge)

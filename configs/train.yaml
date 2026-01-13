@@ -274,17 +274,18 @@ model:
   log_scale_targets: false
   head:
     type: vitdet
-    vitdet_dim: 320
+    vitdet_dim: 512
     vitdet_patch_size: 16
     vitdet_scale_factors:
     - 2.0
     - 1.0
+    - 0.5
+    - 0.25
     hidden_dims:
-    - 512
-    - 256
-    activation: relu
-    dropout: 0.060578247072550495
-    ratio_head_mode: separate_spatial
+    - 1280
+    activation: silu
+    dropout: 0.4586939537234684
+    ratio_head_mode: shared
     use_output_softplus: true
     use_cls_token: false
     use_patch_reg3: false
@@ -325,19 +326,18 @@ train_all:
 peft:
   enabled: true
   method: lora
-  use_dora: true
-  r: 16
+  use_dora: false
+  r: 4
   lora_alpha: 16
-  lora_dropout: 0.08459329530700273
+  lora_dropout: 0.03451400041698553
   init: true
-  last_k_blocks: 12
+  last_k_blocks: 16
   layers_pattern: blocks
   target_modules:
   - qkv
-  - proj
-  lora_lr: 0.00027612045077434134
+  lora_lr: 0.0012829542106450487
   lora_weight_decay: 0.0
-  lora_llrd: 0.8628539593898326
+  lora_llrd: 0.86887955343612
   lora_group_size: 1
 loss:
   weighting: uw
@@ -351,8 +351,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 1.0043864678010286e-05
-  weight_decay: 2.156782477676959e-06
+  lr: 0.0001286444268039004
+  weight_decay: 0.0021589341253740045
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -379,7 +379,7 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 1
+  warmup_epochs: 0
   warmup_start_factor: 0.1
 kfold:
   enabled: false
@@ -387,7 +387,7 @@ kfold:
   even_split: false
   folds: null
 trainer:
-  max_epochs: 45
+  max_epochs: 35
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -414,4 +414,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-vitdet-v1-12h-39
+version: tune-vitdet-v1-12h-56
