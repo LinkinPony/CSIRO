@@ -11,6 +11,7 @@ from src.models.head_builder import build_head_layer, DualBranchHeadExport, Mult
 from src.models.spatial_fpn import FPNHeadConfig, FPNScalarHead
 from src.models.dpt_scalar_head import DPTHeadConfig, DPTScalarHead
 from src.models.peft_integration import export_lora_payload_if_any
+from src.callbacks.ema import ExponentialMovingAverage
 
 
 class HeadCheckpoint(Callback):
@@ -59,6 +60,47 @@ class HeadCheckpoint(Callback):
                 return
             if not self._is_last_epoch(trainer):
                 return
+
+        # ---------------------------
+        # Export provenance metadata
+        # ---------------------------
+        # Exported head weights may be raw or EMA-swapped depending on the callback order
+        # and EMA settings. To prevent ambiguity at inference time, we record a minimal
+        # provenance block into the saved meta.
+        weights_source = "raw"
+        ema_meta = None
+        ema_cb = None
+        try:
+            for cb in list(getattr(trainer, "callbacks", []) or []):
+                if isinstance(cb, ExponentialMovingAverage):
+                    ema_cb = cb
+                    break
+        except Exception:
+            ema_cb = None
+        if ema_cb is not None:
+            exported_while_swapped = False
+            try:
+                exported_while_swapped = bool(getattr(ema_cb, "_backup", None) is not None)
+            except Exception:
+                exported_while_swapped = False
+            if exported_while_swapped:
+                weights_source = "ema"
+            try:
+                ema_meta = {
+                    "enabled": True,
+                    "decay": float(getattr(ema_cb, "decay", 0.0)),
+                    "update_every_n_steps": int(getattr(ema_cb, "update_every_n_steps", 1)),
+                    "start_step": int(getattr(ema_cb, "start_step", 0)),
+                    "eval_with_ema": bool(getattr(ema_cb, "eval_with_ema", True)),
+                    "apply_at_end": bool(getattr(ema_cb, "apply_at_end", True)),
+                    "trainable_only": bool(getattr(ema_cb, "trainable_only", True)),
+                    "num_updates": int(getattr(ema_cb, "_num_updates", 0)),
+                    "last_updated_step": int(getattr(ema_cb, "_last_updated_step", -1)),
+                    "exported_while_swapped": bool(exported_while_swapped),
+                }
+            except Exception:
+                ema_meta = {"enabled": True, "exported_while_swapped": bool(exported_while_swapped)}
+
         # Collect metrics for filename suffix if available
         metrics = getattr(trainer, "callback_metrics", {}) or {}
         def _get_float(name: str):
@@ -160,6 +202,12 @@ class HeadCheckpoint(Callback):
                         "ratio_has_presence": False,
                     },
                 }
+                try:
+                    state["meta"]["weights_source"] = str(weights_source)
+                    if ema_meta is not None:
+                        state["meta"]["ema"] = ema_meta
+                except Exception:
+                    pass
                 # Optionally bundle LoRA payload
                 try:
                     fe = getattr(pl_module, "feature_extractor", None)
@@ -259,6 +307,12 @@ class HeadCheckpoint(Callback):
                         "ratio_has_presence": False,
                     },
                 }
+                try:
+                    state["meta"]["weights_source"] = str(weights_source)
+                    if ema_meta is not None:
+                        state["meta"]["ema"] = ema_meta
+                except Exception:
+                    pass
                 # Optionally bundle LoRA payload
                 try:
                     fe = getattr(pl_module, "feature_extractor", None)
@@ -348,6 +402,12 @@ class HeadCheckpoint(Callback):
                         "ratio_has_presence": False,
                     },
                 }
+                try:
+                    state["meta"]["weights_source"] = str(weights_source)
+                    if ema_meta is not None:
+                        state["meta"]["ema"] = ema_meta
+                except Exception:
+                    pass
                 # Optionally bundle LoRA payload
                 try:
                     fe = getattr(pl_module, "feature_extractor", None)
@@ -458,6 +518,12 @@ class HeadCheckpoint(Callback):
                         "ratio_has_presence": False,
                     },
                 }
+                try:
+                    state["meta"]["weights_source"] = str(weights_source)
+                    if ema_meta is not None:
+                        state["meta"]["ema"] = ema_meta
+                except Exception:
+                    pass
                 # Optionally bundle LoRA payload
                 try:
                     fe = getattr(pl_module, "feature_extractor", None)
@@ -856,6 +922,12 @@ class HeadCheckpoint(Callback):
                 "ratio_has_presence": False,
             },
         }
+        try:
+            state["meta"]["weights_source"] = str(weights_source)
+            if ema_meta is not None:
+                state["meta"]["ema"] = ema_meta
+        except Exception:
+            pass
         # Optional: export learned fusion logits for the MLP multi-layer path.
         # This is kept in meta (not state_dict) to avoid changing the inference head module structure.
         try:
@@ -903,6 +975,12 @@ class HeadCheckpoint(Callback):
                         "head_type": "ndvi_dense_linear",
                     },
                 }
+                try:
+                    ndvi_state["meta"]["weights_source"] = str(weights_source)
+                    if ema_meta is not None:
+                        ndvi_state["meta"]["ema"] = ema_meta
+                except Exception:
+                    pass
                 try:
                     if fe is not None and hasattr(fe, "backbone"):
                         peft_payload = export_lora_payload_if_any(fe.backbone)

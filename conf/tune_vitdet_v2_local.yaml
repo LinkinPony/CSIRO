@@ -35,7 +35,7 @@ data:
       width_m: 0.7
       length_m: 0.3
   image_size: [960, 480]
-  batch_size: 1
+  batch_size: 2
   val_batch_size: 1
   num_workers: 8
   prefetch_factor: 2
@@ -319,11 +319,12 @@ trainer:
   checkpoint:
     every_n_epochs: 1
   resume_from: null
-  accumulate_grad_batches: 8
+  accumulate_grad_batches: 4
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   swa:
-    enabled: true
+    enabled: false
+    adaptive_lrs: true
     swa_lrs: 0.0001
     auto_lrs: true
     freeze_lora: false
@@ -331,6 +332,14 @@ trainer:
     swa_epoch_start: 0.8
     annealing_epochs: 5
     annealing_strategy: cos
+  ema:
+    enabled: true
+    decay: 0.999
+    update_every_n_steps: 1
+    start_step: 0
+    eval_with_ema: true
+    apply_at_end: true
+    trainable_only: true
 
 logging:
   log_dir: outputs
@@ -347,7 +356,7 @@ ray:
   address: auto
 
 tune:
-  name: tune-vitdet-v1-12h-56-continue
+  name: tune-vitdet-v1-12h-56-c-manifold
   resume: false
   restore_path: null
   resume_unfinished: true
@@ -359,7 +368,7 @@ tune:
   mode: min
 
   # Local search => fewer samples than v1-12h; adjust from CLI if needed.
-  num_samples: 60
+  num_samples: 120
   max_concurrent_trials: 2
   resources_per_trial:
     cpu: 8
@@ -447,5 +456,18 @@ tune:
       type: uniform
       lower: 0.8
       upper: 1.0
+
+    # --- Manifold Mixup (augment-level, affects representation regularization) ---
+    data.augment.manifold_mixup.prob:
+      type: uniform
+      lower: 0.5
+      upper: 1.0
+    data.augment.manifold_mixup.alpha:
+      type: uniform
+      lower: 0.5
+      upper: 4.0
+    data.augment.manifold_mixup.detach_pair:
+      type: choice
+      values: [true, false]
 
 

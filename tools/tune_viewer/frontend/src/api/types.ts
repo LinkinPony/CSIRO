@@ -9,9 +9,16 @@ export type ExperimentSummary = {
   best: number | null;
   best_trial_id: string | null;
   best_trial_dirname: string | null;
+  pinned_best?: Record<string, ExperimentPinnedBest>;
   last_update_ns: number | null;
   now_s: number;
   tune_config_file: string | null;
+};
+
+export type ExperimentPinnedBest = {
+  best: number | null;
+  best_trial_id: string | null;
+  best_trial_dirname: string | null;
 };
 
 export type MetricSummary = {

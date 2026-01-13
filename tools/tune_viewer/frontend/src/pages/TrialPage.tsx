@@ -35,6 +35,125 @@ function emaSmooth(xs: Array<{ x: number; y: number }>, alpha: number): Array<{ 
   return out;
 }
 
+type XY = { x: number; y: number };
+
+const DEFAULT_TS_EXTRA_METRICS = ["train_loss_5d_weighted", "val_loss_5d_weighted"] as const;
+
+function toNumber(x: unknown): number | null {
+  if (typeof x === "number") return Number.isFinite(x) ? x : null;
+  if (typeof x === "string") {
+    const s = x.trim();
+    if (!s) return null;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function quantileSorted(sorted: number[], q: number): number {
+  if (!sorted.length) return NaN;
+  const qq = Math.min(1, Math.max(0, q));
+  const pos = (sorted.length - 1) * qq;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const v0 = sorted[base] ?? sorted[0];
+  const v1 = sorted[base + 1];
+  if (typeof v1 !== "number") return v0;
+  return v0 + rest * (v1 - v0);
+}
+
+function computeIqrBounds(ys: number[], iqrK: number): { lo: number; hi: number } | null {
+  if (ys.length < 4) return null;
+  const s = [...ys].sort((a, b) => a - b);
+  const q1 = quantileSorted(s, 0.25);
+  const q3 = quantileSorted(s, 0.75);
+  const iqr = q3 - q1;
+  if (!Number.isFinite(iqr) || iqr <= 0) return null;
+  const k = Math.max(0, iqrK);
+  return { lo: q1 - k * iqr, hi: q3 + k * iqr };
+}
+
+function robustFilterSeries(
+  pts: XY[],
+  opts?: { hardAbs?: number; iqrK?: number; padFrac?: number },
+): { points: XY[]; yDomain: [number, number] | null; dropped: number } {
+  const hardAbs = opts?.hardAbs ?? 1e8; // also catches sentinel-like defaults (e.g. -1e9)
+  const iqrK = opts?.iqrK ?? 6;
+  const padFrac = opts?.padFrac ?? 0.05;
+
+  const ysForBounds: number[] = [];
+  for (const p of pts) {
+    if (!Number.isFinite(p.y)) continue;
+    if (Math.abs(p.y) > hardAbs) continue;
+    ysForBounds.push(p.y);
+  }
+  if (!ysForBounds.length) return { points: [], yDomain: null, dropped: pts.length };
+
+  const bounds = computeIqrBounds(ysForBounds, iqrK);
+
+  let dropped = 0;
+  const out: XY[] = [];
+  for (const p of pts) {
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+      dropped++;
+      continue;
+    }
+    if (Math.abs(p.y) > hardAbs) {
+      dropped++;
+      continue;
+    }
+    if (bounds && (p.y < bounds.lo || p.y > bounds.hi)) {
+      dropped++;
+      continue;
+    }
+    out.push(p);
+  }
+
+  // If the IQR bounds were too aggressive (rare), fall back to hard-abs filtering only.
+  if (!out.length && pts.length) {
+    dropped = 0;
+    for (const p of pts) {
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+        dropped++;
+        continue;
+      }
+      if (Math.abs(p.y) > hardAbs) {
+        dropped++;
+        continue;
+      }
+      out.push(p);
+    }
+  }
+
+  if (!out.length) return { points: [], yDomain: null, dropped: pts.length };
+
+  let yMin = out[0].y;
+  let yMax = out[0].y;
+  for (let i = 1; i < out.length; i++) {
+    const y = out[i].y;
+    if (y < yMin) yMin = y;
+    if (y > yMax) yMax = y;
+  }
+  const span0 = yMax - yMin;
+  const span = span0 > 0 ? span0 : Math.max(1e-3, Math.abs(yMin) * 0.1);
+  const pad = span * padFrac;
+  const yDomain: [number, number] = [yMin - pad, yMax + pad];
+  return { points: out, yDomain, dropped };
+}
+
+function formatTick(v: unknown): string {
+  const n = toNumber(v);
+  if (n == null) return String(v ?? "");
+  const a = Math.abs(n);
+  if (a === 0) return "0";
+  if (a < 1e-3 || a >= 1e4) return n.toExponential(2);
+  if (a < 1) return n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+  if (a < 10) return n.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+  if (a < 100) return n.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+  if (a < 1000) return n.toFixed(1).replace(/0+$/, "").replace(/\.$/, "");
+  return n.toFixed(0);
+}
+
 export default function TrialPage() {
   const { expName, trialDir } = useParams();
   const exp = expName ? decodeURIComponent(expName) : "";
@@ -50,7 +169,13 @@ export default function TrialPage() {
 
   // Lightning (TensorBoard-like) scalars
   const [ltAvail, setLtAvail] = useState<string[]>([]);
-  const [ltSelected, setLtSelected] = useState<string[]>(["train_loss", "val_loss", "val_r2"]);
+  const [ltSelected, setLtSelected] = useState<string[]>([
+    "train_loss",
+    "train_loss_5d_weighted",
+    "val_loss",
+    "val_loss_5d_weighted",
+    "val_r2",
+  ]);
   const [ltPoints, setLtPoints] = useState<Array<Record<string, unknown>>>([]);
   const [ltXKey, setLtXKey] = useState<"step" | "epoch">("step");
   const [ltSmooth, setLtSmooth] = useState<number>(0.0);
@@ -85,7 +210,10 @@ export default function TrialPage() {
     const refresh = async () => {
       if (!exp || !td) return;
       try {
-        const resp = await getTrialTimeseries(exp, td, [selectedMetric || "val_r2"]);
+        const metricsReq = Array.from(
+          new Set([selectedMetric || "val_r2", ...DEFAULT_TS_EXTRA_METRICS].filter((m) => String(m || "").trim())),
+        );
+        const resp = await getTrialTimeseries(exp, td, metricsReq);
         if (cancelled) return;
         setParams(resp.params || {});
         setAvailableMetrics(resp.available_metrics || []);
@@ -235,15 +363,35 @@ export default function TrialPage() {
     return hasEpoch ? "epoch" : "row_idx";
   }, [points]);
 
-  const yKeys = useMemo(() => {
-    // Plot the selected metric if present; otherwise plot nothing.
-    if (!selectedMetric) return [];
-    return [selectedMetric];
-  }, [selectedMetric]);
+  const tsCharts = useMemo(() => {
+    const metrics = Array.from(
+      new Set([selectedMetric || "val_r2", ...DEFAULT_TS_EXTRA_METRICS].filter((m) => String(m || "").trim())),
+    ) as string[];
 
-  const chartData = useMemo(() => {
-    return points.map((p) => p as any);
-  }, [points]);
+    const out: Record<
+      string,
+      { data: Array<Record<string, unknown>>; yDomain: [number, number] | null; dropped: number }
+    > = {};
+
+    for (const m of metrics) {
+      const series: XY[] = [];
+      for (const p of points) {
+        const x = toNumber((p as any)?.[xKey]);
+        const y = toNumber((p as any)?.[m]);
+        if (x == null || y == null) continue;
+        series.push({ x, y });
+      }
+      series.sort((a, b) => a.x - b.x);
+      const filtered = robustFilterSeries(series, { hardAbs: 1e8, iqrK: 6, padFrac: 0.05 });
+      const data = filtered.points.map((pt) => ({ [xKey]: pt.x, [m]: pt.y } as Record<string, unknown>));
+      out[m] = { data, yDomain: filtered.yDomain, dropped: filtered.dropped };
+    }
+    return out;
+  }, [points, xKey, selectedMetric]);
+
+  const mainMetric = selectedMetric || "val_r2";
+  const mainChart = tsCharts[mainMetric] ?? { data: [], yDomain: null, dropped: 0 };
+  const extraMetrics = DEFAULT_TS_EXTRA_METRICS.filter((m) => m !== mainMetric);
 
   const openFile = async (relPath: string) => {
     if (!exp || !td) return;
@@ -378,7 +526,13 @@ export default function TrialPage() {
             style={{ minWidth: 360 }}
           />
           <button
-            onClick={() => setLtSelected(["train_loss", "val_loss", "val_r2"].filter((t) => ltAvail.includes(t)))}
+            onClick={() =>
+              setLtSelected(
+                ["train_loss", "train_loss_5d_weighted", "val_loss", "val_loss_5d_weighted", "val_r2"].filter((t) =>
+                  ltAvail.includes(t),
+                ),
+              )
+            }
             style={{ padding: "6px 10px", borderRadius: 8, cursor: "pointer" }}
           >
             Default tags
@@ -440,8 +594,9 @@ export default function TrialPage() {
               <div className="grid" style={{ marginTop: 10 }}>
                 {ltSelected.slice(0, 12).map((tag) => {
                   const raw = ltSeries[tag] || [];
-                  const sm = emaSmooth(raw, ltSmooth);
-                  const data = raw.map((p, i) => ({
+                  const filtered = robustFilterSeries(raw, { hardAbs: 1e8, iqrK: 6, padFrac: 0.05 });
+                  const sm = emaSmooth(filtered.points, ltSmooth);
+                  const data = filtered.points.map((p, i) => ({
                     x: p.x,
                     y: p.y,
                     y_smooth: sm[i]?.y ?? p.y,
@@ -453,13 +608,18 @@ export default function TrialPage() {
                       </div>
                       <div className="muted" style={{ marginTop: 4 }}>
                         points: {data.length}
+                        {filtered.dropped ? (
+                          <span className="mono" style={{ marginLeft: 8 }}>
+                            (clipped: {filtered.dropped})
+                          </span>
+                        ) : null}
                       </div>
                       <div style={{ height: 220, marginTop: 8 }}>
                         <ResponsiveContainer width="100%" height="100%">
                           <LineChart data={data}>
                             <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis dataKey="x" />
-                            <YAxis />
+                            <XAxis dataKey="x" type="number" />
+                            <YAxis domain={filtered.yDomain ?? ["auto", "auto"]} tickFormatter={formatTick} />
                             <Tooltip />
                             <Legend />
                             <Line
@@ -470,6 +630,7 @@ export default function TrialPage() {
                               strokeWidth={1}
                               stroke="#8884d8"
                               isAnimationActive={false}
+                              connectNulls
                             />
                             {ltSmooth > 0 ? (
                               <Line
@@ -480,6 +641,7 @@ export default function TrialPage() {
                                 strokeWidth={2}
                                 stroke="#82ca9d"
                                 isAnimationActive={false}
+                                connectNulls
                               />
                             ) : null}
                           </LineChart>
@@ -521,28 +683,73 @@ export default function TrialPage() {
           <span className="pill">points: {points.length}</span>
         </div>
 
+        <div className="muted" style={{ marginTop: 6 }}>
+          {mainChart.dropped ? <span className="mono">clipped outliers: {mainChart.dropped}</span> : <span className="mono">—</span>}
+        </div>
+
         <div style={{ height: 360, marginTop: 10 }}>
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={chartData}>
+            <LineChart data={mainChart.data}>
               <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey={xKey} />
-              <YAxis />
+              <XAxis dataKey={xKey} type="number" />
+              <YAxis domain={mainChart.yDomain ?? ["auto", "auto"]} tickFormatter={formatTick} />
               <Tooltip />
-              <Legend />
-              {yKeys.map((k, idx) => (
-                <Line
-                  key={k}
-                  type="monotone"
-                  dataKey={k}
-                  dot={false}
-                  strokeWidth={2}
-                  stroke={idx === 0 ? "#8884d8" : "#82ca9d"}
-                  isAnimationActive={false}
-                />
-              ))}
+              <Line
+                type="monotone"
+                dataKey={mainMetric}
+                dot={false}
+                strokeWidth={2}
+                stroke="#8884d8"
+                isAnimationActive={false}
+                connectNulls
+              />
             </LineChart>
           </ResponsiveContainer>
         </div>
+
+        {extraMetrics.length ? (
+          <div className="grid" style={{ marginTop: 12 }}>
+            {extraMetrics.map((m) => {
+              const ch = tsCharts[m];
+              if (!ch || !ch.data.length) return null;
+              const stroke = m.startsWith("val_") ? "#82ca9d" : "#8884d8";
+              return (
+                <div key={m} className="card">
+                  <div className="mono" title={m} style={{ fontWeight: 700, overflow: "hidden" }}>
+                    {m}
+                  </div>
+                  <div className="muted" style={{ marginTop: 4 }}>
+                    points: {ch.data.length}
+                    {ch.dropped ? (
+                      <span className="mono" style={{ marginLeft: 8 }}>
+                        (clipped: {ch.dropped})
+                      </span>
+                    ) : null}
+                  </div>
+                  <div style={{ height: 220, marginTop: 8 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={ch.data}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis dataKey={xKey} type="number" />
+                        <YAxis domain={ch.yDomain ?? ["auto", "auto"]} tickFormatter={formatTick} />
+                        <Tooltip />
+                        <Line
+                          type="monotone"
+                          dataKey={m}
+                          dot={false}
+                          strokeWidth={2}
+                          stroke={stroke}
+                          isAnimationActive={false}
+                          connectNulls
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
       </div>
 
       <div className="grid">

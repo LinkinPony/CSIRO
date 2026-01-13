@@ -93,6 +93,7 @@ export default function ExperimentPage() {
     const getVal = (t: TrialSummary): number | string | null => {
       const vr2 = t.pinned_metrics?.["val_r2"];
       const vloss5d = t.pinned_metrics?.["val_loss_5d_weighted"];
+      const tloss5d = t.pinned_metrics?.["train_loss_5d_weighted"];
       if (sortKey === "trial_id") return t.trial_id;
       if (sortKey === "status") return t.status;
       if (sortKey === "best") return t.best;
@@ -101,6 +102,8 @@ export default function ExperimentPage() {
       if (sortKey === "last_epoch") return t.last_epoch;
       if (sortKey === "val_r2_best") return vr2?.best ?? null;
       if (sortKey === "val_r2_last") return vr2?.last ?? null;
+      if (sortKey === "train_loss_5d_weighted_best") return tloss5d?.best ?? null;
+      if (sortKey === "train_loss_5d_weighted_last") return tloss5d?.last ?? null;
       if (sortKey === "val_loss_5d_weighted_best") return vloss5d?.best ?? null;
       if (sortKey === "val_loss_5d_weighted_last") return vloss5d?.last ?? null;
       if (sortKey === "time_total_s") return t.time_total_s;
@@ -128,7 +131,7 @@ export default function ExperimentPage() {
       setSortKey(key);
       if (key === "trial_id" || key === "status") {
         setSortDir("asc");
-      } else if (key.startsWith("val_loss_5d_weighted_")) {
+      } else if (key.startsWith("val_loss_5d_weighted_") || key.startsWith("train_loss_5d_weighted_")) {
         setSortDir("asc");
       } else {
         setSortDir("desc");
@@ -210,6 +213,12 @@ export default function ExperimentPage() {
                 <button onClick={() => toggleSort("val_r2_last")}>val_r2(last)</button>
               </th>
               <th>
+                <button onClick={() => toggleSort("train_loss_5d_weighted_best")}>train_loss_5d_weighted(best)</button>
+              </th>
+              <th>
+                <button onClick={() => toggleSort("train_loss_5d_weighted_last")}>train_loss_5d_weighted(last)</button>
+              </th>
+              <th>
                 <button onClick={() => toggleSort("val_loss_5d_weighted_best")}>val_loss_5d_weighted(best)</button>
               </th>
               <th>
@@ -229,6 +238,7 @@ export default function ExperimentPage() {
             {sorted.map((t) => {
               const vr2 = t.pinned_metrics?.["val_r2"];
               const vloss5d = t.pinned_metrics?.["val_loss_5d_weighted"];
+              const tloss5d = t.pinned_metrics?.["train_loss_5d_weighted"];
               return (
                 <tr key={t.trial_dirname}>
                 <td className="mono">
@@ -249,6 +259,8 @@ export default function ExperimentPage() {
                 <td className="mono">{t.last_epoch ?? "—"}</td>
                 <td className="mono">{vr2?.best == null ? "—" : vr2.best.toFixed(6)}</td>
                 <td className="mono">{vr2?.last == null ? "—" : vr2.last.toFixed(6)}</td>
+                <td className="mono">{tloss5d?.best == null ? "—" : tloss5d.best.toFixed(6)}</td>
+                <td className="mono">{tloss5d?.last == null ? "—" : tloss5d.last.toFixed(6)}</td>
                 <td className="mono">{vloss5d?.best == null ? "—" : vloss5d.best.toFixed(6)}</td>
                 <td className="mono">{vloss5d?.last == null ? "—" : vloss5d.last.toFixed(6)}</td>
                 <td className="mono">

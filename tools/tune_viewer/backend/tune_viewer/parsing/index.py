@@ -354,7 +354,11 @@ class TuneResultsIndex:
         metric_n = str(metric).strip()
 
         # Always compute these pinned metrics as well (regardless of Tune objective).
-        pinned_jobs = [("val_r2", "max"), ("val_loss_5d_weighted", "min")]
+        pinned_jobs = [
+            ("val_r2", "max"),
+            ("val_loss_5d_weighted", "min"),
+            ("train_loss_5d_weighted", "min"),
+        ]
 
         # Compute objective + pinned in one pass over records.
         metric_jobs: list[tuple[str, str]] = []
@@ -503,9 +507,10 @@ class TuneResultsIndex:
             "result_size": (None if result_fp is None else int(result_fp.size)),
             "params": params,
             "pinned_metrics": {
-                # Always show these two regardless of objective metric.
+                # Always show these regardless of objective metric (if present in result.json).
                 "val_r2": _pack_metric_summary("val_r2", "max"),
                 "val_loss_5d_weighted": _pack_metric_summary("val_loss_5d_weighted", "min"),
+                "train_loss_5d_weighted": _pack_metric_summary("train_loss_5d_weighted", "min"),
             },
         }
 
@@ -545,6 +550,10 @@ class TuneResultsIndex:
             counts = {"RUNNING": 0, "TERMINATED": 0, "ERROR": 0, "NO_DATA": 0}
             best_trial: Optional[dict[str, Any]] = None
             last_update_ns: Optional[int] = None
+            pinned_best: dict[str, dict[str, Any]] = {
+                "train_loss_5d_weighted": {"best": None, "best_trial_id": None, "best_trial_dirname": None},
+                "val_loss_5d_weighted": {"best": None, "best_trial_id": None, "best_trial_dirname": None},
+            }
 
             for td in trials:
                 summ = self._compute_trial_summary(
@@ -563,6 +572,26 @@ class TuneResultsIndex:
                 mtime_ns = summ.get("result_mtime_ns")
                 if isinstance(mtime_ns, int):
                     last_update_ns = mtime_ns if last_update_ns is None else max(last_update_ns, mtime_ns)
+
+                # Track best values for pinned metrics across trials (for quick experiment-level display).
+                pm = summ.get("pinned_metrics") or {}
+                if isinstance(pm, dict):
+                    for mk in ("train_loss_5d_weighted", "val_loss_5d_weighted"):
+                        ms = pm.get(mk) if isinstance(pm.get(mk), dict) else {}
+                        vv = (ms or {}).get("best") if isinstance(ms, dict) else None
+                        if vv is None:
+                            continue
+                        try:
+                            vv_f = float(vv)
+                        except Exception:
+                            continue
+                        md = str((ms or {}).get("mode") or "min").lower().strip()
+                        cur = pinned_best.get(mk, {}).get("best")
+                        better_p = (cur is None) or ((vv_f < float(cur)) if md == "min" else (vv_f > float(cur)))
+                        if better_p:
+                            pinned_best[mk]["best"] = vv_f
+                            pinned_best[mk]["best_trial_id"] = summ.get("trial_id")
+                            pinned_best[mk]["best_trial_dirname"] = summ.get("trial_dirname")
 
                 v = summ.get("best")
                 if v is None:
@@ -588,6 +617,7 @@ class TuneResultsIndex:
                     "best": (None if best_trial is None else best_trial.get("best")),
                     "best_trial_id": (None if best_trial is None else best_trial.get("trial_id")),
                     "best_trial_dirname": (None if best_trial is None else best_trial.get("trial_dirname")),
+                    "pinned_best": pinned_best,
                     "last_update_ns": last_update_ns,
                     "now_s": float(now),
                     "tune_config_file": (None if cfg is None else cfg.config_file),
@@ -686,7 +716,14 @@ class TuneResultsIndex:
         cols_req = list(dict.fromkeys(cols_req))
         if not cols_req:
             # Default: try some common tags, otherwise take first few.
-            defaults = ["train_loss", "val_loss", "val_r2", "lr-AdamW/head"]
+            defaults = [
+                "train_loss",
+                "train_loss_5d_weighted",
+                "val_loss",
+                "val_loss_5d_weighted",
+                "val_r2",
+                "lr-AdamW/head",
+            ]
             cols_req = [c for c in defaults if c in set(available_cols)]
             if not cols_req:
                 cols_req = available_cols[:6]

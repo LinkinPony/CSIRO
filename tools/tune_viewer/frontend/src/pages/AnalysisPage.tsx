@@ -314,6 +314,8 @@ export default function AnalysisPage() {
                 <th>mode</th>
                 <th>trials</th>
                 <th>best</th>
+                <th>train_loss_5d_weighted(best)</th>
+                <th>val_loss_5d_weighted(best)</th>
                 <th>best_trial</th>
               </tr>
             </thead>
@@ -325,6 +327,16 @@ export default function AnalysisPage() {
                   <td className="mono">{e.mode}</td>
                   <td className="mono">{e.n_trials}</td>
                   <td className="mono">{e.best == null ? "—" : e.best.toFixed(6)}</td>
+                  <td className="mono">
+                    {e.pinned_best?.["train_loss_5d_weighted"]?.best == null
+                      ? "—"
+                      : e.pinned_best["train_loss_5d_weighted"].best.toFixed(6)}
+                  </td>
+                  <td className="mono">
+                    {e.pinned_best?.["val_loss_5d_weighted"]?.best == null
+                      ? "—"
+                      : e.pinned_best["val_loss_5d_weighted"].best.toFixed(6)}
+                  </td>
                   <td className="mono">{e.best_trial_id ?? "—"}</td>
                 </tr>
               ))}

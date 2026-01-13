@@ -637,6 +637,18 @@ def infer_components_5d_for_model(
         state, meta, peft_payload = load_head_state(head_pt)
         if not isinstance(meta, dict):
             meta = {}
+        # Helpful one-liner for debugging weight provenance (EMA vs raw).
+        try:
+            ws = str(meta.get("weights_source", "") or "").strip().lower()
+            if not ws:
+                ws = "unknown"
+            ema_info = meta.get("ema", None)
+            if ws == "ema" and isinstance(ema_info, dict) and ema_info.get("decay", None) is not None:
+                print(f"[HEAD] {os.path.basename(str(head_pt))} weights_source=ema decay={ema_info.get('decay')}")
+            else:
+                print(f"[HEAD] {os.path.basename(str(head_pt))} weights_source={ws}")
+        except Exception:
+            pass
 
         head_num_main = int(meta.get("num_outputs_main", meta.get("num_outputs", num_outputs_main_default)))
         head_num_ratio = int(meta.get("num_outputs_ratio", num_outputs_ratio_default))

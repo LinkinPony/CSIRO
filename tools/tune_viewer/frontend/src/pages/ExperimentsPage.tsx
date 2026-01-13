@@ -96,6 +96,9 @@ export default function ExperimentsPage() {
         {filtered.map((e) => {
           const updatedMs = e.last_update_ns ? Math.floor(e.last_update_ns / 1e6) : null;
           const updated = updatedMs ? new Date(updatedMs).toLocaleString() : "—";
+          const pinned = e.pinned_best || {};
+          const trainLoss5d = pinned["train_loss_5d_weighted"]?.best ?? null;
+          const valLoss5d = pinned["val_loss_5d_weighted"]?.best ?? null;
           return (
             <Link key={e.name} to={`/experiments/${encodeURIComponent(e.name)}`}>
               <div className="card">
@@ -116,6 +119,8 @@ export default function ExperimentsPage() {
                 </div>
                 <div className="mono" style={{ marginTop: 10 }}>
                   <div>best: {e.best == null ? "—" : e.best.toFixed(6)}</div>
+                  <div>train_loss_5d_weighted(best): {trainLoss5d == null ? "—" : trainLoss5d.toFixed(6)}</div>
+                  <div>val_loss_5d_weighted(best): {valLoss5d == null ? "—" : valLoss5d.toFixed(6)}</div>
                   <div>best_trial: {e.best_trial_id ?? "—"}</div>
                   <div>updated: {updated}</div>
                 </div>
