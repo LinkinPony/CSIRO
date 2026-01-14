@@ -323,13 +323,23 @@ class TuneResultsIndex:
         mode: str,
         min_epoch_for_best: int,
     ) -> dict[str, Any]:
-        # Cached per (metric, mode, min_epoch) as long as result.json fingerprint is unchanged.
+        # Cached per (metric, mode, min_epoch) as long as inputs are unchanged.
+        #
+        # NOTE:
+        # This endpoint is polled from the UI; if we return a cached summary without
+        # validating the underlying files, the UI will appear "stuck" until the
+        # backend restarts (clearing memory). See: result.json is appended while a
+        # trial is running, so we must invalidate based on its fingerprint.
         key = (str(metric), str(mode).lower().strip(), int(min_epoch_for_best))
+
+        # Compute fingerprints outside the lock (filesystem I/O).
+        result_fp_now = _fingerprint(trial_dir / "result.json")
+        params_fp_now = _fingerprint(trial_dir / "params.json")
 
         with self._lock:
             entry = self._get_or_create_trial_cache(trial_dir)
             cached = entry.summaries.get(key)
-            if cached is not None:
+            if cached is not None and entry.result_fp == result_fp_now and entry.params_fp == params_fp_now:
                 return cached
 
         records = self._load_records_cached(trial_dir)
