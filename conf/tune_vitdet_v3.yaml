@@ -1,0 +1,470 @@
+# Local follow-up sweep based on `configs/train.yaml` (best-known legacy YAML).
+# Goal: continue improving around the current best by focusing on the most sensitive knobs
+# from the v1-12h sweep, while avoiding the large distribution shifts introduced by
+# `tune_vitdet_continue.yaml` (e.g., val_split=0.2, shorter epochs, log_scale_targets toggles).
+#
+# Run:
+#   python tune.py --config-name tune_vitdet_v2_local
+#
+# Notes:
+# - This file is a self-contained training config + Tune section (no Hydra defaults),
+#   mirroring `configs/train.yaml` so the base behavior matches your best run.
+# - Search space is intentionally narrower (local search) to spend trials near the good region.
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
+
+# -----------------------------
+# Base training config (copied from configs/train.yaml)
+# -----------------------------
+data:
+  root: data
+  train_csv: train.csv
+  aigc_aug:
+    enabled: false
+    subdir: nano_banana_pro/train
+    manifest: manifest.csv
+    types: null
+  dataset: csiro
+  datasets:
+    csiro:
+      width_m: 0.7
+      length_m: 0.3
+  image_size: [960, 480]
+  batch_size: 4
+  val_batch_size: 1
+  num_workers: 8
+  prefetch_factor: 2
+  val_split: 0.2
+  shuffle: true
+  target_order: [Dry_Total_g]
+  augment:
+    policy: legacy
+    debug_dump:
+      enabled: false
+      stages: [train]
+      every_n_steps: 50
+      max_images: 32
+      num_images_per_step: 4
+      denormalize: true
+      format: jpeg
+      png_compress_level: 6
+      jpeg_quality: 90
+      webp_quality: 90
+    augmix:
+      enabled: false
+      severity: 2
+      width: 2
+      depth: -1
+      alpha: 0.5
+      all_ops: false
+      consistency:
+        enabled: false
+        uw_task: true
+        supervise_aug_views: true
+        num_aug: 2
+        weight_reg3: 1.0
+        weight_ratio_jsd: 1.0
+        eps: 1.0e-7
+    random_resized_crop_enabled: true
+    random_resized_crop_scale: [0.8, 1.0]
+    jitter_crop:
+      enabled: false
+      prob: 1.0
+      scale: [0.8, 1.2]
+      ratio: null
+      interpolation: bicubic
+      center:
+        enabled: true
+        prob: 0.5
+        max_offset_frac: [0.2, 0.1]
+      random:
+        enabled: true
+        prob: 0.5
+    horizontal_flip_prob: 0.5
+    color_jitter:
+      enabled: true
+      prob: 0.8
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      hue: 0.0
+    vertical_flip:
+      enabled: true
+      prob: 0.5
+    random_affine:
+      enabled: true
+      degrees: 5.0
+      translate: [0.02, 0.02]
+      scale: [0.95, 1.05]
+      shear: [0.02, 0.02]
+      interpolation: bilinear
+      fill: 0
+    gaussian_blur:
+      enabled: true
+      kernel_size: 3
+      kernel_size_range: [3, 7]
+      prob: 0.5
+      sigma: [0.1, 1.0]
+    gaussian_noise:
+      enabled: true
+      mean: 0.0
+      std: 0.01
+      prob: 0.5
+    watermark:
+      enabled: true
+      prob: 0.3
+      style: random
+      position: random
+      position_choices: [bottom_right, bottom_left, top_right, top_left]
+      position_probs: [0.7, 0.15, 0.1, 0.05]
+      timestamp_prob: 0.5
+      timestamp_format: "%d %m %Y %H:%M"
+      margin_frac_range: [0.008, 0.05]
+      font_size_frac_range: [0.04, 0.12]
+      alpha_range: [128, 200]
+      color_choices:
+        - [255, 140, 0]
+        - [255, 120, 0]
+        - [255, 170, 40]
+        - [255, 200, 0]
+        - [255, 255, 255]
+      color_jitter: 50
+      render_mode: shadow
+      shadow_color: [0, 0, 0]
+      shadow_alpha_range: [160, 255]
+      shadow_offset_frac_range: [0.03, 0.07]
+      texts: []
+      use_random_text: true
+      random_text_length_range: [3, 20]
+    light_spot:
+      enabled: true
+      blend_mode: composite
+      prob: 0.3
+      radius_frac_range: [0.06, 0.18]
+      alpha_range: [0.2, 0.6]
+      color: [255, 255, 220]
+      blur_frac: 0.5
+      core_blur_frac: 0.15
+      halo_enabled: false
+      halo_scale_range: [1.0, 3.5]
+      halo_alpha_mult_range: [0.06, 0.2]
+      grid_enabled: false
+      grid_rows_range: [2, 4]
+      grid_cols_range: [2, 5]
+      grid_spacing_mul_range: [5.0, 9.0]
+      grid_jitter_frac: 0.12
+      grid_cell_dropout_prob: 0.1
+      grid_share_params: true
+    random_erasing:
+      enabled: true
+      p: 0.25
+      scale: [0.02, 0.1]
+      ratio: [0.3, 3.3]
+      value: random
+    manifold_mixup:
+      enabled: true
+      prob: 1.0
+      alpha: 2.0
+      apply_on: tokens
+      detach_pair: false
+      mix_cls_token: false
+    cutmix:
+      enabled: false
+      alpha: 0.5
+      use_prev_for_bsz1: true
+    no_augment_prob: 0.1
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+ndvi_dense:
+  enabled: false
+  root: data/NDVI
+  tile_size: 640
+  tile_stride: 448
+  batch_size: 1
+  num_workers: 8
+  normalization:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  augment:
+    horizontal_flip_prob: 0.5
+    cutmix:
+      enabled: true
+      prob: 0.5
+      alpha: 0.3
+      use_prev_for_bsz1: true
+    vertical_flip_prob: 0.0
+
+model:
+  backbone: dinov3_vith16plus
+  weights_url: null
+  # IMPORTANT (workspace rule): frozen backbone weights are shared across runs.
+  weights_path: dinov3_weights/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pt
+  pretrained: true
+  freeze_backbone: true
+  backbone_weights_dtype: fp32
+  gradient_checkpointing: false
+  embedding_dim: 1280
+  log_scale_targets: false
+  head:
+    type: vitdet
+    vitdet_dim: 512
+    vitdet_patch_size: 16
+    vitdet_scale_factors: [2.0, 1.0, 0.5, 0.25]
+    hidden_dims: [1280]
+    activation: silu
+    dropout: 0.4586939537234684
+    ratio_head_mode: shared
+    use_output_softplus: true
+    use_cls_token: false
+    use_patch_reg3: false
+    dual_branch:
+      enabled: false
+      alpha_init: 0.2
+  backbone_layers:
+    enabled: true
+    layer_fusion: learned
+    separate_bottlenecks: true
+    indices_by_backbone:
+      dinov3_vitl16: [5, 11, 17, 23]
+      dinov3_vith16plus: [12, 24, 31]
+      dinov3_vit7b16: [9, 19, 29, 39]
+
+mtl:
+  enabled: true
+  tasks:
+    height: true
+    ndvi: true
+    ndvi_dense: false
+    species: false
+    state: true
+  sample_ratio:
+    ndvi_dense: 0.0
+
+train_all:
+  enabled: false
+
+peft:
+  enabled: true
+  method: lora
+  use_dora: false
+  r: 4
+  lora_alpha: 16
+  lora_dropout: 0.03451400041698553
+  init: true
+  last_k_blocks: 16
+  layers_pattern: blocks
+  target_modules: [qkv]
+  lora_lr: 0.0012829542106450487
+  lora_weight_decay: 0.0
+  lora_llrd: 0.86887955343612
+  lora_group_size: 1
+
+loss:
+  weighting: uw
+  use_ratio_head: true
+  use_5d_weighted_mse: true
+  mse_5d_weights_per_target: [0.1, 0.1, 0.1, 0.2, 0.5]
+
+optimizer:
+  name: adamw
+  lr: 0.0001286444268039004
+  weight_decay: 0.0021589341253740045
+  uw_lr: 0.01
+  uw_weight_decay: 0.0
+  use_sam: false
+  sam_rho: 0.05
+  sam_adaptive: true
+
+pcgrad:
+  enabled: true
+  mode: primary_anchored
+  eps: 1.0e-8
+  reduction: sum
+  shuffle_tasks: true
+  seed: null
+  primary_tasks: [reg3, ratio, biomass_5d]
+  aux_tasks: null
+  apply_to_group_types: [head]
+  exclude_group_types: [uw]
+  exclude_param_name_substrings: []
+  include_tasks: null
+  exclude_tasks: []
+
+scheduler:
+  name: cosine
+  warmup_epochs: 0
+  warmup_start_factor: 0.1
+
+kfold:
+  enabled: false
+  k: 5
+  even_split: false
+  folds: null
+
+trainer:
+  max_epochs: 35
+  accelerator: auto
+  devices: 1
+  precision: 16-mixed
+  limit_train_batches: 1500
+  limit_val_batches: 1
+  log_every_n_steps: 10
+  checkpoint:
+    every_n_epochs: 1
+  resume_from: null
+  accumulate_grad_batches: 2
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  swa:
+    enabled: false
+    adaptive_lrs: true
+    swa_lrs: 0.0001
+    auto_lrs: true
+    freeze_lora: false
+    freeze_lora_lr: 0.0
+    swa_epoch_start: 0.8
+    annealing_epochs: 5
+    annealing_strategy: cos
+  ema:
+    enabled: true
+    decay: 0.999
+    update_every_n_steps: 1
+    start_step: 0
+    eval_with_ema: true
+    apply_at_end: true
+    trainable_only: true
+
+logging:
+  log_dir: outputs
+  ckpt_dir: outputs/checkpoints
+  use_loguru: true
+
+seed: 42
+version: tune-vitdet-v1-12h-56-continue
+
+# -----------------------------
+# Ray Tune config
+# -----------------------------
+ray:
+  address: auto
+
+tune:
+  name: tune-vitdet-v3
+  resume: false
+  restore_path: null
+  resume_unfinished: true
+  resume_errored: true
+  restart_errored: false
+  storage_path: ray_results
+
+  metric: val_loss_5d_weighted
+  mode: min
+
+  # Local search => fewer samples than v1-12h; adjust from CLI if needed.
+  num_samples: 120
+  max_concurrent_trials: 2
+  resources_per_trial:
+    cpu: 8
+    gpu: 1
+
+  scheduler:
+    type: asha
+    max_epochs: ${trainer.max_epochs}
+    grace_period: 12
+    reduction_factor: 2
+
+  seeds: [42]
+  report_per_epoch: true
+
+  # Optional: promote top-N configs to k-fold evaluation (more reliable than single split).
+  two_stage:
+    enabled: true
+    scope: best
+    min_epoch: ${tune.scheduler.grace_period}
+    top_n: 8
+    name_suffix: "-stage2-kfold"
+    train_overrides:
+      kfold.enabled: true
+      kfold.k: 5
+      kfold.even_split: false
+      kfold.folds: null
+      train_all.enabled: false
+
+  # Focused search space around the current best + strongest directions from v1-12h analysis.
+  search_space:
+    # --- Optimizer / scheduler (high impact) ---
+    optimizer.lr:
+      type: loguniform
+      # v1-12h suggests lower LR is consistently better; keep range near best.
+      lower: 1.0e-5
+      upper: 3.0e-4
+    optimizer.weight_decay:
+      type: loguniform
+      # v1-12h suggests much smaller WD than current best often improves.
+      lower: 1.0e-6
+      upper: 5.0e-3
+    scheduler.warmup_epochs:
+      type: choice
+      values: [0, 1, 3, 5]
+
+    # --- ViTDet head (small local variants) ---
+    model.head.vitdet_dim:
+      type: choice
+      values: [256, 320, 512]
+    model.head.vitdet_scale_factors:
+      type: choice
+      values:
+        - [2.0, 1.0, 0.5, 0.25]
+        - [2.0, 1.0, 0.5]
+    model.head.hidden_dims:
+      type: choice
+      values:
+        - [1280]        # current best
+        - [512, 256]    # strong in v1-12h
+        - []            # linear head on pooled pyramid features (supported by code)
+    model.head.dropout:
+      type: uniform
+      lower: 0.25
+      upper: 0.6
+
+    # --- LoRA (continue from current best, but allow more capacity) ---
+    peft.r:
+      type: choice
+      values: [4, 8, 16]
+    peft.last_k_blocks:
+      type: choice
+      values: [8, 12, 16]
+    peft.lora_alpha:
+      type: choice
+      values: [8, 16, 32]
+    peft.lora_lr:
+      type: loguniform
+      lower: 3.0e-4
+      upper: 3.0e-3
+    peft.lora_dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.1
+    peft.lora_llrd:
+      type: uniform
+      lower: 0.8
+      upper: 1.0
+
+    # --- Manifold Mixup (augment-level, affects representation regularization) ---
+    data.augment.manifold_mixup.prob:
+      type: uniform
+      lower: 0.0
+      upper: 1.0
+    data.augment.manifold_mixup.alpha:
+      type: uniform
+      lower: 0.1
+      upper: 4.0
+
+

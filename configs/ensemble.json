@@ -20,7 +20,7 @@
       ]
     },
     "disagreement": {
-      "enabled": true,
+      "enabled": false,
       "space": "log1p",
       "weight_fn": "inv",
       "power": 1.0,
@@ -29,13 +29,8 @@
     }
   },
   "versions": [
-    "vitdet-320-detach-pair-augmix",
-    "vitdet-320-start-again-detach-pair",
-    "v186-align-lb0.76-vith16plus",
-    "vitdet-640-start-again-detach-pair",
-    "mainfold-mixup-no-patch-reg3-multilayer",
-    "patch-reg3-seprate_head",
-    "mainfold-mixup-no-patch-reg3-multilayer-log"
+    "tune-vitdet-v1-12h-56-c-05-ema-0.99",
+    "tune-vitdet-v1-12h-56-ema-0.99"
   ]
 }
 

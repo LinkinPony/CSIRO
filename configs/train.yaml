@@ -14,7 +14,7 @@ data:
   image_size:
   - 960
   - 480
-  batch_size: 2
+  batch_size: 4
   val_batch_size: 1
   num_workers: 8
   prefetch_factor: 2
@@ -219,8 +219,8 @@ data:
       value: random
     manifold_mixup:
       enabled: true
-      prob: 0.961368743712364
-      alpha: 3.9186644691596566
+      prob: 0.20710500313204228
+      alpha: 3.211423553488778
       apply_on: tokens
       detach_pair: false
       mix_cls_token: false
@@ -280,11 +280,9 @@ model:
     - 2.0
     - 1.0
     - 0.5
-    - 0.25
-    hidden_dims:
-    - 1280
+    hidden_dims: []
     activation: silu
-    dropout: 0.4195346732130885
+    dropout: 0.26904160538347066
     ratio_head_mode: shared
     use_output_softplus: true
     use_cls_token: false
@@ -322,22 +320,22 @@ mtl:
   sample_ratio:
     ndvi_dense: 0.0
 train_all:
-  enabled: true
+  enabled: false
 peft:
   enabled: true
   method: lora
   use_dora: false
-  r: 8
-  lora_alpha: 16
-  lora_dropout: 0.09990038225555746
+  r: 16
+  lora_alpha: 8
+  lora_dropout: 0.039810591007334487
   init: true
-  last_k_blocks: 16
+  last_k_blocks: 12
   layers_pattern: blocks
   target_modules:
   - qkv
-  lora_lr: 0.0005009856007190292
+  lora_lr: 0.0016567581500935733
   lora_weight_decay: 0.0
-  lora_llrd: 0.8729858381132479
+  lora_llrd: 0.8233237902572262
   lora_group_size: 1
 loss:
   weighting: uw
@@ -351,8 +349,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 7.876635324491703e-05
-  weight_decay: 1.3901312448240555e-05
+  lr: 0.0001555896786616759
+  weight_decay: 3.1608918491926586e-06
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -379,7 +377,7 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 5
+  warmup_epochs: 0
   warmup_start_factor: 0.1
 kfold:
   enabled: true
@@ -387,7 +385,7 @@ kfold:
   even_split: false
   folds: [0]
 trainer:
-  max_epochs: 45
+  max_epochs: 35
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -397,7 +395,7 @@ trainer:
   checkpoint:
     every_n_epochs: 1
   resume_from: null
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 2
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   swa:
@@ -411,12 +409,6 @@ trainer:
     annealing_epochs: 5
     annealing_strategy: cos
   ema:
-    # Exponential Moving Average (EMA) of model parameters (trainable-only by default).
-    # - eval_with_ema: swap model weights to EMA during val/test so logged metrics are EMA-based.
-    # - apply_at_end: keep EMA weights on the model at train end (so export/checkpoints use EMA).
-    # Exported head checkpoints embed provenance in meta:
-    #   meta.weights_source: "ema" | "raw"
-    #   meta.ema: {decay, update_every_n_steps, ...}
     enabled: true
     decay: 0.99
     update_every_n_steps: 1
@@ -429,4 +421,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-vitdet-v1-12h-56-c-05-ema-0.99-epoch-45
+version: tune-vitdet-v3-68
