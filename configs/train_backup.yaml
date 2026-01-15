@@ -437,6 +437,7 @@ mtl:
     ndvi_dense: false
     species: false
     state: true
+    date: false
   # Per-step sampling ratio within an epoch (expected proportion).
   # ndvi_dense: probability to include NDVI-dense loss on a training step.
   sample_ratio:
@@ -519,6 +520,7 @@ pcgrad:
   # - ndvi        : auxiliary NDVI regression (mtl.tasks.ndvi=true or NDVI-only batches)
   # - species     : auxiliary species classification (mtl.tasks.species=true)
   # - state       : auxiliary state classification (mtl.tasks.state=true)
+  # - date        : auxiliary date-on-circle regression (mtl.tasks.date=true)
   # Note (mode=primary_anchored): if primary_tasks has multiple entries, we first apply symmetric PCGrad
   # among the primary tasks to build the anchor, then project auxiliary task gradients against that anchor.
   primary_tasks: [reg3, ratio, biomass_5d]

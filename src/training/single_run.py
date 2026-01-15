@@ -325,6 +325,7 @@ def train_single_split(
     height_enabled = bool(tasks_cfg.get("height", False)) and mtl_enabled
     ndvi_enabled = bool(tasks_cfg.get("ndvi", False)) and mtl_enabled
     ndvi_dense_enabled = bool(tasks_cfg.get("ndvi_dense", False)) and mtl_enabled
+    date_enabled = bool(tasks_cfg.get("date", False)) and mtl_enabled
 
     # Infer auxiliary class counts if not provided explicitly (e.g., from k-fold)
     if mtl_enabled:
@@ -596,6 +597,7 @@ def train_single_split(
         enable_ndvi_dense=ndvi_dense_enabled,
         enable_species=bool(tasks_cfg.get("species", False)) and mtl_enabled,
         enable_state=bool(tasks_cfg.get("state", False)) and mtl_enabled,
+        enable_date=date_enabled,
         peft_cfg=dict(cfg.get("peft", {})),
         # Feature-level manifold mixup & CutMix configs (augmentation-level)
         manifold_mixup_cfg=dict(
@@ -821,5 +823,4 @@ def train_single_split(
     metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
     plots_dir = Path(log_dir) / "plots"
     plot_epoch_metrics(metrics_csv, plots_dir)
-
 

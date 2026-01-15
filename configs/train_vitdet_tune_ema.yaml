@@ -328,6 +328,7 @@ mtl:
     ndvi_dense: false
     species: false
     state: true
+    date: false
   sample_ratio:
     ndvi_dense: 0.0
 train_all:

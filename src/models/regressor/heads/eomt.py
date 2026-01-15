@@ -113,10 +113,12 @@ def init_eomt_task_heads(
     enable_height = bool(getattr(model, "enable_height", False))
     enable_species = bool(getattr(model, "enable_species", False))
     enable_state = bool(getattr(model, "enable_state", False))
+    enable_date = bool(getattr(model, "enable_date", False))
 
     model.height_head = (
         nn.Linear(int(bottleneck_dim), 1) if enable_height else None
     )  # type: ignore[assignment]
+    model.date_head = nn.Linear(int(bottleneck_dim), 2) if enable_date else None  # type: ignore[assignment]
     model.ndvi_head = None  # type: ignore[assignment]
     model.ratio_head = None  # type: ignore[assignment]
 
@@ -153,10 +155,10 @@ def init_eomt_task_heads(
     model.layer_ratio_heads = None  # type: ignore[assignment]
     model.layer_height_heads = None  # type: ignore[assignment]
     model.layer_ndvi_heads = None  # type: ignore[assignment]
+    model.layer_date_heads = None  # type: ignore[assignment]
     model.layer_species_heads = None  # type: ignore[assignment]
     model.layer_state_heads = None  # type: ignore[assignment]
 
 
 __all__ = ["init_eomt_head", "init_eomt_task_heads"]
-
 

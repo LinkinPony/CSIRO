@@ -117,6 +117,8 @@ class IrishGlassCloverDataset(Dataset):
         # Species/state not available; keep as dummy zeros
         y_species = torch.tensor(0, dtype=torch.long)
         y_state = torch.tensor(0, dtype=torch.long)
+        y_date = torch.zeros((2,), dtype=torch.float32)
+        date_mask = torch.zeros((1,), dtype=torch.float32)
 
         # Biomass decomposition targets are not available in full for this dataset.
         # We always return dummy 5D tensors with zero masks so the collate path
@@ -156,12 +158,13 @@ class IrishGlassCloverDataset(Dataset):
             "ndvi_mask": ndvi_mask,
             "y_species": y_species,
             "y_state": y_state,
+            "y_date": y_date,
+            "date_mask": date_mask,
             # Biomass decomposition (unused for Irish; masks are zero)
             "y_biomass_5d_g": y_5d_g,
             "biomass_5d_mask": biomass_5d_mask,
             "y_ratio": y_ratio,
             "ratio_mask": ratio_mask,
         }
-
 
 

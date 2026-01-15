@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -19,6 +20,44 @@ from .irish_glass_clover import IrishGlassCloverDataset
 class NormalizationSpec:
     mean: Sequence[float]
     std: Sequence[float]
+
+
+def _sampling_date_to_unit_circle(records: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = int(len(records))
+    cos_vals = np.zeros(n, dtype=np.float32)
+    sin_vals = np.zeros(n, dtype=np.float32)
+    mask_vals = np.zeros(n, dtype=np.float32)
+    if n == 0 or "Sampling_Date" not in records.columns:
+        return cos_vals, sin_vals, mask_vals
+    try:
+        parsed = pd.to_datetime(records["Sampling_Date"], errors="coerce")
+    except Exception:
+        parsed = pd.to_datetime(records["Sampling_Date"].astype(str), errors="coerce")
+    month = parsed.dt.month.to_numpy()
+    day = parsed.dt.day.to_numpy()
+    # Cumulative days for a non-leap year.
+    cum_days = np.array([0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334], dtype=np.int32)
+    for i in range(n):
+        m = month[i]
+        d = day[i]
+        if not np.isfinite(m) or not np.isfinite(d):
+            continue
+        mi = int(m)
+        di = int(d)
+        if mi < 1 or mi > 12 or di < 1 or di > 31:
+            continue
+        if mi == 2 and di == 29:
+            di = 28
+        doy = int(cum_days[mi - 1] + di)
+        if doy < 1:
+            continue
+        if doy > 365:
+            doy = 365
+        theta = 2.0 * math.pi * float(doy - 1) / 365.0
+        cos_vals[i] = math.cos(theta)
+        sin_vals[i] = math.sin(theta)
+        mask_vals[i] = 1.0
+    return cos_vals, sin_vals, mask_vals
 
 
 def _merge_augment_cfg(
@@ -150,6 +189,7 @@ class PastureImageDataset(Dataset):
         self.species_to_idx = dict(species_to_idx or {})
         self.state_to_idx = dict(state_to_idx or {})
         self.transform = transform
+        self._date_cos, self._date_sin, self._date_mask = _sampling_date_to_unit_circle(self.records)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -257,6 +297,12 @@ class PastureImageDataset(Dataset):
             y_state = torch.tensor(int(self.state_to_idx[state]), dtype=torch.long)
         else:
             y_state = torch.tensor(0, dtype=torch.long)
+        # auxiliary cyclical date target (unit circle: cos/sin)
+        y_date = torch.tensor(
+            [float(self._date_cos[index]), float(self._date_sin[index])],
+            dtype=torch.float32,
+        )
+        date_mask = torch.tensor([float(self._date_mask[index])], dtype=torch.float32)
         return {
             "image": image,
             "image_id": image_id,
@@ -269,6 +315,8 @@ class PastureImageDataset(Dataset):
             "ndvi_mask": ndvi_mask,       # 1 => NDVI supervised
             "y_species": y_species,
             "y_state": y_state,
+            "y_date": y_date,
+            "date_mask": date_mask,
             # Biomass decomposition targets (CSIRO only; masks handle missing values)
             "y_biomass_5d_g": y_5d_g,
             "biomass_5d_mask": biomass_5d_mask,

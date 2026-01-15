@@ -386,6 +386,7 @@ mtl:
     ndvi_dense: false
     species: false
     state: false
+    date: false
   # Per-step sampling ratio within an epoch (expected proportion).
   # ndvi_dense: probability to include NDVI-dense loss on a training step.
   sample_ratio:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -132,6 +133,14 @@ class LossesMixin:
         y_ndvi: Tensor = torch.nan_to_num(batch["y_ndvi"], nan=0.0, posinf=0.0, neginf=0.0)  # (B,1)
         y_species: Tensor = batch["y_species"]  # (B,)
         y_state: Tensor = batch["y_state"]  # (B,)
+        y_date_raw: Optional[Tensor] = batch.get("y_date", None)  # (B,2)
+        if y_date_raw is None:
+            y_date = torch.zeros((y_reg3.shape[0], 2), dtype=y_reg3.dtype, device=y_reg3.device)
+        else:
+            y_date = torch.nan_to_num(y_date_raw, nan=0.0, posinf=0.0, neginf=0.0)
+        date_mask: Optional[Tensor] = batch.get("date_mask", None)  # (B,1)
+        if date_mask is None:
+            date_mask = torch.zeros((y_date.shape[0], 1), dtype=y_date.dtype, device=y_date.device)
 
         if self.out_softplus is not None:
             pred_reg3 = self.out_softplus(pred_reg3)
@@ -425,6 +434,7 @@ class LossesMixin:
             and self.enable_ndvi is False
             and self.enable_species is False
             and self.enable_state is False
+            and self.enable_date is False
         ):
             if self.loss_weighting == "uw":
                 named_losses_simple: List[Tuple[str, Tensor]] = [("reg3", loss_reg3_mse)]
@@ -505,11 +515,13 @@ class LossesMixin:
         # Otherwise, compute enabled auxiliary task heads and losses
         pred_height = None
         pred_ndvi = None
+        pred_date = None
         logits_species = None
         logits_state = None
         if head_type in ("fpn", "dpt", "vitdet", "eomt"):
             pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
             pred_ndvi = ndvi_pred_from_head if self.enable_ndvi else None
+            pred_date = self.date_head(z) if self.enable_date else None  # type: ignore[assignment]
             logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
             logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
         elif self.use_layerwise_heads and z_layers is not None:
@@ -529,6 +541,14 @@ class LossesMixin:
                     device=ndvi_preds_layers[0].device, dtype=ndvi_preds_layers[0].dtype
                 )
                 pred_ndvi = fuse_layerwise_predictions(ndvi_preds_layers, weights=w)
+            if self.enable_date and self.layer_date_heads is not None:
+                date_preds_layers: List[Tensor] = []
+                for idx, head in enumerate(self.layer_date_heads):
+                    date_preds_layers.append(head(z_layers[idx]))
+                w = self._get_backbone_layer_fusion_weights(
+                    device=date_preds_layers[0].device, dtype=date_preds_layers[0].dtype
+                )
+                pred_date = fuse_layerwise_predictions(date_preds_layers, weights=w)
             if self.enable_species and self.layer_species_heads is not None:
                 species_logits_layers: List[Tensor] = []
                 for idx, head in enumerate(self.layer_species_heads):
@@ -548,6 +568,7 @@ class LossesMixin:
         else:
             pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
             pred_ndvi = self.ndvi_head(z) if self.enable_ndvi else None  # type: ignore[assignment]
+            pred_date = self.date_head(z) if self.enable_date else None  # type: ignore[assignment]
             logits_species = self.species_head(z) if self.enable_species else None  # type: ignore[assignment]
             logits_state = self.state_head(z) if self.enable_state else None  # type: ignore[assignment]
 
@@ -596,6 +617,28 @@ class LossesMixin:
             _log(f"{stage}_mse_ndvi", loss_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             _log(f"{stage}_mae_ndvi", mae_ndvi, on_step=False, on_epoch=True, prog_bar=False)
             named_losses.append(("ndvi", loss_ndvi))
+
+        if self.enable_date:
+            m_date = date_mask.to(device=y_date.device, dtype=y_date.dtype)
+            if pred_date is None:
+                zero_date = (z.sum() * 0.0)
+                loss_date = zero_date
+                mae_date_deg = zero_date
+            else:
+                pred_norm = pred_date.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                pred_unit = pred_date / pred_norm
+                diff = pred_unit - y_date
+                diff2 = (diff * diff).mean(dim=-1, keepdim=True)
+                diff2 = torch.where(m_date > 0.0, diff2, torch.zeros_like(diff2))
+                denom = m_date.sum().clamp_min(1.0)
+                loss_date = diff2.sum() / denom
+                cos_sim = (pred_unit * y_date).sum(dim=-1).clamp(-1.0, 1.0)
+                angle = torch.acos(cos_sim)
+                angle_deg = angle * (180.0 / float(math.pi))
+                mae_date_deg = (angle_deg * m_date.squeeze(-1)).sum() / denom
+            _log(f"{stage}_loss_date", loss_date, on_step=False, on_epoch=True, prog_bar=False)
+            _log(f"{stage}_mae_date_deg", mae_date_deg, on_step=False, on_epoch=True, prog_bar=False)
+            named_losses.append(("date", loss_date))
 
         if self.enable_species and logits_species is not None:
             loss_species = F.cross_entropy(logits_species, y_species)
@@ -663,5 +706,3 @@ class LossesMixin:
                 else torch.zeros(5, device=loss_reg3_mse.device, dtype=loss_reg3_mse.dtype)
             ),
         }
-
-

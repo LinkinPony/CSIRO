@@ -127,6 +127,7 @@ class BiomassRegressor(
         enable_ndvi_dense: bool = False,
         enable_species: bool = False,
         enable_state: bool = False,
+        enable_date: bool = False,
         # CutMix configs (batch-level augmentation)
         cutmix_cfg: Optional[Dict[str, Any]] = None,
         ndvi_dense_cutmix_cfg: Optional[Dict[str, Any]] = None,
@@ -402,6 +403,7 @@ class BiomassRegressor(
         self.enable_ndvi_dense = bool(enable_ndvi_dense) and self.mtl_enabled
         self.enable_species = bool(enable_species) and self.mtl_enabled
         self.enable_state = bool(enable_state) and self.mtl_enabled
+        self.enable_date = bool(enable_date) and self.mtl_enabled
 
         # Persist auxiliary class counts (needed by head builders).
         if self.enable_species:
@@ -534,6 +536,8 @@ class BiomassRegressor(
                 task_names.append("species")
             if self.enable_state:
                 task_names.append("state")
+            if self.enable_date:
+                task_names.append("date")
             pdict = nn.ParameterDict({name: nn.Parameter(torch.zeros(1)) for name in task_names})
             self._uw_task_params = pdict
 

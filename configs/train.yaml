@@ -315,8 +315,9 @@ mtl:
     height: true
     ndvi: true
     ndvi_dense: false
-    species: false
+    species: true
     state: true
+    date: true
   sample_ratio:
     ndvi_dense: 0.0
 train_all:
@@ -380,7 +381,7 @@ scheduler:
   warmup_epochs: 0
   warmup_start_factor: 0.1
 kfold:
-  enabled: false
+  enabled: true
   k: 5
   even_split: false
   folds:
@@ -422,4 +423,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-vitdet-v5-98
+version: tune-vitdet-v5-98-mtl

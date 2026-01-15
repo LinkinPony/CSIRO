@@ -175,11 +175,13 @@ def init_mlp_task_heads(
     enable_ndvi = bool(getattr(model, "enable_ndvi", False))
     enable_species = bool(getattr(model, "enable_species", False))
     enable_state = bool(getattr(model, "enable_state", False))
+    enable_date = bool(getattr(model, "enable_date", False))
     enable_ratio_head = bool(getattr(model, "enable_ratio_head", True))
 
     # Scalar auxiliary heads
     model.height_head = nn.Linear(int(bottleneck_dim), 1) if enable_height else None  # type: ignore[assignment]
     model.ndvi_head = nn.Linear(int(bottleneck_dim), 1) if enable_ndvi else None  # type: ignore[assignment]
+    model.date_head = nn.Linear(int(bottleneck_dim), 2) if enable_date else None  # type: ignore[assignment]
 
     # Species / state classification heads
     if enable_species:
@@ -231,6 +233,9 @@ def init_mlp_task_heads(
         model.layer_ndvi_heads = (  # type: ignore[assignment]
             nn.ModuleList(nn.Linear(int(bottleneck_dim), 1) for _ in range(L)) if enable_ndvi else None
         )
+        model.layer_date_heads = (  # type: ignore[assignment]
+            nn.ModuleList(nn.Linear(int(bottleneck_dim), 2) for _ in range(L)) if enable_date else None
+        )
         model.layer_species_heads = (  # type: ignore[assignment]
             nn.ModuleList(nn.Linear(int(bottleneck_dim), int(getattr(model, "num_species_classes", 0))) for _ in range(L))
             if enable_species and int(getattr(model, "num_species_classes", 0)) > 0
@@ -246,7 +251,7 @@ def init_mlp_task_heads(
         model.layer_ratio_heads = None  # type: ignore[assignment]
         model.layer_height_heads = None  # type: ignore[assignment]
         model.layer_ndvi_heads = None  # type: ignore[assignment]
+        model.layer_date_heads = None  # type: ignore[assignment]
         model.layer_species_heads = None  # type: ignore[assignment]
         model.layer_state_heads = None  # type: ignore[assignment]
-
 

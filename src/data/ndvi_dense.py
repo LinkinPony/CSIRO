@@ -291,6 +291,8 @@ class NdviDenseAsScalarDataset(Dataset):
         y_height = torch.zeros((1,), dtype=torch.float32)
         y_species = torch.tensor(0, dtype=torch.long)
         y_state = torch.tensor(0, dtype=torch.long)
+        y_date = torch.zeros((2,), dtype=torch.float32)
+        date_mask = torch.zeros((1,), dtype=torch.float32)
 
         return {
             "image": rgb,
@@ -302,6 +304,8 @@ class NdviDenseAsScalarDataset(Dataset):
             "y_ndvi": y_ndvi_scalar,
             "y_species": y_species,
             "y_state": y_state,
+            "y_date": y_date,
+            "date_mask": date_mask,
             "ndvi_only": True,
             "task": "ndvi_only",
             "meta": {
@@ -331,5 +335,4 @@ def build_ndvi_scalar_dataloader(
         persistent_workers=bool(cfg.num_workers > 0),
         drop_last=is_train,
     )
-
 
