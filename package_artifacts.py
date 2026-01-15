@@ -894,6 +894,81 @@ def _export_swa_head_from_checkpoint(ckpt_path: Path, dst_dir: Path) -> tuple[Pa
     return ckpt_path, dst_path
 
 
+def _export_head_from_checkpoint(ckpt_path: Path, dst_dir: Path) -> tuple[Path, Path] | None:
+    """
+    Build an inference head directly from a Lightning checkpoint (non-SWA).
+    Returns (ckpt_path, dst_head_path) on success, or None if export fails.
+    """
+    from src.models.regressor import BiomassRegressor
+    from src.callbacks.head_checkpoint import HeadCheckpoint
+    import shutil as _shutil
+
+    if not ckpt_path.is_file():
+        print(f"[HEAD] Checkpoint not found on disk, skipping head export: {ckpt_path}")
+        return None
+
+    print(f"[HEAD] Exporting head from checkpoint: {ckpt_path}")
+
+    try:
+        ckpt_obj = _load_checkpoint(ckpt_path)
+    except Exception as e:
+        print(f"[HEAD] Failed to load checkpoint ({ckpt_path}): {e}")
+        return None
+
+    try:
+        model = BiomassRegressor.load_from_checkpoint(str(ckpt_path), map_location="cpu")
+    except Exception as e:
+        print(f"[HEAD] Failed to construct BiomassRegressor from checkpoint ({ckpt_path}): {e}")
+        return None
+
+    # Export into a temporary directory, then copy into destination.
+    tmp_dir = dst_dir.parent / ".tmp_head_export"
+    if tmp_dir.exists() and tmp_dir.is_dir():
+        _shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    head_cb = HeadCheckpoint(output_dir=str(tmp_dir), save_only_last_epoch=False)
+
+    class _DummyTrainer:
+        def __init__(self, epoch: int):
+            self.current_epoch = epoch
+            self.callback_metrics = {}
+
+    epoch_int = 0
+    try:
+        epoch_int = int(ckpt_obj.get("epoch", 0))
+    except Exception:
+        epoch_int = 0
+
+    dummy_trainer = _DummyTrainer(epoch=epoch_int)
+    try:
+        head_cb.on_validation_epoch_end(dummy_trainer, model)
+    except Exception as e:
+        print(f"[HEAD] HeadCheckpoint export failed: {e}")
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    head_files = list_head_checkpoints(tmp_dir)
+    if not head_files:
+        print("[HEAD] No head-epoch*.pt files produced by HeadCheckpoint in temporary export dir.")
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    chosen = pick_latest_head(head_files)
+    if chosen is None:
+        print("[HEAD] Failed to select a head checkpoint from temporary export dir.")
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst_path = dst_dir / "infer_head.pt"
+    _shutil.copyfile(str(chosen), str(dst_path))
+
+    _shutil.rmtree(tmp_dir, ignore_errors=True)
+    print(f"[HEAD] Successfully exported head: {ckpt_path} -> {dst_path}")
+    return ckpt_path, dst_path
+
+
 def main():
     args = parse_args()
     cfg = load_cfg(args.config)
@@ -977,7 +1052,21 @@ def main():
                     head_dir = train_all_dir / "head"
                     head_files = list_head_checkpoints(head_dir)
                     if not head_files:
-                        raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
+                        # As a last resort, export head directly from last.ckpt.
+                        last_ckpt = train_all_dir / "last.ckpt"
+                        if dst_dir.exists() and dst_dir.is_dir():
+                            shutil.rmtree(dst_dir)
+                        res = _export_head_from_checkpoint(last_ckpt, dst_dir)
+                        if res is None:
+                            raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
+                        chosen_head, copied_head = res
+                        exported.append((chosen_head, copied_head))
+                        try:
+                            rel = copied_head.relative_to(weights_dir / "head")
+                            packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                        except Exception:
+                            pass
+                        head_files = []
                     chosen_head: Path | None = None
                     if select_best:
                         metrics_csv = find_latest_metrics_csv(v_log_dir / "train_all")
@@ -994,19 +1083,20 @@ def main():
                             chosen_head = pick_latest_head(head_files)
                     else:
                         chosen_head = pick_latest_head(head_files)
-                    if chosen_head is None:
-                        raise FileNotFoundError(f"Failed to determine a train_all head checkpoint for version {ver}.")
-                    if dst_dir.exists() and dst_dir.is_dir():
-                        shutil.rmtree(dst_dir)
-                    dst_dir.mkdir(parents=True, exist_ok=True)
-                    copied_head = dst_dir / "infer_head.pt"
-                    shutil.copyfile(str(chosen_head), str(copied_head))
-                    exported.append((chosen_head, copied_head))
-                    try:
-                        rel = copied_head.relative_to(weights_dir / "head")
-                        packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
-                    except Exception:
-                        pass
+                    if copied_head is None:
+                        if chosen_head is None:
+                            raise FileNotFoundError(f"Failed to determine a train_all head checkpoint for version {ver}.")
+                        if dst_dir.exists() and dst_dir.is_dir():
+                            shutil.rmtree(dst_dir)
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        copied_head = dst_dir / "infer_head.pt"
+                        shutil.copyfile(str(chosen_head), str(copied_head))
+                        exported.append((chosen_head, copied_head))
+                        try:
+                            rel = copied_head.relative_to(weights_dir / "head")
+                            packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                        except Exception:
+                            pass
 
                 # Copy z_score.json for train_all (best effort)
                 zsrc = v_log_dir / "train_all" / "z_score.json"
@@ -1074,7 +1164,27 @@ def main():
                         fold_ckpt_head_dir = fold_dir / "head"
                         head_files = list_head_checkpoints(fold_ckpt_head_dir)
                         if not head_files:
-                            raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
+                            # As a last resort, export head directly from last.ckpt.
+                            last_ckpt = fold_dir / "last.ckpt"
+                            if dst_dir.exists() and dst_dir.is_dir():
+                                shutil.rmtree(dst_dir)
+                            res = _export_head_from_checkpoint(last_ckpt, dst_dir)
+                            if res is None:
+                                raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
+                            chosen, dst_path = res
+                            exported.append((chosen, dst_path))
+                            try:
+                                rel = dst_path.relative_to(weights_dir / "head")
+                                packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                            except Exception:
+                                pass
+                            zsrc = v_log_dir / fold_dir.name / "z_score.json"
+                            if zsrc.is_file():
+                                try:
+                                    shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                                except Exception:
+                                    pass
+                            continue
                         if select_best:
                             metrics_csv = find_latest_metrics_csv(v_log_dir / fold_dir.name)
                             chosen = None
@@ -1116,6 +1226,7 @@ def main():
                     dst_dir = weights_dir / "head" / ver
                     # Try SWA
                     chosen: Path | None = None
+                    copied_head: Path | None = None
                     if use_swa:
                         main_last_ckpt = v_ckpt_dir / "last.ckpt"
                         if main_last_ckpt.is_file():
@@ -1149,7 +1260,27 @@ def main():
                         head_dir = v_ckpt_dir / "head"
                         head_files = list_head_checkpoints(head_dir)
                         if not head_files:
-                            raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
+                            # As a last resort, export head directly from last.ckpt.
+                            last_ckpt = v_ckpt_dir / "last.ckpt"
+                            if dst_dir.exists() and dst_dir.is_dir():
+                                shutil.rmtree(dst_dir)
+                            res = _export_head_from_checkpoint(last_ckpt, dst_dir)
+                            if res is None:
+                                raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
+                            chosen, copied_head = res
+                            print(f"Copied head checkpoint: {chosen} -> {copied_head}")
+                            try:
+                                rel = copied_head.relative_to(weights_dir / "head")
+                                packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                            except Exception:
+                                pass
+                            zsrc = v_log_dir / "z_score.json"
+                            if zsrc.is_file():
+                                try:
+                                    shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                                except Exception:
+                                    pass
+                            head_files = []
                         if select_best:
                             metrics_csv = find_latest_metrics_csv(v_log_dir)
                             chosen = None
@@ -1163,25 +1294,26 @@ def main():
                                 chosen = pick_latest_head(head_files)
                         else:
                             chosen = pick_latest_head(head_files)
-                        if chosen is None:
-                            raise FileNotFoundError(f"Failed to determine a head checkpoint for version {ver}.")
-                        if dst_dir.exists() and dst_dir.is_dir():
-                            shutil.rmtree(dst_dir)
-                        dst_dir.mkdir(parents=True, exist_ok=True)
-                        copied_head = dst_dir / "infer_head.pt"
-                        shutil.copyfile(str(chosen), str(copied_head))
-                        print(f"Copied head checkpoint: {chosen} -> {copied_head}")
-                        try:
-                            rel = copied_head.relative_to(weights_dir / "head")
-                            packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
-                        except Exception:
-                            pass
-                        zsrc = v_log_dir / "z_score.json"
-                        if zsrc.is_file():
+                        if copied_head is None:
+                            if chosen is None:
+                                raise FileNotFoundError(f"Failed to determine a head checkpoint for version {ver}.")
+                            if dst_dir.exists() and dst_dir.is_dir():
+                                shutil.rmtree(dst_dir)
+                            dst_dir.mkdir(parents=True, exist_ok=True)
+                            copied_head = dst_dir / "infer_head.pt"
+                            shutil.copyfile(str(chosen), str(copied_head))
+                            print(f"Copied head checkpoint: {chosen} -> {copied_head}")
                             try:
-                                shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                                rel = copied_head.relative_to(weights_dir / "head")
+                                packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
                             except Exception:
                                 pass
+                            zsrc = v_log_dir / "z_score.json"
+                            if zsrc.is_file():
+                                try:
+                                    shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                                except Exception:
+                                    pass
 
         # Write packaged ensemble manifest
         if packaged_head_rel_paths:
@@ -1295,7 +1427,28 @@ def main():
             # under fold_{i}/head/ as before.
             head_files = list_head_checkpoints(fold_ckpt_head_dir)
             if not head_files:
-                raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
+                # As a last resort, export head directly from last.ckpt.
+                last_ckpt = fold_root_ckpt_dir / "last.ckpt"
+                dst_dir = weights_dir / "head" / f"fold_{fold_idx}"
+                if dst_dir.exists() and dst_dir.is_dir():
+                    shutil.rmtree(dst_dir)
+                res = _export_head_from_checkpoint(last_ckpt, dst_dir)
+                if res is None:
+                    raise FileNotFoundError(f"No head checkpoints found under: {fold_ckpt_head_dir}")
+                chosen, dst_path = res
+                exported.append((chosen, dst_path))
+                try:
+                    rel = dst_path.relative_to(weights_dir / "head")
+                    packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                except Exception:
+                    pass
+                zsrc = fold_log_dir / "z_score.json"
+                if zsrc.is_file():
+                    try:
+                        shutil.copyfile(str(zsrc), str(dst_dir / "z_score.json"))
+                    except Exception:
+                        pass
+                continue
 
             if select_best:
                 # Pick best by val_loss using this fold's latest metrics.csv
@@ -1398,41 +1551,58 @@ def main():
         if train_all_head_dst is None:
             head_files = list_head_checkpoints(train_all_head_dir)
             if not head_files:
-                raise FileNotFoundError(f"No head checkpoints found under: {train_all_head_dir}")
-
-            if select_best:
-                metrics_csv = find_latest_metrics_csv(train_all_log_dir)
-                chosen = None
-                if metrics_csv is not None:
-                    best_epoch = pick_best_epoch_from_metrics(metrics_csv)
-                    if best_epoch is not None:
-                        p = find_head_by_epoch(train_all_head_dir, best_epoch)
-                        if p is not None:
-                            chosen = p
-                if chosen is None:
-                    chosen = pick_latest_head(head_files)
-            else:
-                chosen = pick_latest_head(head_files)
-
-            if chosen is None:
-                raise FileNotFoundError("Failed to determine a head checkpoint for train_all.")
-
-            head_dst_dir = weights_dir / "head"
-            head_dst_dir.mkdir(parents=True, exist_ok=True)
-            train_all_head_dst = head_dst_dir / "infer_head.pt"
-            shutil.copyfile(str(chosen), str(train_all_head_dst))
-            try:
-                rel = train_all_head_dst.relative_to(weights_dir / "head")
-                packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
-            except Exception:
-                pass
-            # Copy z_score.json for train_all if present
-            zsrc = train_all_log_dir / "z_score.json"
-            if zsrc.is_file():
+                # As a last resort, export head directly from last.ckpt.
+                head_dst_dir = weights_dir / "head"
+                res = _export_head_from_checkpoint(train_all_root_ckpt_dir / "last.ckpt", head_dst_dir)
+                if res is None:
+                    raise FileNotFoundError(f"No head checkpoints found under: {train_all_head_dir}")
+                chosen, train_all_head_dst = res
                 try:
-                    shutil.copyfile(str(zsrc), str(head_dst_dir / "z_score.json"))
+                    rel = train_all_head_dst.relative_to(weights_dir / "head")
+                    packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
                 except Exception:
                     pass
+                zsrc = train_all_log_dir / "z_score.json"
+                if zsrc.is_file():
+                    try:
+                        shutil.copyfile(str(zsrc), str(head_dst_dir / "z_score.json"))
+                    except Exception:
+                        pass
+
+            if train_all_head_dst is None:
+                if select_best:
+                    metrics_csv = find_latest_metrics_csv(train_all_log_dir)
+                    chosen = None
+                    if metrics_csv is not None:
+                        best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+                        if best_epoch is not None:
+                            p = find_head_by_epoch(train_all_head_dir, best_epoch)
+                            if p is not None:
+                                chosen = p
+                    if chosen is None:
+                        chosen = pick_latest_head(head_files)
+                else:
+                    chosen = pick_latest_head(head_files)
+
+                if chosen is None:
+                    raise FileNotFoundError("Failed to determine a head checkpoint for train_all.")
+
+                head_dst_dir = weights_dir / "head"
+                head_dst_dir.mkdir(parents=True, exist_ok=True)
+                train_all_head_dst = head_dst_dir / "infer_head.pt"
+                shutil.copyfile(str(chosen), str(train_all_head_dst))
+                try:
+                    rel = train_all_head_dst.relative_to(weights_dir / "head")
+                    packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                except Exception:
+                    pass
+                # Copy z_score.json for train_all if present
+                zsrc = train_all_log_dir / "z_score.json"
+                if zsrc.is_file():
+                    try:
+                        shutil.copyfile(str(zsrc), str(head_dst_dir / "z_score.json"))
+                    except Exception:
+                        pass
 
         if train_all_head_dst is not None:
             print(f"Copied train_all head checkpoint -> {train_all_head_dst}")
@@ -1483,32 +1653,46 @@ def main():
         if head_dir is not None:
             head_files = list_head_checkpoints(head_dir)
             if not head_files:
-                raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
-
-            if select_best:
-                metrics_csv = find_latest_metrics_csv(log_dir)
-                chosen = None
-                if metrics_csv is not None:
-                    best_epoch = pick_best_epoch_from_metrics(metrics_csv)
-                    if best_epoch is not None:
-                        p = find_head_by_epoch(head_dir, best_epoch)
-                        if p is not None:
-                            chosen = p
-                if chosen is None:
-                    chosen = pick_latest_head(head_files)
+                # As a last resort, export head directly from last.ckpt.
+                last_ckpt = ckpt_dir / "last.ckpt"
+                dst_dir = weights_dir / "head"
+                if dst_dir.exists() and dst_dir.is_dir():
+                    shutil.rmtree(dst_dir)
+                res = _export_head_from_checkpoint(last_ckpt, dst_dir)
+                if res is None:
+                    raise FileNotFoundError(f"No head checkpoints found under: {head_dir}")
+                chosen, copied_head = res
+                print(f"Copied head checkpoint: {chosen} -> {copied_head}")
+                try:
+                    rel = copied_head.relative_to(weights_dir / "head")
+                    packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                except Exception:
+                    pass
             else:
-                chosen = pick_latest_head(head_files)
+                if select_best:
+                    metrics_csv = find_latest_metrics_csv(log_dir)
+                    chosen = None
+                    if metrics_csv is not None:
+                        best_epoch = pick_best_epoch_from_metrics(metrics_csv)
+                        if best_epoch is not None:
+                            p = find_head_by_epoch(head_dir, best_epoch)
+                            if p is not None:
+                                chosen = p
+                    if chosen is None:
+                        chosen = pick_latest_head(head_files)
+                else:
+                    chosen = pick_latest_head(head_files)
 
-            if chosen is None:
-                raise FileNotFoundError("Failed to determine a head checkpoint to package.")
+                if chosen is None:
+                    raise FileNotFoundError("Failed to determine a head checkpoint to package.")
 
-            copied_head = copy_head_to_weights(chosen, weights_dir)
-            print(f"Copied head checkpoint: {chosen} -> {copied_head}")
-            try:
-                rel = copied_head.relative_to(weights_dir / "head")
-                packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
-            except Exception:
-                pass
+                copied_head = copy_head_to_weights(chosen, weights_dir)
+                print(f"Copied head checkpoint: {chosen} -> {copied_head}")
+                try:
+                    rel = copied_head.relative_to(weights_dir / "head")
+                    packaged_head_rel_paths.append(str(rel).replace("\\", "/"))
+                except Exception:
+                    pass
         # Copy z_score.json from run log dir if present
         zsrc = log_dir / "z_score.json"
         if zsrc.is_file():
@@ -1554,5 +1738,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
