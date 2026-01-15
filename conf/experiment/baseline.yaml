@@ -5,6 +5,7 @@ defaults:
   - /data/normalization: imagenet
   - /data/ndvi_dense: default
   - /data/irish_glass_clover: default
+  - /data/biomass_data: default
 
   # --- Model ---
   - /model/backbone: dinov3_vith16plus
@@ -27,5 +28,4 @@ defaults:
 
 seed: 42
 version: mlp-v2-pcgrad-irish-no-peft
-
 

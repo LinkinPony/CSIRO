@@ -144,6 +144,7 @@ def _build_datamodule(
     """
     log_scale_targets_cfg = bool(cfg["model"].get("log_scale_targets", False))
     irish_cfg = cfg.get("irish_glass_clover", {})
+    biomass_cfg = cfg.get("biomass_data", {})
     ndvi_dense_cfg = cfg.get("ndvi_dense", {})
     aigc_cfg = cfg.get("data", {}).get("aigc_aug", {}) or {}
     # Normalize optional list-like config keys
@@ -154,6 +155,14 @@ def _build_datamodule(
         aigc_types = [str(x) for x in types_val]
     else:
         aigc_types = [str(types_val)]
+
+    biomass_csvs_val = biomass_cfg.get("csvs", None)
+    if biomass_csvs_val in (None, "", "null"):
+        biomass_csvs = None
+    elif isinstance(biomass_csvs_val, (list, tuple)):
+        biomass_csvs = [str(x) for x in biomass_csvs_val]
+    else:
+        biomass_csvs = [str(biomass_csvs_val)]
 
     dm = PastureDataModule(
         data_root=cfg["data"]["root"],
@@ -226,6 +235,32 @@ def _build_datamodule(
             irish_cfg.get("image_size", cfg["data"]["image_size"])
         )
         if irish_cfg.get("image_size", None) is not None
+        else None,
+        # Biomass Data (optional mixed dataset)
+        biomass_enabled=bool(biomass_cfg.get("enabled", False)),
+        biomass_root=str(biomass_cfg.get("root", ""))  # type: ignore[arg-type]
+        if biomass_cfg.get("root", None) is not None
+        else None,
+        biomass_train_csv=str(biomass_cfg.get("train_csv", ""))  # type: ignore[arg-type]
+        if biomass_cfg.get("train_csv", None) is not None
+        else None,
+        biomass_test_csv=str(biomass_cfg.get("test_csv", ""))  # type: ignore[arg-type]
+        if biomass_cfg.get("test_csv", None) is not None
+        else None,
+        biomass_csvs=biomass_csvs,
+        biomass_image_dir=str(biomass_cfg.get("image_dir", "images")),
+        biomass_image_dir_from_csv=bool(biomass_cfg.get("image_dir_from_csv", True)),
+        biomass_image_col=str(biomass_cfg.get("image_col", "image_file_name")),
+        biomass_dry_total_col=str(biomass_cfg.get("dry_total_col", "dry_total")),
+        biomass_dry_clover_col=str(biomass_cfg.get("dry_clover_col", "dry_clover")),
+        biomass_dry_weeds_col=str(biomass_cfg.get("dry_weeds_col", "dry_weeds")),
+        biomass_dry_grass_col=str(biomass_cfg.get("dry_grass_col", "dry_grass")),
+        biomass_supervise_ratio=bool(biomass_cfg.get("supervise_ratio", False)),
+        biomass_drop_unlabeled=bool(biomass_cfg.get("drop_unlabeled", False)),
+        biomass_image_size=parse_image_size(
+            biomass_cfg.get("image_size", cfg["data"]["image_size"])
+        )
+        if biomass_cfg.get("image_size", None) is not None
         else None,
         # Seed for reproducible internal split when predefined splits are not supplied
         random_seed=int(cfg.get("seed", 42)),
@@ -823,4 +858,3 @@ def train_single_split(
     metrics_csv = Path(csv_logger.log_dir) / "metrics.csv"
     plots_dir = Path(log_dir) / "plots"
     plot_epoch_metrics(metrics_csv, plots_dir)
-

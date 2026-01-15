@@ -14,6 +14,7 @@ from loguru import logger
 from src.data.augmentations import build_transforms as build_aug_transforms
 from .ndvi_dense import NdviDenseConfig, build_ndvi_scalar_dataloader
 from .irish_glass_clover import IrishGlassCloverDataset
+from .biomass_data import BiomassDataDataset
 
 
 @dataclass
@@ -366,6 +367,22 @@ class PastureDataModule(LightningDataModule):
         irish_image_dir: str = "images",
         irish_supervise_ratio: bool = False,
         irish_image_size: Optional[Union[int, Tuple[int, int]]] = None,
+        # Optional Biomass Data mixed dataset
+        biomass_enabled: bool = False,
+        biomass_root: Optional[str] = None,
+        biomass_train_csv: Optional[str] = None,
+        biomass_test_csv: Optional[str] = None,
+        biomass_csvs: Optional[Sequence[str]] = None,
+        biomass_image_dir: str = "images",
+        biomass_image_dir_from_csv: bool = True,
+        biomass_image_col: str = "image_file_name",
+        biomass_dry_total_col: str = "dry_total",
+        biomass_dry_clover_col: str = "dry_clover",
+        biomass_dry_weeds_col: str = "dry_weeds",
+        biomass_dry_grass_col: str = "dry_grass",
+        biomass_supervise_ratio: bool = False,
+        biomass_drop_unlabeled: bool = False,
+        biomass_image_size: Optional[Union[int, Tuple[int, int]]] = None,
         # Seed for reproducible internal train/val split when predefined splits are not supplied
         random_seed: int = 42,
         # Split policy: keep all samples from the same (Sampling_Date, State) group together
@@ -429,6 +446,24 @@ class PastureDataModule(LightningDataModule):
         self.irish_image_dir: str = str(irish_image_dir or "images")
         self.irish_supervise_ratio: bool = bool(irish_supervise_ratio)
         self.irish_image_size: Optional[Union[int, Tuple[int, int]]] = irish_image_size
+        # Biomass Data mixed dataset config
+        self.biomass_enabled: bool = bool(biomass_enabled)
+        self.biomass_root: Optional[str] = str(biomass_root) if biomass_root else None
+        self.biomass_train_csv: Optional[str] = str(biomass_train_csv) if biomass_train_csv else None
+        self.biomass_test_csv: Optional[str] = str(biomass_test_csv) if biomass_test_csv else None
+        self.biomass_csvs: Optional[List[str]] = (
+            [str(x) for x in list(biomass_csvs)] if biomass_csvs is not None else None
+        )
+        self.biomass_image_dir: str = str(biomass_image_dir or "images")
+        self.biomass_image_dir_from_csv: bool = bool(biomass_image_dir_from_csv)
+        self.biomass_image_col: str = str(biomass_image_col or "image_file_name")
+        self.biomass_dry_total_col: str = str(biomass_dry_total_col or "dry_total")
+        self.biomass_dry_clover_col: str = str(biomass_dry_clover_col or "dry_clover")
+        self.biomass_dry_weeds_col: str = str(biomass_dry_weeds_col or "dry_weeds")
+        self.biomass_dry_grass_col: str = str(biomass_dry_grass_col or "dry_grass")
+        self.biomass_supervise_ratio: bool = bool(biomass_supervise_ratio)
+        self.biomass_drop_unlabeled: bool = bool(biomass_drop_unlabeled)
+        self.biomass_image_size: Optional[Union[int, Tuple[int, int]]] = biomass_image_size
         try:
             self.random_seed: int = int(random_seed)
         except Exception:
@@ -448,6 +483,22 @@ class PastureDataModule(LightningDataModule):
             merged_aug_irish = _merge_augment_cfg(augment_cfg=augment_cfg, train_scale=train_scale, hflip_prob=hflip_prob)
             self.irish_train_tf, _ = build_aug_transforms(
                 image_size=irish_size, mean=mean, std=std, augment_cfg=merged_aug_irish
+            )
+        self.biomass_train_tf: Optional[T.Compose] = None
+        if self.biomass_enabled and self.biomass_root and (
+            self.biomass_csvs is not None or self.biomass_train_csv or self.biomass_test_csv
+        ):
+            biomass_size = self.biomass_image_size if self.biomass_image_size is not None else image_size
+            merged_aug_biomass = _merge_augment_cfg(
+                augment_cfg=augment_cfg,
+                train_scale=train_scale,
+                hflip_prob=hflip_prob,
+            )
+            self.biomass_train_tf, _ = build_aug_transforms(
+                image_size=biomass_size,
+                mean=mean,
+                std=std,
+                augment_cfg=merged_aug_biomass,
             )
         # z-score stats (computed in setup)
         self._reg3_mean: Optional[List[float]] = None
@@ -614,6 +665,32 @@ class PastureDataModule(LightningDataModule):
             return os.path.join(subdir, manifest)
         return os.path.join(str(self.data_root), subdir, manifest)
 
+    def _resolve_biomass_csv_paths(self) -> List[str]:
+        if not self.biomass_root:
+            return []
+        csvs: List[str] = []
+        if self.biomass_csvs:
+            csvs = [str(x) for x in self.biomass_csvs if str(x).strip()]
+        else:
+            if self.biomass_train_csv:
+                csvs.append(str(self.biomass_train_csv))
+            if self.biomass_test_csv:
+                csvs.append(str(self.biomass_test_csv))
+        out: List[str] = []
+        seen = set()
+        for p in csvs:
+            if not p:
+                continue
+            if os.path.isabs(p):
+                resolved = p
+            else:
+                resolved = os.path.join(str(self.biomass_root), p)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            out.append(resolved)
+        return out
+
     def _maybe_append_aigc_augmented_train_df(self) -> None:
         if not self.aigc_aug_enabled:
             return
@@ -776,6 +853,34 @@ class PastureDataModule(LightningDataModule):
             except Exception:
                 # If anything goes wrong, fall back to CSIRO-only training
                 pass
+
+        # Optional Biomass Data dataset mixed into the main regression stream
+        if self.biomass_enabled and self.biomass_root and self.biomass_train_tf is not None:
+            csv_paths = self._resolve_biomass_csv_paths()
+            if csv_paths:
+                try:
+                    biomass_ds = BiomassDataDataset(
+                        csv_paths=csv_paths,
+                        root_dir=self.biomass_root,
+                        image_dir=self.biomass_image_dir,
+                        image_dir_from_csv=self.biomass_image_dir_from_csv,
+                        image_col=self.biomass_image_col,
+                        dry_total_col=self.biomass_dry_total_col,
+                        dry_clover_col=self.biomass_dry_clover_col,
+                        dry_weeds_col=self.biomass_dry_weeds_col,
+                        dry_grass_col=self.biomass_dry_grass_col,
+                        supervise_ratio=self.biomass_supervise_ratio,
+                        drop_unlabeled=self.biomass_drop_unlabeled,
+                        target_order=self.target_order,
+                        reg3_mean=self._reg3_mean,
+                        reg3_std=self._reg3_std,
+                        log_scale_targets=self._log_scale_targets,
+                        transform=self.biomass_train_tf,
+                    )
+                    main_datasets.append(biomass_ds)
+                except Exception:
+                    # If anything goes wrong, fall back to CSIRO-only training
+                    pass
 
         if len(main_datasets) == 1:
             main_ds: Dataset = main_datasets[0]

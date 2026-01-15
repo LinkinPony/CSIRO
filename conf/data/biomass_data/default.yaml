@@ -1,0 +1,23 @@
+# @package biomass_data
+
+enabled: true
+# When true, use biomass_data samples to supervise the biomass ratio head
+# (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) derived from dry_total/dry_clover/dry_weeds/dry_grass.
+supervise_ratio: true
+# Root directory containing train/test CSVs and images/ for the biomass dataset
+root: data/biomass_data
+train_csv: train/biomass_train_data.csv
+test_csv: null
+csvs: null
+image_dir: images
+# When true, image_dir is resolved under each CSV's parent folder (e.g., train/images, test/images)
+image_dir_from_csv: true
+image_col: image_file_name
+dry_total_col: dry_total
+dry_clover_col: dry_clover
+dry_weeds_col: dry_weeds
+dry_grass_col: dry_grass
+# Keep unlabeled rows (e.g., test CSV) with zero masks; set true to drop them.
+drop_unlabeled: false
+# Separate image size for this dataset in YAML is [W, H] (width, height); code parses it to (H, W).
+image_size: [800, 800]
