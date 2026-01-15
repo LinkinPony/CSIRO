@@ -219,8 +219,8 @@ data:
       value: random
     manifold_mixup:
       enabled: true
-      prob: 0.4576663445221093
-      alpha: 1.2708037555354221
+      prob: 0.1907794315321104
+      alpha: 3.345627067353604
       apply_on: tokens
       detach_pair: false
       mix_cls_token: false
@@ -274,16 +274,17 @@ model:
   log_scale_targets: false
   head:
     type: vitdet
-    vitdet_dim: 512
+    vitdet_dim: 320
     vitdet_patch_size: 16
     vitdet_scale_factors:
     - 2.0
     - 1.0
     - 0.5
+    - 0.25
     hidden_dims:
     - 1280
     activation: silu
-    dropout: 0.31829482999907377
+    dropout: 0.46948122537409587
     ratio_head_mode: shared
     use_output_softplus: true
     use_cls_token: false
@@ -326,13 +327,13 @@ peft:
   use_dora: false
   r: 8
   lora_alpha: 8
-  lora_dropout: 0.13229903065467416
+  lora_dropout: 0.0484482168175022
   init: true
-  last_k_blocks: 16
+  last_k_blocks: 8
   layers_pattern: blocks
   target_modules:
   - qkv
-  lora_lr: 0.0014958918297906048
+  lora_lr: 0.0011065552436839673
   lora_weight_decay: 0.0
   lora_llrd: 0.8729858381132479
   lora_group_size: 1
@@ -348,8 +349,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 0.0002153880710984828
-  weight_decay: 6.93015139570719e-06
+  lr: 6.454569017428953e-05
+  weight_decay: 0.00024182275728080725
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -376,7 +377,7 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 5
+  warmup_epochs: 0
   warmup_start_factor: 0.1
 kfold:
   enabled: false
@@ -421,4 +422,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-vitdet-v5-64
+version: tune-vitdet-v5-98
