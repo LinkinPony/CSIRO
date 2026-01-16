@@ -219,8 +219,8 @@ data:
       value: random
     manifold_mixup:
       enabled: true
-      prob: 0.956847045256992
-      alpha: 4.446775407024156
+      prob: 0.20433212194102002
+      alpha: 3.9803152997082485
       apply_on: tokens
       detach_pair: false
       mix_cls_token: false
@@ -262,6 +262,33 @@ ndvi_dense:
       alpha: 0.3
       use_prev_for_bsz1: true
     vertical_flip_prob: 0.0
+biomass_data:
+  enabled: true
+  supervise_ratio: true
+  root: data/biomass_data
+  train_csv: train/biomass_train_data.csv
+  test_csv: null
+  csvs: null
+  image_dir: images
+  image_dir_from_csv: true
+  image_col: image_file_name
+  dry_total_col: dry_total
+  dry_clover_col: dry_clover
+  dry_weeds_col: dry_weeds
+  dry_grass_col: dry_grass
+  drop_unlabeled: false
+  image_size:
+  - 800
+  - 800
+irish_glass_clover:
+  enabled: true
+  supervise_ratio: true
+  root: data/irish_glass_clover
+  csv: data.csv
+  image_dir: images
+  image_size:
+  - 800
+  - 800
 model:
   backbone: dinov3_vith16plus
   weights_url: null
@@ -281,9 +308,10 @@ model:
     - 1.0
     - 0.5
     - 0.25
-    hidden_dims: []
+    hidden_dims:
+    - 1280
     activation: silu
-    dropout: 0.5267209984215473
+    dropout: 0.33295493288064115
     ratio_head_mode: shared
     use_output_softplus: true
     use_cls_token: false
@@ -302,7 +330,9 @@ model:
       - 17
       - 23
       dinov3_vith16plus:
-      - 24
+      - 28
+      - 29
+      - 30
       - 31
       dinov3_vit7b16:
       - 9
@@ -325,15 +355,15 @@ peft:
   enabled: true
   method: lora
   use_dora: false
-  r: 16
+  r: 8
   lora_alpha: 16
-  lora_dropout: 0.1243701494964387
+  lora_dropout: 0.048693990302431794
   init: true
-  last_k_blocks: 16
+  last_k_blocks: 12
   layers_pattern: blocks
   target_modules:
   - qkv
-  lora_lr: 0.00046456563549632923
+  lora_lr: 0.0012922429028410648
   lora_weight_decay: 0.0
   lora_llrd: 0.8729858381132479
   lora_group_size: 1
@@ -349,8 +379,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 0.00018772373321957915
-  weight_decay: 9.772120778113486e-05
+  lr: 0.00016435102724538601
+  weight_decay: 1.8438419644273858e-05
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -377,7 +407,7 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 1
+  warmup_epochs: 0
   warmup_start_factor: 0.1
 kfold:
   enabled: false
@@ -386,7 +416,7 @@ kfold:
   folds:
   - 0
 trainer:
-  max_epochs: 35
+  max_epochs: 15
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -411,7 +441,7 @@ trainer:
     annealing_strategy: cos
   ema:
     enabled: true
-    decay: 0.992
+    decay: 0.99
     update_every_n_steps: 1
     start_step: 0
     eval_with_ema: true
@@ -422,4 +452,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-vitdet-v5-10
+version: tune-vitdet-v7-56
