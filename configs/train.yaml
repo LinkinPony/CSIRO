@@ -348,7 +348,7 @@ mtl:
   sample_ratio:
     ndvi_dense: 0.0
 train_all:
-  enabled: false
+  enabled: true
 peft:
   enabled: true
   method: lora
@@ -408,7 +408,7 @@ scheduler:
   warmup_epochs: 3
   warmup_start_factor: 0.1
 kfold:
-  enabled: true
+  enabled: false
   k: 5
   even_split: false
   folds: null
