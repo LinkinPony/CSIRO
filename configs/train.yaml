@@ -111,10 +111,10 @@ data:
       enabled: true
       mean: 0.0
       std: 0.01
-      prob: 0.5
+      prob: 0.25
     watermark:
       enabled: true
-      prob: 0.3
+      prob: 0.0
       style: random
       position: random
       position_choices:
@@ -174,7 +174,7 @@ data:
     light_spot:
       enabled: true
       blend_mode: composite
-      prob: 0.3
+      prob: 0.2
       radius_frac_range:
       - 0.06
       - 0.18
@@ -209,7 +209,7 @@ data:
       grid_share_params: true
     random_erasing:
       enabled: true
-      p: 0.25
+      p: 0.0
       scale:
       - 0.02
       - 0.1
@@ -219,8 +219,8 @@ data:
       value: random
     manifold_mixup:
       enabled: true
-      prob: 0.09542699635939922
-      alpha: 2.421302681875321
+      prob: 0.23470529739598162
+      alpha: 2.407831784677343
       apply_on: tokens
       detach_pair: false
       mix_cls_token: false
@@ -228,7 +228,7 @@ data:
       enabled: false
       alpha: 0.5
       use_prev_for_bsz1: true
-    no_augment_prob: 0.1
+    no_augment_prob: 0.05
   normalization:
     mean:
     - 0.485
@@ -298,20 +298,22 @@ model:
   backbone_weights_dtype: fp32
   gradient_checkpointing: false
   embedding_dim: 1280
-  log_scale_targets: false
+  log_scale_targets: true
   head:
     type: vitdet
-    vitdet_dim: 256
+    vitdet_dim: 512
     vitdet_patch_size: 16
     vitdet_scale_factors:
     - 2.0
     - 1.0
     - 0.5
     - 0.25
-    hidden_dims: []
+    hidden_dims:
+    - 512
+    - 256
     activation: silu
-    dropout: 0.25711884649203415
-    ratio_head_mode: shared
+    dropout: 0.35160137380262413
+    ratio_head_mode: separate_mlp
     use_output_softplus: true
     use_cls_token: false
     use_patch_reg3: false
@@ -329,9 +331,6 @@ model:
       - 17
       - 23
       dinov3_vith16plus:
-      - 28
-      - 29
-      - 30
       - 31
       dinov3_vit7b16:
       - 9
@@ -339,7 +338,7 @@ model:
       - 29
       - 39
 mtl:
-  enabled: true
+  enabled: false
   tasks:
     height: true
     ndvi: true
@@ -349,20 +348,20 @@ mtl:
   sample_ratio:
     ndvi_dense: 0.0
 train_all:
-  enabled: true
+  enabled: false
 peft:
   enabled: true
   method: lora
   use_dora: false
   r: 8
-  lora_alpha: 16
-  lora_dropout: 0.025814935607487266
+  lora_alpha: 32
+  lora_dropout: 0.028099417970736017
   init: true
-  last_k_blocks: 12
+  last_k_blocks: 4
   layers_pattern: blocks
   target_modules:
   - qkv
-  lora_lr: 0.002159763643023887
+  lora_lr: 0.0004063144644051399
   lora_weight_decay: 0.0
   lora_llrd: 0.8729858381132479
   lora_group_size: 1
@@ -378,8 +377,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 0.00024167695866265736
-  weight_decay: 1.0161484416017329e-05
+  lr: 0.00013713004477670655
+  weight_decay: 8.903922893133563e-05
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -406,15 +405,16 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 0
+  warmup_epochs: 3
   warmup_start_factor: 0.1
 kfold:
-  enabled: false
+  enabled: true
   k: 5
   even_split: false
   folds: null
+  group_by_date_state: true
 trainer:
-  max_epochs: 35
+  max_epochs: 25
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -450,4 +450,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-vitdet-v8
+version: tune-vitdet-v9-kfold-04

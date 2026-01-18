@@ -1,0 +1,137 @@
+# ViTDet v9 sweep (single-split HPO -> k-fold verification).
+#
+# Goal vs v8:
+# - Optimize r^2 directly during HPO (val_r2 / mode=max) instead of a proxy loss.
+# - Enable log-scale targets (log1p) to handle long-tailed biomass targets.
+# - Add a small set of "high ROI" knobs: heavy augmentation strength + PCGrad/MTL on/off.
+#
+# Run:
+#   python tune.py --config-name tune_vitdet_v9
+#
+# Notes:
+# - Stage 1 is a grouped single-split (data.val_split>0, kfold.enabled=false) so ASHA can prune.
+# - Stage 2 promotes top-N configs to k-fold (kfold.enabled=true) and selects by val_r2_global.
+
+defaults:
+  # Reuse v8 as the base training + search space, then override deltas here.
+  - tune_vitdet_v8
+  - _self_
+
+# -----------------------------
+# Training config overrides
+# -----------------------------
+
+version: tune-vitdet-v9
+
+model:
+  # Key change: predict/learn in log1p space (with z-score stats computed in log space).
+  log_scale_targets: true
+
+data:
+  # Stage-1 uses a single validation split. (Grouped by (Sampling_Date, State) in code.)
+  val_split: 0.2
+
+# Stage-1: single split (fast) so Ray ASHA can prune.
+kfold:
+  enabled: false
+  # Explicit to match splits.py defaults (keeps (Sampling_Date, State) groups together in k-fold).
+  group_by_date_state: true
+
+trainer:
+  # Give ASHA enough runway; stage-2 can be re-run longer if desired.
+  max_epochs: 25
+
+# -----------------------------
+# Ray Tune config overrides
+# -----------------------------
+tune:
+  name: tune-vitdet-v9
+
+  # Optimize the metric you actually care about.
+  metric: val_r2
+  mode: max
+
+  # Smaller default than v8 because we add a few extra knobs; override from CLI if needed.
+  num_samples: 80
+
+  # Stage-1 should use ASHA (per-epoch reporting works only when kfold.enabled=false).
+  scheduler:
+    type: asha
+    max_epochs: ${trainer.max_epochs}
+    grace_period: 10
+    reduction_factor: 2
+
+  # Keep stage-1 single-seed so ASHA semantics stay clean.
+  seeds: [42]
+  report_per_epoch: true
+
+  # Promote top-N configs to k-fold verification (more reliable, less split-noise).
+  two_stage:
+    enabled: true
+    scope: best
+    min_epoch: ${tune.scheduler.grace_period}
+    top_n: 8
+    name_suffix: "-stage2-kfold"
+
+    # Stage-2 can optimize a different metric. `val_r2_global` tends to be closer to the
+    # competition-style global-baseline R^2 than `val_r2` (val-baseline).
+    stage2_metric: val_r2_global
+    stage2_mode: max
+
+    train_overrides:
+      kfold.enabled: true
+      kfold.k: 5
+      kfold.even_split: false
+      kfold.folds: null
+      kfold.group_by_date_state: true
+      train_all.enabled: false
+      # Keep epoch budget consistent across stages by default.
+      trainer.max_epochs: ${trainer.max_epochs}
+      # Not used under k-fold but kept explicit to avoid confusion when reading configs.
+      data.val_split: 0.0
+
+  # Extend v8 search space with a few high-impact knobs and tighten MixUp ranges.
+  search_space:
+    # ---- Objective-aligned head coupling ----
+    model.head.ratio_head_mode:
+      type: choice
+      values: [shared, separate_mlp, separate_spatial]
+
+    # ---- Regularization / augmentation strength (allow 0.0 to effectively disable) ----
+    data.augment.watermark.prob:
+      type: choice
+      values: [0.0, 0.1, 0.2, 0.3]
+    data.augment.light_spot.prob:
+      type: choice
+      values: [0.0, 0.1, 0.2, 0.3]
+    data.augment.gaussian_noise.prob:
+      type: choice
+      values: [0.0, 0.25, 0.5]
+    data.augment.gaussian_noise.std:
+      type: choice
+      values: [0.0, 0.005, 0.01, 0.02]
+    data.augment.random_erasing.p:
+      type: choice
+      values: [0.0, 0.1, 0.25]
+    data.augment.no_augment_prob:
+      type: choice
+      values: [0.0, 0.05, 0.1]
+
+    # Manifold MixUp is sensitive; keep probability range tighter than v8.
+    data.augment.manifold_mixup.prob:
+      type: uniform
+      lower: 0.0
+      upper: 0.4
+    data.augment.manifold_mixup.alpha:
+      type: uniform
+      lower: 0.3
+      upper: 4.0
+
+    # ---- Optimization strategy switches (ablation inside Tune) ----
+    pcgrad.enabled:
+      type: choice
+      values: [true, false]
+    mtl.enabled:
+      type: choice
+      values: [true, false]
+
