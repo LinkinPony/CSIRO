@@ -561,14 +561,19 @@ def main(cfg: DictConfig) -> None:
         for k, v in (config or {}).items():
             _set_by_dotted_path(cfg_trial, str(k), v)
 
-        # Only enable per-epoch reporting for single-seed trials to keep ASHA semantics clean.
-        enable_epoch_reporting = bool(report_per_epoch) and len(seeds) == 1
+        # Determine whether this trial runs k-fold training (expensive; reported as aggregated metrics).
+        kfold_cfg_trial = cfg_trial.get("kfold", {}) or {}
+        kfold_enabled_trial = bool(kfold_cfg_trial.get("enabled", False))
+
+        # Only enable per-epoch reporting for single-seed, non-kfold trials to keep ASHA semantics clean.
+        enable_epoch_reporting = bool(report_per_epoch) and len(seeds) == 1 and not kfold_enabled_trial
 
         from src.callbacks.ray_tune_report import RayTuneReportCallback
 
         # Aggregate final metrics across seeds (when multi-seed is enabled).
         metrics_by_name: dict[str, list[float]] = {}
         epoch_ends: list[int] = []
+        fold_counts: list[int] = []
 
         for si, seed in enumerate(seeds):
             cfg_seed = copy.deepcopy(cfg_trial)
@@ -590,26 +595,55 @@ def main(cfg: DictConfig) -> None:
                 enable_post_kfold_swa_eval=False,
             )
 
-            # Extract final metrics for aggregation; only emit per-seed reports when epoch reporting is disabled.
-            epoch_end, final_metrics = _try_extract_final_metrics(log_dir)
-            if epoch_end is not None:
-                epoch_ends.append(int(epoch_end))
-            for k, v in (final_metrics or {}).items():
-                try:
-                    metrics_by_name.setdefault(str(k), []).append(float(v))
-                except Exception:
-                    continue
+            if kfold_enabled_trial:
+                # Extract aggregated k-fold metrics under this seed_root/logs.
+                ep_end, num_folds, avg_metrics, fold_std = _try_extract_kfold_metrics(log_dir)
+                if ep_end is not None:
+                    epoch_ends.append(int(ep_end))
+                if num_folds is not None:
+                    fold_counts.append(int(num_folds))
 
-            if not enable_epoch_reporting and (epoch_end is not None) and final_metrics:
-                per_seed_payload: dict[str, Any] = {"epoch": int(epoch_end), "seed": int(seed)}
-                # Keep historical per-seed keys for the most common metrics.
-                if "val_loss" in final_metrics:
-                    per_seed_payload[f"val_loss_seed{si}"] = float(final_metrics["val_loss"])
-                if "val_r2" in final_metrics:
-                    per_seed_payload[f"val_r2_seed{si}"] = float(final_metrics["val_r2"])
-                if "val_r2_global" in final_metrics:
-                    per_seed_payload[f"val_r2_global_seed{si}"] = float(final_metrics["val_r2_global"])
-                session.report(per_seed_payload)
+                # Mean across folds (per seed)
+                for k, v in (avg_metrics or {}).items():
+                    try:
+                        metrics_by_name.setdefault(str(k), []).append(float(v))
+                    except Exception:
+                        continue
+
+                # Std across folds (per seed), stored with a suffix for clarity.
+                for k, v in (fold_std or {}).items():
+                    try:
+                        metrics_by_name.setdefault(f"{str(k)}_fold_std", []).append(float(v))
+                    except Exception:
+                        continue
+            else:
+                # Extract final metrics for aggregation; only emit per-seed reports when epoch reporting is disabled.
+                epoch_end, final_metrics = _try_extract_final_metrics(log_dir)
+                if epoch_end is not None:
+                    epoch_ends.append(int(epoch_end))
+                for k, v in (final_metrics or {}).items():
+                    try:
+                        metrics_by_name.setdefault(str(k), []).append(float(v))
+                    except Exception:
+                        continue
+
+                # Optional per-seed report (useful when report_per_epoch is disabled).
+                # IMPORTANT: Ray strict metric checking requires every report to include the objective metric.
+                if not enable_epoch_reporting and (epoch_end is not None) and final_metrics:
+                    per_seed_payload: dict[str, Any] = {"epoch": int(epoch_end), "seed": int(seed)}
+                    # Objective metric (or sentinel) for Ray Tune robustness.
+                    if str(metric) in final_metrics:
+                        per_seed_payload[str(metric)] = float(final_metrics[str(metric)])
+                    else:
+                        per_seed_payload[str(metric)] = _missing_metric_sentinel(mode=mode)
+                    # Keep historical per-seed keys for the most common metrics.
+                    if "val_loss" in final_metrics:
+                        per_seed_payload[f"val_loss_seed{si}"] = float(final_metrics["val_loss"])
+                    if "val_r2" in final_metrics:
+                        per_seed_payload[f"val_r2_seed{si}"] = float(final_metrics["val_r2"])
+                    if "val_r2_global" in final_metrics:
+                        per_seed_payload[f"val_r2_global_seed{si}"] = float(final_metrics["val_r2_global"])
+                    session.report(per_seed_payload)
 
         # Final aggregated report (the metric optimized by Tune is `metric` from the Tune config).
         max_epochs = int(cfg_trial.get("trainer", {}).get("max_epochs", 0) or 0)
@@ -625,6 +659,11 @@ def main(cfg: DictConfig) -> None:
                 continue
         if len(seeds) > 1:
             payload["num_seeds"] = int(len(seeds))
+        if kfold_enabled_trial:
+            payload["kfold_num_folds"] = float(sum(fold_counts) / len(fold_counts)) if fold_counts else 0.0
+        # Ray strict metric checking: always include the objective metric.
+        if str(metric) not in payload:
+            payload[str(metric)] = _missing_metric_sentinel(mode=mode)
         # Only report if we have at least one scalar metric in addition to epoch.
         if len(payload) > 1:
             session.report(payload)

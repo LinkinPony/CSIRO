@@ -1,3 +1,23 @@
+# ViTDet v8 sweep (k-fold Tune; select the best config by mean metric across folds).
+#
+# Changes vs configs/train.yaml:
+# - kfold.enabled=true (each trial is evaluated via k-fold CV; metrics are averaged across folds)
+# - train_all.enabled=false (k-fold already uses full data across folds)
+# - trainer.ema.decay fixed to 0.992 (per request)
+#
+# Run:
+#   python tune.py --config-name tune_vitdet_v8
+#
+# Tip (cluster/NFS):
+#   python tune.py --config-name tune_vitdet_v8 tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
+
 data:
   root: data
   train_csv: train.csv
@@ -18,6 +38,7 @@ data:
   val_batch_size: 1
   num_workers: 8
   prefetch_factor: 2
+  # NOTE: unused when k-fold is enabled (splits are provided explicitly per fold).
   val_split: 0.0
   shuffle: true
   target_order:
@@ -219,8 +240,8 @@ data:
       value: random
     manifold_mixup:
       enabled: true
-      prob: 0.09542699635939922
-      alpha: 2.421302681875321
+      prob: 0.961368743712364
+      alpha: 3.9186644691596566
       apply_on: tokens
       detach_pair: false
       mix_cls_token: false
@@ -238,6 +259,7 @@ data:
     - 0.229
     - 0.224
     - 0.225
+
 ndvi_dense:
   enabled: false
   root: data/NDVI
@@ -282,13 +304,17 @@ biomass_data:
   - 800
 irish_glass_clover:
   enabled: false
+  # When true, use Irish Glass Clover samples to supervise the biomass ratio head
+  # (Dry_Clover_g, Dry_Dead_g, Dry_Green_g) derived from dry_total_g_cm2 / dry_clover_g_cm2.
   supervise_ratio: true
+  # Root directory containing data.csv and images/ for the Irish Glass Clover dataset
   root: data/irish_glass_clover
   csv: data.csv
   image_dir: images
-  image_size:
-  - 800
-  - 800
+  # Separate image size for this dataset in YAML is [W, H] (width, height); code parses it to (H, W).
+  # Augmentation config is reused from `data.augment`.
+  # You can adjust this to match the native resolution of the Irish images.
+  image_size: [800, 800]
 model:
   backbone: dinov3_vith16plus
   weights_url: null
@@ -301,16 +327,17 @@ model:
   log_scale_targets: false
   head:
     type: vitdet
-    vitdet_dim: 256
+    vitdet_dim: 512
     vitdet_patch_size: 16
     vitdet_scale_factors:
     - 2.0
     - 1.0
     - 0.5
     - 0.25
-    hidden_dims: []
+    hidden_dims:
+    - 1280
     activation: silu
-    dropout: 0.25711884649203415
+    dropout: 0.4195346732130885
     ratio_head_mode: shared
     use_output_softplus: true
     use_cls_token: false
@@ -320,7 +347,7 @@ model:
       alpha_init: 0.2
   backbone_layers:
     enabled: true
-    layer_fusion: mean
+    layer_fusion: learned
     separate_bottlenecks: true
     indices_by_backbone:
       dinov3_vitl16:
@@ -329,15 +356,15 @@ model:
       - 17
       - 23
       dinov3_vith16plus:
-      - 28
-      - 29
-      - 30
+      - 12
+      - 24
       - 31
       dinov3_vit7b16:
       - 9
       - 19
       - 29
       - 39
+
 mtl:
   enabled: true
   tasks:
@@ -348,24 +375,27 @@ mtl:
     state: true
   sample_ratio:
     ndvi_dense: 0.0
+
 train_all:
-  enabled: true
+  enabled: false
+
 peft:
   enabled: true
   method: lora
   use_dora: false
   r: 8
   lora_alpha: 16
-  lora_dropout: 0.025814935607487266
+  lora_dropout: 0.09990038225555746
   init: true
-  last_k_blocks: 12
+  last_k_blocks: 16
   layers_pattern: blocks
   target_modules:
   - qkv
-  lora_lr: 0.002159763643023887
+  lora_lr: 0.0005009856007190292
   lora_weight_decay: 0.0
   lora_llrd: 0.8729858381132479
   lora_group_size: 1
+
 loss:
   weighting: uw
   use_ratio_head: true
@@ -376,15 +406,17 @@ loss:
   - 0.1
   - 0.2
   - 0.5
+
 optimizer:
   name: adamw
-  lr: 0.00024167695866265736
-  weight_decay: 1.0161484416017329e-05
+  lr: 7.876635324491703e-05
+  weight_decay: 1.3901312448240555e-05
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
   sam_rho: 0.05
   sam_adaptive: true
+
 pcgrad:
   enabled: true
   mode: primary_anchored
@@ -404,17 +436,20 @@ pcgrad:
   exclude_param_name_substrings: []
   include_tasks: null
   exclude_tasks: []
+
 scheduler:
   name: cosine
-  warmup_epochs: 0
+  warmup_epochs: 5
   warmup_start_factor: 0.1
+
 kfold:
-  enabled: false
+  enabled: true
   k: 5
   even_split: false
   folds: null
+
 trainer:
-  max_epochs: 35
+  max_epochs: 15
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -438,6 +473,9 @@ trainer:
     annealing_epochs: 5
     annealing_strategy: cos
   ema:
+    # Exponential Moving Average (EMA) of model parameters (trainable-only by default).
+    # - eval_with_ema: swap model weights to EMA during val/test so logged metrics are EMA-based.
+    # - apply_at_end: keep EMA weights on the model at train end (so export/checkpoints use EMA).
     enabled: true
     decay: 0.992
     update_every_n_steps: 1
@@ -445,9 +483,134 @@ trainer:
     eval_with_ema: true
     apply_at_end: true
     trainable_only: true
+
 logging:
   log_dir: outputs
   ckpt_dir: outputs/checkpoints
   use_loguru: true
+
 seed: 42
 version: tune-vitdet-v8
+
+# -----------------------------
+# Ray Tune config
+# -----------------------------
+ray:
+  address: auto
+
+tune:
+  name: tune-vitdet-v8
+  resume: false
+  restore_path: null
+  resume_unfinished: true
+  resume_errored: true
+  restart_errored: false
+  storage_path: ray_results
+
+  metric: val_loss_5d_weighted
+  mode: min
+
+  num_samples: 120
+  max_concurrent_trials: 2
+  resources_per_trial:
+    cpu: 8
+    gpu: 1
+
+  # K-fold trials are expensive; use FIFO by default (single final report per trial).
+  scheduler:
+    type: fifo
+
+  seeds: [998244353]
+  report_per_epoch: false
+
+  # Promote top-N configs to k-fold evaluation (more reliable than a single split).
+  two_stage:
+    # Disabled: this config does k-fold *during* tuning (each trial runs k-fold).
+    enabled: false
+    scope: best
+    # Keep as a plain value to avoid Hydra interpolation issues when scheduler.type != asha.
+    min_epoch: 1
+    top_n: 4
+    name_suffix: "-stage2-kfold"
+    train_overrides:
+      kfold.enabled: true
+      kfold.k: 5
+      kfold.even_split: false
+      kfold.folds: null
+      train_all.enabled: false
+
+  # Search space: refined knobs from tune-vitdet-v1-12h / tune-vitdet-new / tune-vitdet-v3.
+  search_space:
+    # ---- Optimizer / scheduler (consistently high impact across sweeps) ----
+    optimizer.lr:
+      type: loguniform
+      lower: 2.0e-05
+      upper: 3.0e-04
+    optimizer.weight_decay:
+      type: loguniform
+      lower: 1.0e-06
+      upper: 1.0e-03
+    scheduler.warmup_epochs:
+      type: choice
+      values: [0, 1, 3, 5]
+
+    # ---- Backbone multi-layer fusion (inspired by tune-vitdet-new) ----
+    model.backbone_layers.layer_fusion:
+      type: choice
+      values: [learned, mean]
+    model.backbone_layers.indices_by_backbone.dinov3_vith16plus:
+      type: choice
+      values:
+        - [28, 29, 30, 31]
+        - [12, 24, 31]   # current best
+        - [24, 31]
+        - [31]
+
+    # ---- ViTDet head (architecture + regularization) ----
+    model.head.vitdet_dim:
+      type: choice
+      values: [256, 320, 512]
+    model.head.vitdet_scale_factors:
+      type: choice
+      values:
+        - [2.0, 1.0, 0.5, 0.25]  # current best
+        - [2.0, 1.0, 0.5]        # slightly preferred in v1/new/v3 analyses
+    model.head.hidden_dims:
+      type: choice
+      values:
+        - [1280]       # current best
+        - [512, 256]   # strong in v1-12h
+        - []           # strong in v3/new (linear head)
+    model.head.dropout:
+      type: uniform
+      lower: 0.15
+      upper: 0.55
+
+    # ---- LoRA (adapter capacity + scheduling) ----
+    peft.r:
+      type: choice
+      values: [8, 16]
+    peft.last_k_blocks:
+      type: choice
+      values: [4, 8, 12, 16]
+    peft.lora_alpha:
+      type: choice
+      values: [8, 16, 32]
+    peft.lora_lr:
+      type: loguniform
+      lower: 3.0e-04
+      upper: 3.0e-03
+    peft.lora_dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.15
+
+    # ---- Manifold Mixup (regularization; sensitive in v3) ----
+    data.augment.manifold_mixup.prob:
+      type: uniform
+      lower: 0.0
+      upper: 1.0
+    data.augment.manifold_mixup.alpha:
+      type: uniform
+      lower: 0.3
+      upper: 6.0
