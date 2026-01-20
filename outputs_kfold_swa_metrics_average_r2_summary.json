@@ -1,0 +1,13 @@
+{
+  "tune-vitdet-v7-56": 0.8396880030632019,
+  "tune-vitdet-v3-68-irish": 0.7977094650268555,
+  "vitdet-tune-ema": 0.7545171976089478,
+  "outputs": 0.7251866459846497,
+  "tune-vitdet-v1-12h-56-ema-0.99": 0.7251866459846497,
+  "vitdet-finetune-42": 0.7049689292907715,
+  "tune-vitdet-v9-kfold-04": 0.6820881724357605,
+  "tune-vitdet-v8": 0.6776901841163635,
+  "mlp-v2-pcgrad-no-irish-no-peft": 0.6359782218933105,
+  "mlp-v2-pcgrad-primary-anchored": 0.4695084750652313,
+  "mlp-v2-pcgrad-irish-no-peft": 0.2990756630897522
+}

@@ -1,36 +1,20 @@
 {
-  "enabled": false,
-  "aggregation": "per_sample_weighted_mean",
-  "per_sample_weighting": {
-    "enabled": true,
-    "method": "mc_and_disagreement",
-    "mc_dropout": {
-      "enabled": true,
-      "samples": 64,
-      "var_mode": "relative",
-      "include_ratio": true,
-      "ratio_weight": 1.0,
-      "eps": 1e-8,
-      "weight_fn": "inv",
-      "power": 1.0,
-      "weight_eps": 1e-8,
-      "clip": [
-        0.0,
-        1000.0
-      ]
-    },
-    "disagreement": {
-      "enabled": false,
-      "space": "log1p",
-      "weight_fn": "inv",
-      "power": 1.0,
-      "eps": 1e-8,
-      "temperature": 1.0
+  "enabled": true,
+  "aggregation": "mean",
+  "models": [
+    {
+      "id": "tune-vitdet-v1-12h-56-c-05-ema-0.99_train_all",
+      "version": "tune-vitdet-v1-12h-56-c-05-ema-0.99",
+      "mode": "kfold_train_all",
+      "include": {
+        "kfold": true,
+        "train_all": true
+      },
+      "weights": {
+        "fold": 1.0,
+        "train_all": 1.0
+      }
     }
-  },
-  "versions": [
-    "tune-vitdet-v1-12h-56-c-05-ema-0.99",
-    "tune-vitdet-v1-12h-56-ema-0.99"
   ]
 }
 

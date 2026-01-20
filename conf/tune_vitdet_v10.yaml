@@ -1,0 +1,157 @@
+# ViTDet v10 sweep (more LB-aligned, less noisy than v9).
+#
+# Motivation (based on repo history + your feedback):
+# - v9 (log_scale_targets=true + single-layer options + MTL/PCGrad off paths) underperformed on public LB (0.71).
+# - The strongest public-LB-labelled configs in `outputs/` (e.g. v186-align-lb0.76-*) share:
+#   - log_scale_targets=false
+#   - higher-capacity LoRA (often DoRA / broader target_modules / more blocks)
+# - Several "too-good" CV results in outputs were actually computed on fold-0 only; v10
+#   therefore biases towards more robust, multi-layer feature choices and lets stage-2 do
+#   full k-fold selection.
+#
+# Run:
+#   python tune.py --config-name tune_vitdet_v10
+
+defaults:
+  # Start from the v8 sweep (clean search space focused on head/LoRA/backbone fusion),
+  # then override the parts that likely hurt LB in v9.
+  - tune_vitdet_v8
+  - _self_
+
+# -----------------------------
+# Training config overrides
+# -----------------------------
+
+version: tune-vitdet-v10
+
+# v9 fixed log-scale on and that run underperformed on LB; make linear-space the default.
+model:
+  log_scale_targets: false
+
+# Stage-1: single split for ASHA (fast), grouped split logic is inside the datamodule.
+kfold:
+  enabled: false
+  group_by_date_state: true
+train_all:
+  enabled: false
+
+data:
+  val_split: 0.2
+
+trainer:
+  # Keep the same budget as the v9-kfold training you ran (cheaper iteration).
+  max_epochs: 25
+
+# -----------------------------
+# Ray Tune config overrides
+# -----------------------------
+tune:
+  name: tune-vitdet-v10
+
+  # Keep val_r2 as the Ray objective because RayTuneReportCallback guarantees it exists
+  # (it emits a sentinel when Lightning hasn't logged it yet). Stage-2 selects by val_r2_global.
+  metric: val_r2
+  mode: max
+
+  # Slightly smaller default than v8 (v10 adds a few structural knobs); override from CLI if desired.
+  num_samples: 80
+
+  scheduler:
+    type: asha
+    max_epochs: ${trainer.max_epochs}
+    grace_period: 10
+    reduction_factor: 2
+
+  seeds: [42]
+  report_per_epoch: true
+
+  two_stage:
+    enabled: true
+    scope: best
+    min_epoch: ${tune.scheduler.grace_period}
+    top_n: 8
+    name_suffix: "-stage2-kfold"
+
+    # More LB-aligned objective in stage 2 (global baseline in log-space).
+    stage2_metric: val_r2_global
+    stage2_mode: max
+
+    train_overrides:
+      kfold.enabled: true
+      kfold.k: 5
+      kfold.even_split: false
+      kfold.folds: null
+      kfold.group_by_date_state: true
+      train_all.enabled: false
+      data.val_split: 0.0
+      trainer.max_epochs: ${trainer.max_epochs}
+
+  # Search space: override / extend v8 with knobs that are most likely to move public LB.
+  search_space:
+    # ---- Target scaling (v9 fixed this on; allow the model to decide) ----
+    model.log_scale_targets:
+      type: choice
+      values: [false, true]
+
+    # ---- Backbone multi-layer hooks (avoid the fragile single-layer [31] option) ----
+    model.backbone_layers.indices_by_backbone.dinov3_vith16plus:
+      type: choice
+      values:
+        # Deep 4-layer hooks (commonly strong; matches many good historical runs)
+        - [28, 29, 30, 31]
+        # DPT-style sparse hooks (strong and cheaper than 4-layer)
+        - [12, 24, 31]
+        - [24, 31]
+
+    # ---- Ratio head coupling (v9 selected separate_mlp; keep it searchable) ----
+    model.head.ratio_head_mode:
+      type: choice
+      values: [shared, separate_mlp, separate_spatial]
+
+    # ---- LoRA / DoRA capacity (bring back the “lb0.76” style knobs) ----
+    peft.use_dora:
+      type: choice
+      values: [false, true]
+    peft.target_modules:
+      type: choice
+      values:
+        - [qkv]
+        - [qkv, proj]
+        - [qkv, proj, w1, w2, w3]
+    peft.r:
+      type: choice
+      values: [4, 8, 16]
+    peft.lora_alpha:
+      type: choice
+      values: [4, 8, 16, 32]
+    peft.last_k_blocks:
+      type: choice
+      values: [4, 8, 12, 16, 0]
+
+    # ---- Manifold mixup stability knob (important; detach_pair was helpful in several runs) ----
+    data.augment.manifold_mixup.detach_pair:
+      type: choice
+      values: [true, false]
+
+    # ---- MTL/PCGrad ablations (v9 ended up with MTL off in the final run) ----
+    mtl.tasks.height:
+      type: choice
+      values: [true, false]
+    mtl.tasks.ndvi:
+      type: choice
+      values: [true, false]
+    mtl.tasks.state:
+      type: choice
+      values: [true, false]
+    pcgrad.enabled:
+      type: choice
+      values: [true, false]
+
+    # ---- Optional extra data (can help LB; keep as a coarse toggle) ----
+    irish_glass_clover.enabled:
+      type: choice
+      values: [false, true]
+    biomass_data.enabled:
+      type: choice
+      values: [false, true]
+

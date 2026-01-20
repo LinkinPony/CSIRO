@@ -219,6 +219,274 @@ def discover_head_weight_paths(path: str) -> List[str]:
     raise FileNotFoundError(f"Cannot find head weights at: {path}")
 
 
+def _parse_head_epoch_from_filename(name: str) -> int:
+    """
+    Extract epoch integer from filenames like:
+      - head-epoch034.pt
+      - head-epoch034-val_loss0.123456.pt
+    Returns -1 if not found.
+    """
+    try:
+        m = re.search(r"head-epoch(\d+)", str(name or ""))
+        return int(m.group(1)) if m else -1
+    except Exception:
+        return -1
+
+
+def _pick_latest_pt(paths: List[str]) -> Optional[str]:
+    """
+    Pick a "latest" .pt file from a list, preferring larger epoch, then mtime.
+    Returns None when list is empty.
+    """
+    if not paths:
+        return None
+    scored: List[Tuple[int, float, str]] = []
+    for p in paths:
+        if not (isinstance(p, str) and p and os.path.isfile(p)):
+            continue
+        try:
+            epoch = _parse_head_epoch_from_filename(os.path.basename(p))
+        except Exception:
+            epoch = -1
+        try:
+            mtime = float(os.path.getmtime(p))
+        except Exception:
+            mtime = 0.0
+        scored.append((int(epoch), float(mtime), str(p)))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return scored[0][2]
+
+
+def _discover_head_pt_for_run_dir(run_dir: str) -> Optional[str]:
+    """
+    Best-effort: locate a head weights .pt file for a single run directory.
+
+    Supports both:
+      - training outputs:  <run_dir>/head/head-epoch*.pt
+      - packaged weights:  <run_dir>/infer_head.pt
+    """
+    if not (isinstance(run_dir, str) and run_dir and os.path.isdir(run_dir)):
+        return None
+
+    # Packaged convention: <run_dir>/infer_head.pt
+    p0 = os.path.join(run_dir, "infer_head.pt")
+    if os.path.isfile(p0):
+        return p0
+
+    # Some layouts may have <run_dir>/head/infer_head.pt
+    p1 = os.path.join(run_dir, "head", "infer_head.pt")
+    if os.path.isfile(p1):
+        return p1
+
+    # Training convention: <run_dir>/head/head-epoch*.pt
+    head_dir = os.path.join(run_dir, "head")
+    if os.path.isdir(head_dir):
+        try:
+            pts = [
+                os.path.join(head_dir, n)
+                for n in os.listdir(head_dir)
+                if n.startswith("head-epoch") and n.endswith(".pt")
+            ]
+        except Exception:
+            pts = []
+        chosen = _pick_latest_pt(pts)
+        if chosen is not None:
+            return chosen
+
+        # Fallback: any .pt under head_dir
+        try:
+            pts2 = [os.path.join(head_dir, n) for n in os.listdir(head_dir) if n.endswith(".pt")]
+        except Exception:
+            pts2 = []
+        chosen = _pick_latest_pt(pts2)
+        if chosen is not None:
+            return chosen
+
+    # Fallback: any .pt directly under run_dir
+    try:
+        pts3 = [os.path.join(run_dir, n) for n in os.listdir(run_dir) if n.endswith(".pt")]
+    except Exception:
+        pts3 = []
+    chosen = _pick_latest_pt(pts3)
+    return chosen
+
+
+def _expand_kfold_train_all_model(project_dir: str, *, model_cfg: dict) -> List[dict]:
+    """
+    Expand a single ensemble model entry with:
+      mode: "kfold_train_all"
+    into multiple sub-model entries (fold_* + train_all), best-effort.
+
+    This is used to ensemble *within a single version* while reusing all completed runs.
+    """
+    if not isinstance(model_cfg, dict):
+        return []
+
+    mode = str(model_cfg.get("mode", "") or "").strip().lower()
+    if mode not in ("kfold_train_all", "kfold+train_all", "kfold_trainall"):
+        return []
+
+    version = model_cfg.get("version", None)
+    ver = str(version).strip() if isinstance(version, (str, int, float)) else ""
+    if not ver:
+        print("[ENSEMBLE] mode=kfold_train_all requires a non-empty 'version'; skipping expansion.")
+        return []
+
+    # Resolve the per-version train.yaml snapshot (needed to resolve log_dir/ckpt_dir).
+    cfg_path = None
+    for k in ("config", "config_path", "train_yaml", "train_config"):
+        v = model_cfg.get(k, None)
+        if isinstance(v, str) and v.strip():
+            cfg_path = resolve_path_best_effort(project_dir, v.strip())
+            break
+    if cfg_path is None:
+        cfg_path = resolve_version_train_yaml(project_dir, ver)
+    if not (isinstance(cfg_path, str) and cfg_path and os.path.isfile(cfg_path)):
+        print(f"[ENSEMBLE] mode=kfold_train_all: train.yaml not found for version={ver}: {cfg_path}")
+        return []
+
+    try:
+        cfg_model = load_config_file(cfg_path)
+    except Exception as e:
+        print(f"[ENSEMBLE] mode=kfold_train_all: failed to load config {cfg_path}: {e}")
+        return []
+
+    log_cfg = cfg_model.get("logging", {}) if isinstance(cfg_model.get("logging", {}), dict) else {}
+    log_root = resolve_path_best_effort(project_dir, str(log_cfg.get("log_dir", "outputs") or "outputs"))
+    ckpt_root = resolve_path_best_effort(
+        project_dir, str(log_cfg.get("ckpt_dir", "outputs/checkpoints") or "outputs/checkpoints")
+    )
+
+    ckpt_ver_dir = os.path.join(str(ckpt_root), ver) if ver else str(ckpt_root)
+    log_ver_dir = os.path.join(str(log_root), ver) if ver else str(log_root)
+
+    include_cfg = model_cfg.get("include", None)
+    include_cfg = include_cfg if isinstance(include_cfg, dict) else {}
+    include_kfold = bool(include_cfg.get("kfold", True))
+    include_train_all = bool(include_cfg.get("train_all", True))
+
+    weights_cfg = model_cfg.get("weights", None)
+    weights_cfg = weights_cfg if isinstance(weights_cfg, dict) else {}
+    try:
+        base_model_weight = float(model_cfg.get("weight", 1.0))
+    except Exception:
+        base_model_weight = 1.0
+    try:
+        fold_w = float(weights_cfg.get("fold", 1.0))
+    except Exception:
+        fold_w = 1.0
+    try:
+        train_all_w = float(weights_cfg.get("train_all", 1.0))
+    except Exception:
+        train_all_w = 1.0
+    per_fold_w = weights_cfg.get("per_fold", None)
+    per_fold_w = per_fold_w if isinstance(per_fold_w, dict) else {}
+
+    members: List[Tuple[str, str, float]] = []
+
+    # 1) k-fold members
+    if include_kfold:
+        fold_dirs: List[Tuple[str, str]] = []
+        # Prefer training checkpoints layout
+        if os.path.isdir(ckpt_ver_dir):
+            try:
+                for name in sorted(os.listdir(ckpt_ver_dir)):
+                    if name.startswith("fold_"):
+                        d = os.path.join(ckpt_ver_dir, name)
+                        if os.path.isdir(d):
+                            fold_dirs.append((name, d))
+            except Exception:
+                fold_dirs = []
+
+        # Fallback: packaged heads under weights/head/<ver>/fold_*
+        if not fold_dirs:
+            hb = resolve_version_head_base(project_dir, ver)
+            if hb and os.path.isdir(hb):
+                try:
+                    for name in sorted(os.listdir(hb)):
+                        if name.startswith("fold_"):
+                            d = os.path.join(hb, name)
+                            if os.path.isdir(d):
+                                fold_dirs.append((name, d))
+                except Exception:
+                    fold_dirs = []
+
+        for fold_name, fold_dir in fold_dirs:
+            head_pt = _discover_head_pt_for_run_dir(fold_dir)
+            if head_pt is None:
+                continue
+            try:
+                w_eff = float(per_fold_w.get(fold_name, fold_w))
+            except Exception:
+                w_eff = float(fold_w)
+            if w_eff <= 0.0:
+                continue
+            members.append((fold_name, head_pt, float(base_model_weight) * float(w_eff)))
+
+    # 2) train_all member
+    if include_train_all:
+        head_pt = None
+        if os.path.isdir(os.path.join(ckpt_ver_dir, "train_all")):
+            head_pt = _discover_head_pt_for_run_dir(os.path.join(ckpt_ver_dir, "train_all"))
+        if head_pt is None:
+            hb = resolve_version_head_base(project_dir, ver)
+            if hb and os.path.isdir(os.path.join(hb, "train_all")):
+                head_pt = _discover_head_pt_for_run_dir(os.path.join(hb, "train_all"))
+        if head_pt is not None and float(train_all_w) > 0.0:
+            members.append(("train_all", head_pt, float(base_model_weight) * float(train_all_w)))
+
+    if not members:
+        print(f"[ENSEMBLE] mode=kfold_train_all: no members found for version={ver} (ckpt_dir={ckpt_ver_dir}).")
+        return []
+
+    # Build expanded sub-model dicts
+    model_id = str(model_cfg.get("id", ver) or ver)
+    cache_prefix = str(model_cfg.get("cache_name", "") or "").strip()
+    out: List[dict] = []
+    for member_name, head_pt, w_eff in members:
+        mm = dict(model_cfg)
+        mm["id"] = f"{model_id}__{member_name}"
+        mm["version"] = ver
+        mm["weight"] = float(w_eff)
+        mm["head_base"] = str(head_pt)
+        # Ensure per-member config path is explicit (avoid repeated resolve and keep provenance)
+        mm["config_path"] = str(cfg_path)
+        # Ensure cache paths are unique across members
+        if cache_prefix:
+            mm["cache_name"] = safe_slug(f"{cache_prefix}__{member_name}")
+        else:
+            mm["cache_name"] = safe_slug(f"{ver}__{member_name}")
+        # Prevent re-expansion if this dict is processed again downstream.
+        mm["mode"] = "single"
+        # Helpful context for z_score discovery / debugging
+        mm["_kfold_train_all"] = {
+            "member": str(member_name),
+            "log_dir": str(log_ver_dir),
+            "ckpt_dir": str(ckpt_ver_dir),
+        }
+        out.append(mm)
+    print(f"[ENSEMBLE] Expanded mode=kfold_train_all version={ver} -> {len(out)} members")
+    return out
+
+
+def _expand_ensemble_models(project_dir: str, models: List[dict]) -> List[dict]:
+    """
+    Expand any model entries that request within-version expansion.
+    """
+    out: List[dict] = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        expanded = _expand_kfold_train_all_model(project_dir, model_cfg=m)
+        if expanded:
+            out.extend(expanded)
+        else:
+            out.append(m)
+    return out
+
+
 def resolve_dataset_area_m2(cfg: Dict) -> float:
     """
     Resolve dataset area (m^2) from config for unit conversion g <-> g/m^2.
@@ -337,7 +605,12 @@ def resolve_dino_weights_path_for_model(
     )
 
 
-def _load_zscore_json_for_head(head_pt_path: str) -> Optional[dict]:
+def _load_zscore_json_for_head(
+    head_pt_path: str,
+    *,
+    cfg: Optional[Dict] = None,
+    project_dir: Optional[str] = None,
+) -> Optional[dict]:
     """
     Try to locate z_score.json for a given head.
     Priority:
@@ -361,6 +634,57 @@ def _load_zscore_json_for_head(head_pt_path: str) -> Optional[dict]:
                     return json.load(f)
             except Exception:
                 continue
+
+    # ==========================================================
+    # Training-output mapping: checkpoints -> logs
+    #
+    # When running "directly from outputs/", head weights may come from:
+    #   outputs/checkpoints/<version>/<run>/head/head-epoch*.pt
+    # while z_score.json is written under:
+    #   outputs/<version>/<run>/z_score.json
+    #
+    # We map ckpt_dir -> log_dir using cfg.logging.{ckpt_dir,log_dir}.
+    # ==========================================================
+    if not (isinstance(cfg, dict) and isinstance(project_dir, str) and project_dir.strip()):
+        return None
+
+    try:
+        log_cfg = cfg.get("logging", {}) if isinstance(cfg.get("logging", {}), dict) else {}
+        ckpt_dir_cfg = str(log_cfg.get("ckpt_dir", "") or "").strip()
+        log_dir_cfg = str(log_cfg.get("log_dir", "") or "").strip()
+        if not (ckpt_dir_cfg and log_dir_cfg):
+            return None
+        ckpt_root = resolve_path_best_effort(project_dir, ckpt_dir_cfg)
+        log_root = resolve_path_best_effort(project_dir, log_dir_cfg)
+        if not (ckpt_root and log_root and os.path.isdir(ckpt_root) and os.path.isdir(log_root)):
+            return None
+
+        abs_head = os.path.abspath(head_pt_path)
+        ckpt_root_abs = os.path.abspath(ckpt_root)
+        log_root_abs = os.path.abspath(log_root)
+
+        # Ensure head is under ckpt_root
+        try:
+            if os.path.commonpath([abs_head, ckpt_root_abs]) != ckpt_root_abs:
+                return None
+        except Exception:
+            # Fallback: relpath test
+            rel_test = os.path.relpath(abs_head, ckpt_root_abs)
+            if rel_test.startswith(".."):
+                return None
+
+        # Map:
+        #   <ckpt_root>/<ver>/<run>/head/<file>.pt -> <log_root>/<ver>/<run>/z_score.json
+        rel_head_dir = os.path.relpath(os.path.dirname(abs_head), ckpt_root_abs)
+        rel_run_dir = rel_head_dir
+        if os.path.basename(rel_head_dir) == "head":
+            rel_run_dir = os.path.dirname(rel_head_dir)
+        zcand = os.path.join(log_root_abs, rel_run_dir, "z_score.json")
+        if os.path.isfile(zcand):
+            with open(zcand, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return None
     return None
 
 
@@ -1310,7 +1634,7 @@ def infer_components_5d_for_model(
         # --- Per-head normalization inversion (main outputs only) ---
         log_scale_cfg = bool(cfg["model"].get("log_scale_targets", False))
         log_scale_meta = bool(meta.get("log_scale_targets", log_scale_cfg))
-        zscore = _load_zscore_json_for_head(head_pt)
+        zscore = _load_zscore_json_for_head(head_pt, cfg=cfg, project_dir=project_dir)
         reg3_mean = None
         reg3_std = None
         if isinstance(zscore, dict) and "reg3" in zscore:
@@ -1573,6 +1897,9 @@ def run(settings: InferenceSettings) -> None:
     # Multi-model ensemble path (supports mixing ViT/backbone types)
     # ==========================================================
     ensemble_models = normalize_ensemble_models(project_dir_abs)
+    # Optional: within-version expansion (kfold + train_all -> multiple members)
+    if ensemble_models:
+        ensemble_models = _expand_ensemble_models(project_dir_abs, ensemble_models)
     if len(ensemble_models) > 0:
         ensemble_obj = read_ensemble_cfg_obj(project_dir_abs) or {}
         cache_dir_cfg = ensemble_obj.get("cache_dir", None)
