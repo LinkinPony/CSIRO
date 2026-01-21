@@ -553,6 +553,33 @@ def main(cfg: DictConfig) -> None:
         # Note: executed on Ray workers.
         from ray.air import session
 
+        # Ensure this worker imports *this repo's* `src` package.
+        #
+        # Why this matters:
+        # - The driver process inserts repo_root into sys.path, but Ray worker processes may
+        #   start with a different CWD/sys.path (especially on remote nodes).
+        # - Without this, `import src...` may resolve to an unrelated installed package or
+        #   an out-of-date checkout on the worker, causing confusing behavior (e.g. head_type
+        #   not recognizing "mamba" and silently falling back to MLP).
+        rr_env = str(os.environ.get("CSIRO_REPO_ROOT", "") or "").strip()
+        rr = Path(rr_env).resolve() if rr_env else Path(repo_root).resolve()
+        if (rr / "src").is_dir():
+            if str(rr) not in sys.path:
+                sys.path.insert(0, str(rr))
+        else:
+            logger.warning(
+                "Ray worker repo_root does not look valid (rr={}); `src` imports may resolve to a different package.",
+                rr,
+            )
+
+        # Debug breadcrumb: log the actual module file used on this worker (helps catch stale installs/checkouts).
+        try:
+            import src.models.regressor.biomass_regressor as _br
+
+            logger.info("Ray worker import: biomass_regressor={}", getattr(_br, "__file__", "?"))
+        except Exception as e:
+            logger.warning("Ray worker debug import failed (biomass_regressor): {}", e)
+
         trial_dir = Path(session.get_trial_dir()).resolve()
         trial_dir.mkdir(parents=True, exist_ok=True)
 
@@ -589,7 +616,7 @@ def main(cfg: DictConfig) -> None:
                 cfg_seed,
                 log_dir=log_dir,
                 ckpt_dir=ckpt_dir,
-                repo_root=resolve_repo_root(),
+                repo_root=rr,
                 source_config_path=None,
                 extra_callbacks=extra_callbacks,
                 enable_post_kfold_swa_eval=False,
@@ -995,6 +1022,26 @@ def main(cfg: DictConfig) -> None:
             # Note: executed on Ray workers.
             from ray.air import session
 
+            # Ensure this worker imports *this repo's* `src` package (see rationale in stage-1 trainable).
+            rr_env = str(os.environ.get("CSIRO_REPO_ROOT", "") or "").strip()
+            rr = Path(rr_env).resolve() if rr_env else Path(repo_root).resolve()
+            if (rr / "src").is_dir():
+                if str(rr) not in sys.path:
+                    sys.path.insert(0, str(rr))
+            else:
+                logger.warning(
+                    "Ray worker repo_root does not look valid (rr={}); `src` imports may resolve to a different package.",
+                    rr,
+                )
+
+            # Debug breadcrumb (once per stage-2 trial).
+            try:
+                import src.models.regressor.biomass_regressor as _br
+
+                logger.info("Ray worker import: biomass_regressor={}", getattr(_br, "__file__", "?"))
+            except Exception as e:
+                logger.warning("Ray worker debug import failed (biomass_regressor): {}", e)
+
             trial_dir = Path(session.get_trial_dir()).resolve()
             trial_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1030,7 +1077,7 @@ def main(cfg: DictConfig) -> None:
                     cfg_seed,
                     log_dir=log_dir,
                     ckpt_dir=ckpt_dir,
-                    repo_root=resolve_repo_root(),
+                    repo_root=rr,
                     source_config_path=None,
                     extra_callbacks=None,
                     enable_post_kfold_swa_eval=False,

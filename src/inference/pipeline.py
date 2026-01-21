@@ -63,7 +63,7 @@ from src.models.head_builder import DualBranchHeadExport, MultiLayerHeadExport, 
 from src.models.peft_integration import _import_peft
 from src.models.spatial_fpn import FPNHeadConfig, FPNScalarHead
 from src.models.vitdet_head import ViTDetHeadConfig, ViTDetMultiLayerScalarHead, ViTDetScalarHead
-from src.models.mamba_head import MambaHeadConfig, MambaAxialScalarHead, MambaMultiLayerScalarHead
+from src.models.mamba_head import MambaHeadConfig, Mamba2DScalarHead, MambaMultiLayerScalarHead
 
 
 def load_config(project_dir: str) -> Dict:
@@ -1238,7 +1238,7 @@ def infer_components_5d_for_model(
                     mamba_cfg, num_layers=num_layers_eff, layer_fusion=fusion_mode_meta
                 )
             else:
-                head_module = MambaAxialScalarHead(mamba_cfg)  # type: ignore[assignment]
+                head_module = Mamba2DScalarHead(mamba_cfg)  # type: ignore[assignment]
         elif head_type_meta == "dpt":
             dpt_features_meta = int(meta.get("dpt_features", first_meta.get("dpt_features", int(cfg["model"]["head"].get("dpt_features", 256)))))
             dpt_patch_size_meta = int(meta.get("dpt_patch_size", first_meta.get("dpt_patch_size", int(cfg["model"]["head"].get("dpt_patch_size", cfg["model"]["head"].get("fpn_patch_size", 16))))))

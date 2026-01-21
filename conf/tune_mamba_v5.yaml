@@ -1,0 +1,163 @@
+# Mamba (2D-mixing) sweep, based on `conf/tune_vitdet_v5.yaml`.
+#
+# Why a separate sweep:
+# - We replaced the old axial/casual-conv Mamba head with a **non-causal 2D-mixing** head
+#   (depthwise Conv2d same-padding + 2D scan mixing).
+# - The head compute/memory profile changed, so the Tune search ranges are adjusted.
+#
+# Run:
+#   python tune.py --config-name tune_mamba_v5
+#
+# Tip (cluster/NFS):
+#   python tune.py --config-name tune_mamba_v5 tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
+
+defaults:
+  - tune_vitdet_v5
+  - _self_
+
+# -----------------------------
+# Model: switch ViTDet -> Mamba (2D mixing)
+# -----------------------------
+model:
+  head:
+    _delete_: true
+    type: mamba
+    # New Mamba head settings (2D mixing).
+    mamba:
+      dim: 320
+      depth: 3
+      patch_size: 16
+      # Depthwise Conv2d kernel size (we keep Tune values odd: 3/5/7).
+      d_conv: 3
+      # When true, the 2D scan mixes forward+backward for both row/col orderings (more compute).
+      bidirectional: true
+
+    # Scalar bottleneck MLP after pooling (GAP -> MLP -> Linear).
+    # NOTE: For the new Mamba head, `hidden_dims: []` means a true linear head on pooled features.
+    hidden_dims: [512]
+    activation: silu
+    dropout: 0.25
+
+    # Biomass ratio head coupling mode:
+    # - shared       : ratio shares spatial trunk + scalar MLP trunk (cheapest)
+    # - separate_mlp  : ratio gets its own scalar MLP branch (shared spatial trunk)
+    # - separate_spatial : ratio duplicates the full spatial trunk (most expensive)
+    ratio_head_mode: shared
+
+    # Optional torch.compile for Mamba head forward (performance). Default: disabled.
+    torch_compile:
+      enabled: false
+      mode: max-autotune
+
+    # Kept for consistency with other head configs (ignored by Mamba head implementation).
+    use_output_softplus: true
+    use_cls_token: false
+    use_patch_reg3: false
+    dual_branch:
+      enabled: false
+      alpha_init: 0.2
+
+# -----------------------------
+# Bookkeeping
+# -----------------------------
+version: tune-mamba-v5
+tune:
+  name: tune-mamba-v5
+
+  # Replace the ViTDet search space with Mamba-specific knobs + slightly narrower regularization ranges.
+  search_space:
+    _delete_: true
+
+    # ---- Optimizer / scheduler (same as vitdet v5 baseline) ----
+    optimizer.lr:
+      type: loguniform
+      lower: 2.0e-05
+      upper: 3.0e-02
+    optimizer.weight_decay:
+      type: loguniform
+      lower: 1.0e-06
+      upper: 1.0e-03
+    scheduler.warmup_epochs:
+      type: choice
+      values: [0, 1, 3, 5]
+
+    # ---- Backbone multi-layer fusion ----
+    model.backbone_layers.layer_fusion:
+      type: choice
+      values: [learned, mean]
+    model.backbone_layers.indices_by_backbone.dinov3_vith16plus:
+      type: choice
+      values:
+        - [28, 29, 30, 31]
+        - [12, 24, 31]
+        - [24, 31]
+        - [31]
+
+    # ---- Mamba head (2D mixing) ----
+    model.head.mamba.dim:
+      type: choice
+      # Keep dims moderate; 2D scan mixing is heavier than the previous axial head.
+      values: [192, 256, 320, 384]
+    model.head.mamba.depth:
+      type: choice
+      values: [1, 2, 3, 4]
+    model.head.mamba.d_conv:
+      type: choice
+      # Conv2d kernel sizes (odd only; even values are avoided).
+      values: [3, 5, 7]
+    model.head.mamba.bidirectional:
+      type: choice
+      values: [true, false]
+
+    model.head.hidden_dims:
+      type: choice
+      values:
+        - []           # linear head on pooled features
+        - [256]
+        - [512]
+        - [1024]
+        - [512, 256]
+        - [1024, 512]
+    model.head.activation:
+      type: choice
+      values: [relu, silu]
+    model.head.dropout:
+      type: uniform
+      # Narrower than ViTDet v5; Mamba head uses dropout both in the blocks and in the pooled MLP.
+      lower: 0.0
+      upper: 0.4
+    model.head.ratio_head_mode:
+      type: choice
+      # `separate_spatial` is intentionally excluded in this sweep because it doubles the (already expensive)
+      # 2D-mixing trunk and tends to trigger OOM in multi-layer mode. Re-add if you want to explore it later.
+      values: [shared, separate_mlp]
+
+    # ---- LoRA (adapter capacity + scheduling) ----
+    peft.r:
+      type: choice
+      values: [8, 16]
+    peft.last_k_blocks:
+      type: choice
+      values: [8, 12, 16]
+    peft.lora_alpha:
+      type: choice
+      values: [8, 16, 32]
+    peft.lora_lr:
+      type: loguniform
+      lower: 3.0e-04
+      upper: 3.0e-03
+    peft.lora_dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.15
+
+    # ---- Manifold Mixup (regularization) ----
+    data.augment.manifold_mixup.prob:
+      type: uniform
+      lower: 0.0
+      upper: 1.0
+    data.augment.manifold_mixup.alpha:
+      type: uniform
+      lower: 0.3
+      upper: 6.0
+

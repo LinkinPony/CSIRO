@@ -508,6 +508,16 @@ def train_single_split(
     except Exception:
         mamba_bidirectional = True
 
+    # Optional torch.compile for the head forward (performance). Default: disabled.
+    torch_compile_cfg = cfg.get("model", {}).get("head", {}).get("torch_compile", {})
+    if not isinstance(torch_compile_cfg, dict):
+        torch_compile_cfg = {}
+    torch_compile_enabled = bool(torch_compile_cfg.get("enabled", False))
+    try:
+        torch_compile_mode = str(torch_compile_cfg.get("mode", "max-autotune") or "max-autotune")
+    except Exception:
+        torch_compile_mode = "max-autotune"
+
     # Optimizer / SAM configuration
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_name = str(optimizer_cfg.get("name", "adamw"))
@@ -533,6 +543,9 @@ def train_single_split(
         mamba_patch_size=int(mamba_patch_size),
         mamba_d_conv=int(mamba_d_conv),
         mamba_bidirectional=bool(mamba_bidirectional),
+        # Optional torch.compile for head forward (default disabled)
+        torch_compile_enabled=bool(torch_compile_enabled),
+        torch_compile_mode=str(torch_compile_mode),
         # EoMT-style query pooling head (optional)
         eomt_num_queries=int(
             (cfg["model"]["head"].get("eomt", {}) or {}).get("num_queries", 16)

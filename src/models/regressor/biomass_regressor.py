@@ -39,12 +39,16 @@ class BiomassRegressor(
         vitdet_dim: int = 256,
         vitdet_patch_size: int = 16,
         vitdet_scale_factors: Optional[List[float]] = None,
-        # Mamba (PyTorch-only) axial scan head settings
+        # Mamba (PyTorch-only) 2D mixing head settings
         mamba_dim: int = 320,
         mamba_depth: int = 4,
         mamba_patch_size: int = 16,
         mamba_d_conv: int = 3,
         mamba_bidirectional: bool = True,
+        # Optional torch.compile for head forward (performance).
+        # Default: disabled (avoid one-time compilation overhead before the first train step).
+        torch_compile_enabled: bool = False,
+        torch_compile_mode: str = "max-autotune",
         # EoMT-style query pooling head settings
         eomt_num_queries: int = 16,
         eomt_num_layers: int = 2,
@@ -589,11 +593,14 @@ class BiomassRegressor(
         # IMPORTANT semantic note:
         # - For ViTDet heads, an explicit empty list `[]` is meaningful and disables the bottleneck MLP
         #   (linear heads on pooled pyramid features).
+        # - For Mamba heads, an explicit empty list `[]` is also meaningful and disables the pooled scalar MLP
+        #   (linear heads on pooled 2D-mixed features). This is important for HPO and for keeping exported head meta
+        #   consistent with the actual weights.
         # - For other head types, we keep legacy behavior where "unset" (None/[]) falls back to [512, 256].
         ht = str(self._head_type or "mlp").strip().lower()
         if head_hidden_dims is None:
             hidden_dims: List[int] = [512, 256]
-        elif ht == "vitdet":
+        elif ht in ("vitdet", "mamba"):
             hidden_dims = list(head_hidden_dims)
         else:
             hidden_dims = list(head_hidden_dims or [512, 256])
@@ -614,7 +621,7 @@ class BiomassRegressor(
             vitdet_dim=int(vitdet_dim),
             vitdet_patch_size=int(vitdet_patch_size),
             vitdet_scale_factors=list(vitdet_scale_factors or [2.0, 1.0, 0.5]),
-            # Mamba axial head (PyTorch-only)
+            # Mamba 2D-mixing head (PyTorch-only)
             mamba_dim=int(mamba_dim),
             mamba_depth=int(mamba_depth),
             mamba_patch_size=int(mamba_patch_size),
@@ -641,19 +648,24 @@ class BiomassRegressor(
         # can reduce Python + kernel launch overhead and often improves GPU utilization.
         #
         # Control:
-        # - Set `CSIRO_DISABLE_TORCH_COMPILE=1` to force-disable.
-        # - Optionally set `CSIRO_TORCH_COMPILE_MODE` (e.g. "reduce-overhead" | "max-autotune").
+        # - Config (preferred): model.head.torch_compile.enabled=true
+        # - Config:             model.head.torch_compile.mode=<torch.compile mode>
+        # - Env override:       CSIRO_DISABLE_TORCH_COMPILE=1 to force-disable.
+        # - Env override:       CSIRO_TORCH_COMPILE_MODE=<mode> (e.g. "reduce-overhead" | "max-autotune").
         try:
             import os
 
             if ht == "mamba":
-                disable = str(os.environ.get("CSIRO_DISABLE_TORCH_COMPILE", "") or "").strip().lower()
-                if disable not in ("1", "true", "yes", "y", "on"):
+                # Default-off: only compile when explicitly enabled via config.
+                enabled_cfg = bool(torch_compile_enabled)
+                disable_env = str(os.environ.get("CSIRO_DISABLE_TORCH_COMPILE", "") or "").strip().lower()
+                if enabled_cfg and (disable_env not in ("1", "true", "yes", "y", "on")):
                     try:
                         torch_compile = getattr(torch, "compile", None)
                         if callable(torch_compile):
                             # Default to max-autotune for throughput (one-time compile cost).
-                            mode = str(os.environ.get("CSIRO_TORCH_COMPILE_MODE", "max-autotune") or "max-autotune")
+                            mode_default = str(torch_compile_mode or "max-autotune")
+                            mode = str(os.environ.get("CSIRO_TORCH_COMPILE_MODE", mode_default) or mode_default)
                             mh = getattr(self, "mamba_head", None)
                             if isinstance(mh, nn.Module):
                                 # IMPORTANT: compile ONLY the forward to avoid `OptimizedModule`

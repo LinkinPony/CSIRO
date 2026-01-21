@@ -17,6 +17,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
 
+# Ensure Ray head/worker processes can import this repo's `src` package.
+# (Ray tasks/actors may run with a different CWD/sys.path than this shell.)
+export CSIRO_REPO_ROOT="${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
 HEAD_IP="${HEAD_IP:-192.168.10.14}"
 RAY_GCS_PORT="${RAY_GCS_PORT:-6379}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"

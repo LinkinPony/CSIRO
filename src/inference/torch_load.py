@@ -161,11 +161,16 @@ def _infer_sequential_linear_hidden_dims_from_state_dict(
 
 def _infer_vitdet_head_hidden_dims(state_dict: Dict[str, Any]) -> List[int]:
     """
-    Infer ViTDet head bottleneck hidden_dims from the exported state_dict.
+    Infer bottleneck `head_hidden_dims` from an exported head `state_dict`.
 
     This is used for backward compatibility with older exported heads where
     `meta['head_hidden_dims']` was recorded as [] but the actual head weights
     include an MLP (e.g., 960 -> 512 -> 256).
+
+    Note:
+      This logic also applies to other heads that store an MLP under `scalar_mlp`
+      (including the PyTorch-only Mamba head), because the state_dict key layout
+      is the same: either `scalar_mlp.<idx>.weight` or `heads.<i>.scalar_mlp.<idx>.weight`.
     """
     # Prefer the first sub-head if this is a multi-layer wrapper.
     head_idxs: List[int] = []
@@ -197,7 +202,7 @@ def _reconcile_head_meta_with_state_dict(meta: Dict[str, Any], state_dict: dict)
         meta `head_hidden_dims: []`, causing strict load failures in inference/packaging.
 
     Strategy:
-      - For ViTDet heads only, if meta declares an empty `head_hidden_dims` but the state_dict
+      - For ViTDet and Mamba heads, if meta declares an empty `head_hidden_dims` but the state_dict
         contains Linear weights inside `scalar_mlp`, infer the hidden dims and override meta.
       - If there are no `scalar_mlp` Linear weights, keep [] (this corresponds to a true linear head).
     """
@@ -205,7 +210,7 @@ def _reconcile_head_meta_with_state_dict(meta: Dict[str, Any], state_dict: dict)
         head_type = str(meta.get("head_type", "") or "").strip().lower()
     except Exception:
         head_type = ""
-    if head_type != "vitdet":
+    if head_type not in ("vitdet", "mamba"):
         return meta
 
     hd = meta.get("head_hidden_dims", None)

@@ -1,5 +1,5 @@
 seed: 42
-version: mamba-v2
+version: mamba-v3
 data:
   root: data
   train_csv: train.csv
@@ -323,7 +323,7 @@ model:
     #           when model.backbone_layers.enabled=true, builds one independent head per selected layer
     #           and averages the final outputs)
     # - eomt (EoMT-inspired query pooling head: learn Q query tokens and pool patch tokens via cross-attention)
-    # - mamba (PyTorch-only Mamba-like axial scan head on patch tokens -> GAP -> MLP -> Linear)
+    # - mamba (PyTorch-only Mamba-like 2D-mixing head on patch tokens -> GAP -> MLP -> Linear)
     type: mamba
     # ViTDet settings (SimpleFeaturePyramid-style):
     vitdet_dim: 320
@@ -331,7 +331,8 @@ model:
     # Default scale_factors: [2.0, 1.0, 0.5] (less memory than ViTDet's 4.0)
     vitdet_scale_factors: [4.0, 2.0, 1.0, 0.5]
     # Mamba settings (only used when model.head.type=mamba):
-    # - Consumes ViT/DINO patch tokens (B,N,C), mixes them with an axial scan (row+col),
+    # - Consumes ViT/DINO patch tokens (B,N,C), mixes them with non-causal 2D mixing blocks
+    #   (depthwise Conv2d + 2D scan over flattened HxW tokens in both row-major and column-major order),
     #   then global-pools and predicts scalar outputs.
     # - patch_size must match the backbone patch size (DINOv3 ViT-*16 => 16).
     mamba:
@@ -340,6 +341,11 @@ model:
       patch_size: 16
       d_conv: 3
       bidirectional: true
+    # Optional torch.compile for Mamba head forward (performance).
+    # Default: disabled (avoid one-time compilation overhead before the first train step).
+    torch_compile:
+      enabled: false
+      mode: max-autotune
     # FPN settings (Phase A): spatial pyramid built from ViT patch tokens
     fpn_dim: 256
     fpn_num_levels: 3
@@ -459,14 +465,14 @@ train_all:
   enabled: true
 
 peft:
-  enabled: false
+  enabled: true
   method: lora
   use_dora: true
   r: 4
   lora_alpha: 4
   lora_dropout: 0.05
   init: true
-  last_k_blocks: 0
+  last_k_blocks: 16
   layers_pattern: blocks
   target_modules: [qkv, proj, w1, w2, w3]
   lora_lr: 0.0005

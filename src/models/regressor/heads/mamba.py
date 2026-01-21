@@ -102,10 +102,16 @@ class _DiagonalSSMScan1D(nn.Module):
         return y.to(dtype=x.dtype)
 
 
-class _MambaLikeBlock1D(nn.Module):
+class _MambaMixBlock2D(nn.Module):
     """
-    A minimal Mamba-like residual block operating on a 1D token sequence (B,L,D):
-      LN -> Linear(2D) -> depthwise Conv1d -> SiLU -> diagonal SSM scan -> gate -> Linear(D) -> residual
+    A minimal Mamba-like residual block operating on a 2D token map (B, H, W, D):
+      LN -> Linear(2D) -> depthwise Conv2d (same padding) -> SiLU -> 2D scan mixing -> gate -> Linear(D) -> residual
+
+    Notes:
+      - This block is **non-causal** (symmetric padding) which is more appropriate for image regression.
+      - "2D mixing" is implemented by running the diagonal SSM scan over the flattened HxW grid
+        in both row-major and column-major orderings and averaging the results.
+      - We keep this implementation PyTorch-only (no custom CUDA extensions).
     """
 
     def __init__(
@@ -119,20 +125,24 @@ class _MambaLikeBlock1D(nn.Module):
         super().__init__()
         d = int(dim)
         if d <= 0:
-            raise ValueError("dim must be positive for _MambaLikeBlock1D")
+            raise ValueError("dim must be positive for _MambaMixBlock2D")
         k = int(max(1, d_conv))
+        # For "same" padding with symmetric padding, prefer odd kernels.
+        if k % 2 == 0:
+            k += 1
+
         self.dim = d
         self.d_conv = k
         self.bidirectional = bool(bidirectional)
 
         self.norm = nn.LayerNorm(d)
         self.in_proj = nn.Linear(d, 2 * d, bias=True)
-        # Causal depthwise conv (padding k-1, then slice to length)
-        self.conv = nn.Conv1d(
+        # Non-causal depthwise Conv2d (same padding)
+        self.conv2d = nn.Conv2d(
             in_channels=d,
             out_channels=d,
             kernel_size=k,
-            padding=k - 1,
+            padding=k // 2,
             groups=d,
             bias=True,
         )
@@ -140,33 +150,55 @@ class _MambaLikeBlock1D(nn.Module):
         self.out_proj = nn.Linear(d, d, bias=True)
         self.drop = nn.Dropout(float(dropout)) if float(dropout or 0.0) > 0.0 else nn.Identity()
 
-    def _conv_act(self, x: Tensor) -> Tensor:
-        # x: (B,L,D) -> (B,D,L) for conv
-        B, L, D = x.shape
-        x_c = x.transpose(1, 2).contiguous()  # (B,D,L)
-        y = self.conv(x_c)  # (B,D,L+k-1)
-        y = y[..., :L]  # keep length
+    def _conv_act_2d(self, x: Tensor) -> Tensor:
+        # x: (B,H,W,D) -> (B,D,H,W) for conv2d
+        if x.dim() != 4:
+            raise RuntimeError(f"_conv_act_2d expects (B,H,W,D), got: {tuple(x.shape)}")
+        x_c = x.permute(0, 3, 1, 2).contiguous()  # (B,D,H,W)
+        y = self.conv2d(x_c)  # (B,D,H,W)
         y = F.silu(y)
-        return y.transpose(1, 2).contiguous()  # (B,L,D)
+        return y.permute(0, 2, 3, 1).contiguous()  # (B,H,W,D)
 
-    def _scan(self, x: Tensor) -> Tensor:
-        # x: (B,L,D)
-        if not self.bidirectional:
-            return self.ssm(x)
+    def _scan2d(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B,H,W,D)
+        Returns:
+            y: (B,H,W,D)
+        """
+        if x.dim() != 4:
+            raise RuntimeError(f"_scan2d expects (B,H,W,D), got: {tuple(x.shape)}")
+        B, H, W, D = x.shape
+        L = int(H * W)
+        if L <= 0:
+            return x
 
-        # Bidirectional scan without duplicating the SSM graph:
-        # run forward and reversed sequences in a single batched call so `a_pow` etc
-        # are computed once and kernel launch overhead is reduced.
-        x_rev = torch.flip(x, dims=[1])
-        x2 = torch.cat([x, x_rev], dim=0)  # (2B, L, D)
-        y2 = self.ssm(x2)
-        y_f, y_rev = y2.chunk(2, dim=0)
-        y_b = torch.flip(y_rev, dims=[1])
-        return 0.5 * (y_f + y_b)
+        # Row-major sequence: (h,w) with w varying fastest.
+        seq_row = x.reshape(int(B), int(L), int(D))  # (B,L,D)
+
+        # Column-major sequence: (w,h) with h varying fastest (permute H/W first).
+        x_col = x.permute(0, 2, 1, 3).contiguous()  # (B,W,H,D)
+        seq_col = x_col.reshape(int(B), int(L), int(D))  # (B,L,D)
+
+        # Run the diagonal scan on both orderings in a single batched call.
+        if self.bidirectional:
+            seqs = torch.cat([seq_row, seq_col], dim=0)  # (2B,L,D)
+            seqs_rev = torch.flip(seqs, dims=[1])  # (2B,L,D)
+            y2 = self.ssm(torch.cat([seqs, seqs_rev], dim=0))  # (4B,L,D)
+            y_f, y_rev = y2.chunk(2, dim=0)  # each (2B,L,D)
+            y_b = torch.flip(y_rev, dims=[1])
+            y = 0.5 * (y_f + y_b)  # (2B,L,D)
+        else:
+            y = self.ssm(torch.cat([seq_row, seq_col], dim=0))  # (2B,L,D)
+
+        y_row, y_col = y.chunk(2, dim=0)  # each (B,L,D)
+        y_row_map = y_row.reshape(int(B), int(H), int(W), int(D))
+        y_col_map = y_col.reshape(int(B), int(W), int(H), int(D)).permute(0, 2, 1, 3).contiguous()
+        return 0.5 * (y_row_map + y_col_map)
 
     def forward(self, x: Tensor) -> Tensor:
-        if x.dim() != 3:
-            raise RuntimeError(f"_MambaLikeBlock1D expects (B,L,D), got: {tuple(x.shape)}")
+        if x.dim() != 4:
+            raise RuntimeError(f"_MambaMixBlock2D expects (B,H,W,D), got: {tuple(x.shape)}")
 
         # Best-effort dtype alignment when autocast is disabled:
         # - frozen backbone may emit fp16 tokens while the head params are fp32.
@@ -183,55 +215,12 @@ class _MambaLikeBlock1D(nn.Module):
         x_in, gate = x_gate.chunk(2, dim=-1)
         gate = torch.sigmoid(gate)
 
-        u = self._conv_act(x_in)
-        y = self._scan(u)
+        u = self._conv_act_2d(x_in)
+        y = self._scan2d(u)
         y = y * gate
         y = self.out_proj(y)
         y = self.drop(y)
         return x0 + y
-
-
-class _MambaAxialBlock2D(nn.Module):
-    """
-    Axial application of the 1D block over a 2D token map:
-      rows: (B*Hp, Wp, D)
-      cols: (B*Wp, Hp, D)
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        *,
-        d_conv: int = 3,
-        dropout: float = 0.0,
-        bidirectional: bool = True,
-    ) -> None:
-        super().__init__()
-        self.row = _MambaLikeBlock1D(
-            int(dim),
-            d_conv=int(d_conv),
-            dropout=float(dropout or 0.0),
-            bidirectional=bool(bidirectional),
-        )
-        self.col = _MambaLikeBlock1D(
-            int(dim),
-            d_conv=int(d_conv),
-            dropout=float(dropout or 0.0),
-            bidirectional=bool(bidirectional),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B, Hp, Wp, D)
-        if x.dim() != 4:
-            raise RuntimeError(f"_MambaAxialBlock2D expects (B,Hp,Wp,D), got: {tuple(x.shape)}")
-        B, Hp, Wp, D = x.shape
-        # Row scan
-        xr = x.reshape(int(B * Hp), int(Wp), int(D))
-        yr = self.row(xr).reshape(int(B), int(Hp), int(Wp), int(D))
-        # Column scan
-        xc = yr.permute(0, 2, 1, 3).contiguous().reshape(int(B * Wp), int(Hp), int(D))
-        yc = self.col(xc).reshape(int(B), int(Wp), int(Hp), int(D)).permute(0, 2, 1, 3).contiguous()
-        return yc
 
 
 @dataclass
@@ -256,13 +245,13 @@ class MambaHeadConfig:
     dropout: float = 0.0
 
 
-class MambaAxialScalarHead(nn.Module):
+class Mamba2DScalarHead(nn.Module):
     """
-    PyTorch-only Mamba-like scalar head over ViT patch tokens.
+    PyTorch-only Mamba-like scalar head over ViT patch tokens with 2D mixing.
 
     - Consumes patch tokens (B,N,C) from a single backbone layer.
     - Reshapes to a 2D grid (B,Hp,Wp,*) using image_hw + patch_size.
-    - Applies axial Mamba-like mixing blocks.
+    - Applies non-causal 2D Mamba-like mixing blocks (depthwise Conv2d + 2D scan).
     - Pools to a global vector and predicts reg3/ratio/ndvi.
     """
 
@@ -294,7 +283,7 @@ class MambaAxialScalarHead(nn.Module):
         self.in_proj = nn.Linear(self.embedding_dim, self.mamba_dim, bias=True)
         self.blocks = nn.ModuleList(
             [
-                _MambaAxialBlock2D(
+                _MambaMixBlock2D(
                     self.mamba_dim,
                     d_conv=self.d_conv,
                     dropout=float(cfg.dropout or 0.0),
@@ -310,7 +299,7 @@ class MambaAxialScalarHead(nn.Module):
             self.ratio_in_proj = nn.Linear(self.embedding_dim, self.mamba_dim, bias=True)
             self.ratio_blocks = nn.ModuleList(
                 [
-                    _MambaAxialBlock2D(
+                    _MambaMixBlock2D(
                         self.mamba_dim,
                         d_conv=self.d_conv,
                         dropout=float(cfg.dropout or 0.0),
@@ -432,7 +421,7 @@ class MambaAxialScalarHead(nn.Module):
 
 class MambaMultiLayerScalarHead(nn.Module):
     """
-    Multi-layer wrapper: one independent MambaAxialScalarHead per backbone layer,
+    Multi-layer wrapper: one independent Mamba2DScalarHead per backbone layer,
     and fuse the final outputs across layers (mean or learned softmax weights).
     """
 
@@ -449,7 +438,7 @@ class MambaMultiLayerScalarHead(nn.Module):
         self.cfg = cfg
         self.num_layers = int(num_layers)
         self.layer_fusion: str = str(layer_fusion or "mean").strip().lower()
-        self.heads = nn.ModuleList([MambaAxialScalarHead(cfg) for _ in range(self.num_layers)])
+        self.heads = nn.ModuleList([Mamba2DScalarHead(cfg) for _ in range(self.num_layers)])
         # Expose scalar_dim for downstream aux heads
         self.scalar_dim = int(getattr(self.heads[0], "scalar_dim", cfg.mamba_dim))
         if self.layer_fusion == "learned":
@@ -571,7 +560,7 @@ def init_mamba_head(
     dropout: float,
 ) -> int:
     """
-    Initialize the Mamba axial head on `model` (`mamba_head`).
+    Initialize the Mamba 2D-mixing head on `model` (`mamba_head`).
     Returns bottleneck_dim (scalar feature dim produced by the head).
     """
     # Ensure mutually-exclusive head modules exist.
@@ -616,7 +605,7 @@ def init_mamba_head(
         model.mamba_head = MambaMultiLayerScalarHead(cfg, num_layers=num_layers_eff, layer_fusion=layer_fusion)  # type: ignore[assignment]
         bottleneck_dim = int(getattr(model.mamba_head, "scalar_dim", int(mamba_dim)))  # type: ignore[attr-defined]
     else:
-        model.mamba_head = MambaAxialScalarHead(cfg)  # type: ignore[assignment]
+        model.mamba_head = Mamba2DScalarHead(cfg)  # type: ignore[assignment]
         bottleneck_dim = int(getattr(model.mamba_head, "scalar_dim", int(mamba_dim)))  # type: ignore[attr-defined]
     return int(bottleneck_dim)
 
@@ -675,7 +664,7 @@ def init_mamba_task_heads(
 
 __all__ = [
     "MambaHeadConfig",
-    "MambaAxialScalarHead",
+    "Mamba2DScalarHead",
     "MambaMultiLayerScalarHead",
     "init_mamba_head",
     "init_mamba_task_heads",
