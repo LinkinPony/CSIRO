@@ -460,6 +460,54 @@ def train_single_split(
     except Exception:
         dual_branch_alpha_init = 0.2
 
+    # Mamba axial head config (PyTorch-only). Stored under `model.head.mamba` (preferred),
+    # with backward-compatible fallbacks to flat keys (model.head.mamba_dim, etc).
+    mamba_cfg = cfg.get("model", {}).get("head", {}).get("mamba", {})
+    if not isinstance(mamba_cfg, dict):
+        mamba_cfg = {}
+    try:
+        mamba_dim = int(
+            mamba_cfg.get(
+                "dim",
+                cfg["model"]["head"].get(
+                    "mamba_dim", cfg["model"]["head"].get("vitdet_dim", 320)
+                ),
+            )
+        )
+    except Exception:
+        mamba_dim = int(cfg["model"]["head"].get("vitdet_dim", 320))
+    try:
+        mamba_depth = int(
+            mamba_cfg.get("depth", cfg["model"]["head"].get("mamba_depth", 4))
+        )
+    except Exception:
+        mamba_depth = 4
+    try:
+        mamba_patch_size = int(
+            mamba_cfg.get(
+                "patch_size",
+                cfg["model"]["head"].get(
+                    "mamba_patch_size", cfg["model"]["head"].get("fpn_patch_size", 16)
+                ),
+            )
+        )
+    except Exception:
+        mamba_patch_size = int(cfg["model"]["head"].get("fpn_patch_size", 16))
+    try:
+        mamba_d_conv = int(
+            mamba_cfg.get("d_conv", cfg["model"]["head"].get("mamba_d_conv", 3))
+        )
+    except Exception:
+        mamba_d_conv = 3
+    try:
+        mamba_bidirectional = bool(
+            mamba_cfg.get(
+                "bidirectional", cfg["model"]["head"].get("mamba_bidirectional", True)
+            )
+        )
+    except Exception:
+        mamba_bidirectional = True
+
     # Optimizer / SAM configuration
     optimizer_cfg = cfg.get("optimizer", {})
     optimizer_name = str(optimizer_cfg.get("name", "adamw"))
@@ -479,6 +527,12 @@ def train_single_split(
             )
         ),
         vitdet_scale_factors=list(cfg["model"]["head"].get("vitdet_scale_factors", [2.0, 1.0, 0.5])),
+        # Mamba axial head (optional)
+        mamba_dim=int(mamba_dim),
+        mamba_depth=int(mamba_depth),
+        mamba_patch_size=int(mamba_patch_size),
+        mamba_d_conv=int(mamba_d_conv),
+        mamba_bidirectional=bool(mamba_bidirectional),
         # EoMT-style query pooling head (optional)
         eomt_num_queries=int(
             (cfg["model"]["head"].get("eomt", {}) or {}).get("num_queries", 16)

@@ -1513,6 +1513,198 @@ def predict_main_and_ratio_vitdet(
     return rels, preds_main, preds_ratio, preds_main_layers, preds_ratio_layers, preds_main_var, preds_ratio_var
 
 
+def predict_main_and_ratio_mamba(
+    backbone: nn.Module,
+    head: nn.Module,
+    dataset_root: str,
+    image_paths: List[str],
+    image_size: Tuple[int, int],
+    mean: List[float],
+    std: List[float],
+    batch_size: int,
+    num_workers: int,
+    head_num_main: int,
+    head_num_ratio: int,
+    *,
+    use_layerwise_heads: bool,
+    layer_indices: Optional[List[int]] = None,
+    mc_dropout_enabled: bool = False,
+    mc_dropout_samples: int = 1,
+    hflip: bool = False,
+    vflip: bool = False,
+) -> Tuple[
+    List[str],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """
+    Mamba-head inference (PyTorch-only axial scan head).
+    """
+    mp_devs = mp_get_devices_from_backbone(backbone) if isinstance(backbone, nn.Module) else None
+    device0 = mp_devs[0] if mp_devs is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device1 = mp_devs[1] if mp_devs is not None else device0
+    device = device1
+
+    tf = build_transforms(
+        image_size=image_size,
+        mean=mean,
+        std=std,
+        hflip=bool(hflip),
+        vflip=bool(vflip),
+    )
+    ds = TestImageDataset(image_paths, root_dir=dataset_root, transform=tf)
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    feature_extractor = DinoV3FeatureExtractor(backbone)
+    feature_extractor.eval() if mp_devs is not None else feature_extractor.eval().to(device0)
+    head = head.eval().to(device1)
+    compute_var = bool(mc_dropout_enabled) and int(mc_dropout_samples) > 1
+    if compute_var:
+        _enable_dropout_only_train_mode(head, enabled=True)
+    head_dtype = module_param_dtype(head, default=torch.float32)
+
+    rels: List[str] = []
+    preds_main_list: List[torch.Tensor] = []
+    preds_ratio_list: List[torch.Tensor] = []
+    preds_main_var_list: List[torch.Tensor] = []
+    preds_ratio_var_list: List[torch.Tensor] = []
+    preds_main_layers_list: List[torch.Tensor] = []
+    preds_ratio_layers_list: List[torch.Tensor] = []
+
+    with torch.inference_mode():
+        for images, rel_paths in dl:
+            images = images.to(device0, non_blocking=True)
+            H = int(images.shape[-2])
+            W = int(images.shape[-1])
+
+            # Backbone forward ONCE per batch; head is sampled K times on the same tokens.
+            if use_layerwise_heads and layer_indices is not None and len(layer_indices) > 0:
+                _cls_list, pt_list = feature_extractor.forward_layers_cls_and_tokens(images, layer_indices)
+                pt_list = [pt.to(device1, non_blocking=True, dtype=head_dtype) for pt in pt_list]
+                head_in = ("list", pt_list)
+            else:
+                _cls, pt = feature_extractor.forward_cls_and_tokens(images)
+                pt = pt.to(device1, non_blocking=True, dtype=head_dtype)
+                head_in = ("single", pt)
+
+            k = max(1, int(mc_dropout_samples)) if bool(mc_dropout_enabled) else 1
+            reg3_sum = None
+            reg3_sq_sum = None
+            ratio_sum = None
+            ratio_sq_sum = None
+            reg3_layers_sum = None
+            ratio_layers_sum = None
+            for _ in range(k):
+                out = head(head_in[1], image_hw=(H, W))  # type: ignore[call-arg]
+                if not isinstance(out, dict):
+                    raise RuntimeError("Mamba head forward must return a dict")
+                reg3 = out.get("reg3", None)
+                ratio = out.get("ratio", None)
+                reg3_layers = out.get("reg3_layers", None)
+                ratio_layers = out.get("ratio_layers", None)
+                if reg3 is None:
+                    raise RuntimeError("Mamba head did not return 'reg3'")
+
+                reg3_f = reg3.float()
+                reg3_sum = reg3_f if reg3_sum is None else (reg3_sum + reg3_f)
+                if compute_var:
+                    reg3_sq = reg3_f * reg3_f
+                    reg3_sq_sum = reg3_sq if reg3_sq_sum is None else (reg3_sq_sum + reg3_sq)
+
+                if head_num_ratio > 0 and ratio is not None:
+                    ratio_f = ratio.float()
+                    ratio_sum = ratio_f if ratio_sum is None else (ratio_sum + ratio_f)
+                    if compute_var:
+                        ratio_sq = ratio_f * ratio_f
+                        ratio_sq_sum = ratio_sq if ratio_sq_sum is None else (ratio_sq_sum + ratio_sq)
+
+                # Optional per-layer outputs (multi-layer wrapper): keep as (B, L, D).
+                if isinstance(reg3_layers, list) and len(reg3_layers) > 0:
+                    try:
+                        reg3_layers_t = [t for t in reg3_layers if isinstance(t, torch.Tensor)]
+                        if reg3_layers_t:
+                            reg3_layers_stack = torch.stack(reg3_layers_t, dim=1)
+                            reg3_layers_sum = (
+                                reg3_layers_stack
+                                if reg3_layers_sum is None
+                                else (reg3_layers_sum + reg3_layers_stack)
+                            )
+                    except Exception:
+                        pass
+                if head_num_ratio > 0 and isinstance(ratio_layers, list) and len(ratio_layers) > 0:
+                    try:
+                        ratio_layers_t = [t for t in ratio_layers if isinstance(t, torch.Tensor)]
+                        if ratio_layers_t:
+                            ratio_layers_stack = torch.stack(ratio_layers_t, dim=1)
+                            ratio_layers_sum = (
+                                ratio_layers_stack
+                                if ratio_layers_sum is None
+                                else (ratio_layers_sum + ratio_layers_stack)
+                            )
+                    except Exception:
+                        pass
+
+            reg3_mean = reg3_sum / float(k)  # type: ignore[operator]
+            preds_main_list.append(reg3_mean.detach().cpu().float())
+            if compute_var and reg3_sq_sum is not None:
+                reg3_var = (reg3_sq_sum / float(k)) - (reg3_mean * reg3_mean)
+                preds_main_var_list.append(reg3_var.clamp_min(0.0).detach().cpu().float())
+
+            if head_num_ratio > 0 and ratio_sum is not None:
+                ratio_mean = ratio_sum / float(k)
+                preds_ratio_list.append(ratio_mean.detach().cpu().float())
+                if compute_var and ratio_sq_sum is not None:
+                    ratio_var = (ratio_sq_sum / float(k)) - (ratio_mean * ratio_mean)
+                    preds_ratio_var_list.append(ratio_var.clamp_min(0.0).detach().cpu().float())
+
+            if reg3_layers_sum is not None:
+                reg3_layers_mean = reg3_layers_sum / float(k)
+                preds_main_layers_list.append(reg3_layers_mean.detach().cpu().float())
+            if head_num_ratio > 0 and ratio_layers_sum is not None:
+                ratio_layers_mean = ratio_layers_sum / float(k)
+                preds_ratio_layers_list.append(ratio_layers_mean.detach().cpu().float())
+
+            rels.extend(list(rel_paths))
+
+    preds_main = (
+        torch.cat(preds_main_list, dim=0)
+        if preds_main_list
+        else torch.empty((0, head_num_main), dtype=torch.float32)
+    )
+    preds_ratio: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_list:
+        preds_ratio = torch.cat(preds_ratio_list, dim=0)
+    else:
+        preds_ratio = None
+    preds_main_layers: Optional[torch.Tensor]
+    if preds_main_layers_list:
+        preds_main_layers = torch.cat(preds_main_layers_list, dim=0)
+    else:
+        preds_main_layers = None
+    preds_ratio_layers: Optional[torch.Tensor]
+    if head_num_ratio > 0 and preds_ratio_layers_list:
+        preds_ratio_layers = torch.cat(preds_ratio_layers_list, dim=0)
+    else:
+        preds_ratio_layers = None
+    preds_main_var: Optional[torch.Tensor] = None
+    preds_ratio_var: Optional[torch.Tensor] = None
+    if compute_var and preds_main_var_list:
+        preds_main_var = torch.cat(preds_main_var_list, dim=0)
+    if compute_var and head_num_ratio > 0 and preds_ratio_var_list:
+        preds_ratio_var = torch.cat(preds_ratio_var_list, dim=0)
+    return rels, preds_main, preds_ratio, preds_main_layers, preds_ratio_layers, preds_main_var, preds_ratio_var
+
+
 def predict_main_and_ratio_dpt(
     backbone: nn.Module,
     head: nn.Module,

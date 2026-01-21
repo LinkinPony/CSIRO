@@ -314,6 +314,99 @@ class PredictionMixin:
             if pred_reg3 is None or z is None:
                 raise RuntimeError("ViTDet head did not return required outputs (reg3/z)")
 
+        elif head_type == "mamba":
+            # Mamba-like axial scan head: consume patch tokens (single-layer or multi-layer),
+            # optionally apply manifold mixup on patch tokens, then predict reg3/ratio/ndvi.
+            image_hw = (int(images.shape[-2]), int(images.shape[-1]))
+            pt_in: Any
+            if self.use_layerwise_heads and len(self.backbone_layer_indices) > 0:
+                try:
+                    _cls_list, pt_list = self.feature_extractor.forward_layers_cls_and_tokens(
+                        images, self.backbone_layer_indices
+                    )
+                except Exception as e:
+                    backbone_name = getattr(getattr(self, "hparams", None), "backbone_name", None)
+                    raise RuntimeError(
+                        "Failed to extract multi-layer patch tokens for Mamba head. "
+                        f"Check model.backbone_layers.indices={self.backbone_layer_indices} "
+                        f"are valid for backbone={backbone_name!r}. Original error: {e}"
+                    ) from e
+                if not pt_list:
+                    raise RuntimeError(
+                        "Multi-layer token extraction returned an empty pt_list for Mamba head. "
+                        f"indices={self.backbone_layer_indices}"
+                    )
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                    and pt_list
+                ):
+                    try:
+                        pt_stack = torch.stack(pt_list, dim=1)  # (B, L, N, C)
+                        pt_stack, batch, _ = self._manifold_mixup.apply(
+                            pt_stack,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
+                        )
+                        pt_list = [pt_stack[:, i] for i in range(pt_stack.shape[1])]
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="mamba/multilayer/patch_tokens",
+                            err=e,
+                            batch=batch,
+                            pt_list=pt_list,
+                        )
+                pt_in = pt_list
+            else:
+                _, pt_tokens = self.feature_extractor.forward_cls_and_tokens(images)
+                if (
+                    use_mixup
+                    and self._manifold_mixup is not None
+                    and (stage == "train")
+                    and (not is_ndvi_only)
+                ):
+                    try:
+                        pt_tokens, batch, _ = self._manifold_mixup.apply(
+                            pt_tokens,
+                            batch,
+                            force=True,
+                            lam=mixup_lam,
+                            perm=mixup_perm,
+                            mix_labels=mixup_mix_labels,
+                        )
+                    except Exception as e:
+                        self._raise_manifold_mixup_error(
+                            context="mamba/singlelayer/patch_tokens",
+                            err=e,
+                            batch=batch,
+                            x=pt_tokens,
+                        )
+                pt_in = pt_tokens
+
+            out_mamba = self.mamba_head(pt_in, image_hw=image_hw)  # type: ignore[attr-defined]
+            pred_reg3 = out_mamba.get("reg3", None)  # type: ignore[assignment]
+            z = out_mamba.get("z", None)  # type: ignore[assignment]
+            ratio_logits_pred = out_mamba.get("ratio", None)
+            ndvi_pred = out_mamba.get("ndvi", None)
+            # Optional per-layer outputs for downstream consistency/analysis.
+            try:
+                pred_reg3_layers = out_mamba.get("reg3_layers", None)
+                ratio_logits_layers = out_mamba.get("ratio_layers", None)
+                if not isinstance(pred_reg3_layers, list):
+                    pred_reg3_layers = None
+                if not isinstance(ratio_logits_layers, list):
+                    ratio_logits_layers = None
+            except Exception:
+                pred_reg3_layers = None
+                ratio_logits_layers = None
+            if pred_reg3 is None or z is None:
+                raise RuntimeError("Mamba head did not return required outputs (reg3/z)")
+
         elif head_type == "dpt":
             # DPT-style dense prediction head: consume multi-layer CLS+patch tokens (recommended),
             # optionally apply manifold mixup on tokens, then predict reg3/ratio/ndvi.

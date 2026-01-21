@@ -39,6 +39,12 @@ class BiomassRegressor(
         vitdet_dim: int = 256,
         vitdet_patch_size: int = 16,
         vitdet_scale_factors: Optional[List[float]] = None,
+        # Mamba (PyTorch-only) axial scan head settings
+        mamba_dim: int = 320,
+        mamba_depth: int = 4,
+        mamba_patch_size: int = 16,
+        mamba_d_conv: int = 3,
+        mamba_bidirectional: bool = True,
         # EoMT-style query pooling head settings
         eomt_num_queries: int = 16,
         eomt_num_layers: int = 2,
@@ -182,6 +188,8 @@ class BiomassRegressor(
             head_type_norm = "dpt"
         elif head_type_norm in ("vitdet", "vitdet_head", "vitdet_scalar", "simple_feature_pyramid"):
             head_type_norm = "vitdet"
+        elif head_type_norm in ("mamba", "mamba_head", "mamba_axial", "mamba_axial_scan"):
+            head_type_norm = "mamba"
         elif head_type_norm in ("eomt", "eomt_query", "query_pool", "qpool", "query"):
             head_type_norm = "eomt"
         elif head_type_norm in ("mlp", "linear", "head", ""):
@@ -606,6 +614,12 @@ class BiomassRegressor(
             vitdet_dim=int(vitdet_dim),
             vitdet_patch_size=int(vitdet_patch_size),
             vitdet_scale_factors=list(vitdet_scale_factors or [2.0, 1.0, 0.5]),
+            # Mamba axial head (PyTorch-only)
+            mamba_dim=int(mamba_dim),
+            mamba_depth=int(mamba_depth),
+            mamba_patch_size=int(mamba_patch_size),
+            mamba_d_conv=int(mamba_d_conv),
+            mamba_bidirectional=bool(mamba_bidirectional),
             # EoMT-style query pooling (optional)
             eomt_num_queries=int(eomt_num_queries),
             eomt_num_layers=int(eomt_num_layers),
@@ -619,6 +633,37 @@ class BiomassRegressor(
             eomt_proj_activation=str(eomt_proj_activation),
             eomt_proj_dropout=float(eomt_proj_dropout or 0.0),
         )
+
+        # --------------------
+        # Optional torch.compile for performance (no model/hparam changes)
+        # --------------------
+        # Mamba head includes many small ops (norm/linear/scan/permute). `torch.compile`
+        # can reduce Python + kernel launch overhead and often improves GPU utilization.
+        #
+        # Control:
+        # - Set `CSIRO_DISABLE_TORCH_COMPILE=1` to force-disable.
+        # - Optionally set `CSIRO_TORCH_COMPILE_MODE` (e.g. "reduce-overhead" | "max-autotune").
+        try:
+            import os
+
+            if ht == "mamba":
+                disable = str(os.environ.get("CSIRO_DISABLE_TORCH_COMPILE", "") or "").strip().lower()
+                if disable not in ("1", "true", "yes", "y", "on"):
+                    try:
+                        torch_compile = getattr(torch, "compile", None)
+                        if callable(torch_compile):
+                            # Default to max-autotune for throughput (one-time compile cost).
+                            mode = str(os.environ.get("CSIRO_TORCH_COMPILE_MODE", "max-autotune") or "max-autotune")
+                            mh = getattr(self, "mamba_head", None)
+                            if isinstance(mh, nn.Module):
+                                # IMPORTANT: compile ONLY the forward to avoid `OptimizedModule`
+                                # wrappers that change state_dict keys (e.g. `_orig_mod.*`).
+                                mh.forward = torch_compile(mh.forward, mode=mode, fullgraph=False)  # type: ignore[method-assign]
+                                logger.info("torch.compile enabled for mamba_head.forward (mode={})", mode)
+                    except Exception as e:
+                        logger.warning(f"torch.compile failed for mamba_head (fallback to eager): {e}")
+        except Exception:
+            pass
 
 
     def _pcgrad_get_optimizer(self) -> Optional[Optimizer]:

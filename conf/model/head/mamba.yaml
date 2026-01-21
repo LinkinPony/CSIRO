@@ -1,0 +1,36 @@
+# @package model.head
+
+type: mamba
+
+# PyTorch-only Mamba-like axial scan head settings.
+# Notes:
+# - This head consumes ViT/DINO patch tokens (B,N,C) and therefore ignores CLS-related knobs.
+# - `patch_size` must match the backbone patch size (DINOv3 ViT-*16 => 16).
+mamba:
+  dim: 320
+  depth: 4
+  patch_size: 16
+  # Depthwise 1D conv kernel size inside the Mamba-like block.
+  d_conv: 3
+  # When true, run forward + backward scans and average the outputs.
+  bidirectional: true
+
+# Scalar bottleneck MLP after pooling (GAP -> MLP -> Linear).
+hidden_dims: [512]
+activation: relu
+dropout: 0.2
+
+# Biomass ratio head coupling mode:
+# - shared          : ratio shares spatial trunk + scalar MLP trunk (default)
+# - separate_mlp     : ratio uses an independent scalar MLP branch (shared spatial trunk)
+# - separate_spatial : ratio uses a fully independent spatial trunk + scalar MLP
+ratio_head_mode: shared
+
+# The following are MLP-only options kept for backward compatibility; ignored by mamba head.
+use_output_softplus: true
+use_cls_token: false
+use_patch_reg3: false
+dual_branch:
+  enabled: false
+  alpha_init: 0.2
+

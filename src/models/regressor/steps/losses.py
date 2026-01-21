@@ -65,7 +65,7 @@ class LossesMixin:
             return {"loss": zero}
 
         y_ndvi_only: Tensor = batch["y_ndvi"]  # (B,1)
-        if head_type in ("fpn", "dpt", "vitdet", "eomt"):
+        if head_type in ("fpn", "dpt", "vitdet", "eomt", "mamba"):
             if ndvi_pred_from_head is None:
                 zero = (z.sum() * 0.0)
                 self.log(f"{stage}_loss_ndvi", zero, on_step=False, on_epoch=True, prog_bar=False)
@@ -241,7 +241,7 @@ class LossesMixin:
 
                 # Fallback: compute p_pred from a single set of ratio logits.
                 if p_pred is None:
-                    if head_type in ("fpn", "dpt", "vitdet", "eomt"):
+                    if head_type in ("fpn", "dpt", "vitdet", "eomt", "mamba"):
                         ratio_logits = ratio_logits_pred
                     elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
                         logits_per_layer = [head(z_layers[idx]) for idx, head in enumerate(self.layer_ratio_heads)]
@@ -338,7 +338,7 @@ class LossesMixin:
 
             if pred_5d_gm2 is None:
                 pred_total_gm2 = self._invert_reg3_to_g_per_m2(pred_reg3)  # (B,1)
-                if head_type in ("fpn", "dpt", "vitdet", "eomt"):
+                if head_type in ("fpn", "dpt", "vitdet", "eomt", "mamba"):
                     ratio_logits = ratio_logits_pred
                 elif self.use_layerwise_heads and self.layer_ratio_heads is not None and z_layers is not None:
                     logits_per_layer_5d: List[Tensor] = []
@@ -518,7 +518,7 @@ class LossesMixin:
         pred_date = None
         logits_species = None
         logits_state = None
-        if head_type in ("fpn", "dpt", "vitdet", "eomt"):
+        if head_type in ("fpn", "dpt", "vitdet", "eomt", "mamba"):
             pred_height = self.height_head(z) if self.enable_height else None  # type: ignore[assignment]
             pred_ndvi = ndvi_pred_from_head if self.enable_ndvi else None
             pred_date = self.date_head(z) if self.enable_date else None  # type: ignore[assignment]

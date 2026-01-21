@@ -335,6 +335,116 @@ class HeadCheckpoint(Callback):
                 self._save(state, out_path)
                 return
 
+            if head_type in ("mamba", "mamba_head", "mamba_axial", "mamba_axial_scan"):
+                # ---------------------------
+                # Mamba-like axial head export (PyTorch-only)
+                # ---------------------------
+                num_outputs_main = int(getattr(pl_module.hparams, "num_outputs", 1)) if hasattr(pl_module, "hparams") else 1
+                enable_ratio = bool(getattr(pl_module, "enable_ratio_head", False))
+                num_ratio_outputs = int(getattr(pl_module, "num_ratio_outputs", 3)) if enable_ratio else 0
+                head_total_outputs = int(num_outputs_main + num_ratio_outputs)
+
+                embedding_dim = int(getattr(pl_module.hparams, "embedding_dim", 1024)) if hasattr(pl_module, "hparams") else 1024
+                # Mamba-specific knobs (stored on hparams by BiomassRegressor)
+                mamba_dim = int(getattr(pl_module.hparams, "mamba_dim", 320)) if hasattr(pl_module, "hparams") else 320
+                mamba_depth = int(getattr(pl_module.hparams, "mamba_depth", 4)) if hasattr(pl_module, "hparams") else 4
+                mamba_patch_size = int(
+                    getattr(
+                        pl_module.hparams,
+                        "mamba_patch_size",
+                        getattr(pl_module.hparams, "fpn_patch_size", 16) if hasattr(pl_module, "hparams") else 16,
+                    )
+                ) if hasattr(pl_module, "hparams") else 16
+                mamba_d_conv = int(getattr(pl_module.hparams, "mamba_d_conv", 3)) if hasattr(pl_module, "hparams") else 3
+                mamba_bidirectional = bool(getattr(pl_module.hparams, "mamba_bidirectional", True)) if hasattr(pl_module, "hparams") else True
+
+                head_hidden_dims = list(getattr(pl_module.hparams, "head_hidden_dims", [])) if hasattr(pl_module, "hparams") else []
+                head_activation = str(getattr(pl_module.hparams, "head_activation", "relu")) if hasattr(pl_module, "hparams") else "relu"
+                dropout = float(getattr(pl_module.hparams, "dropout", 0.0)) if hasattr(pl_module, "hparams") else 0.0
+
+                # Prefer the module attributes (normalized) over raw hparams.
+                use_layerwise_heads = bool(getattr(pl_module, "use_layerwise_heads", False))
+                backbone_layer_indices = list(getattr(pl_module, "backbone_layer_indices", []))
+                use_separate_bottlenecks = bool(getattr(pl_module, "use_separate_bottlenecks", False))
+                num_layers_eff = max(1, len(backbone_layer_indices)) if use_layerwise_heads else 1
+                enable_ndvi = bool(getattr(pl_module, "enable_ndvi", False))
+
+                mamba_head = getattr(pl_module, "mamba_head", None)
+                if mamba_head is None or not isinstance(mamba_head, nn.Module):
+                    raise RuntimeError(
+                        "Mamba head export failed: expected `pl_module.mamba_head` to be an nn.Module. "
+                        "This likely indicates a mismatched head_type or an unexpected LightningModule structure."
+                    )
+                state_dict_to_save = mamba_head.state_dict()
+
+                state: Dict[str, Any] = {
+                    "state_dict": state_dict_to_save,
+                    "meta": {
+                        "head_type": "mamba",
+                        "backbone": getattr(pl_module.hparams, "backbone_name", None) if hasattr(pl_module, "hparams") else None,
+                        "embedding_dim": int(embedding_dim),
+                        # Mamba config
+                        "mamba_dim": int(mamba_dim),
+                        "mamba_depth": int(mamba_depth),
+                        "mamba_patch_size": int(mamba_patch_size),
+                        "mamba_d_conv": int(mamba_d_conv),
+                        "mamba_bidirectional": bool(mamba_bidirectional),
+                        "enable_ndvi": bool(enable_ndvi),
+                        "num_outputs_main": int(num_outputs_main),
+                        "num_outputs_ratio": int(num_ratio_outputs),
+                        "head_total_outputs": int(head_total_outputs),
+                        "head_hidden_dims": list(head_hidden_dims),
+                        "head_activation": str(head_activation),
+                        "head_dropout": float(dropout),
+                        "ratio_head_mode": str(getattr(pl_module, "ratio_head_mode", "shared")),
+                        "separate_ratio_head": bool(getattr(pl_module, "separate_ratio_head", False)),
+                        "separate_ratio_spatial_head": bool(getattr(pl_module, "separate_ratio_spatial_head", False)),
+                        # Multi-layer fusion mode (mean or learned softmax weights).
+                        "backbone_layers_fusion": str(getattr(pl_module, "backbone_layers_fusion", "mean") or "mean"),
+                        # Export without terminal Softplus; inference handles main outputs.
+                        "use_output_softplus": False,
+                        "log_scale_targets": bool(getattr(pl_module.hparams, "log_scale_targets", False)) if hasattr(pl_module, "hparams") else False,
+                        # Patch tokens are required for Mamba heads.
+                        "use_patch_reg3": True,
+                        "use_cls_token": bool(getattr(pl_module.hparams, "use_cls_token", True)) if hasattr(pl_module, "hparams") else True,
+                        "use_layerwise_heads": bool(use_layerwise_heads),
+                        "backbone_layer_indices": list(backbone_layer_indices),
+                        "use_separate_bottlenecks": bool(use_separate_bottlenecks),
+                        "num_layers": int(num_layers_eff),
+                        "ratio_components": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"] if num_ratio_outputs > 0 else [],
+                        "ratio_head_format": str(getattr(pl_module, "ratio_head_format", "legacy")),
+                        "ratio_num_components": 3 if num_ratio_outputs > 0 else 0,
+                        "ratio_has_presence": False,
+                    },
+                }
+                try:
+                    state["meta"]["weights_source"] = str(weights_source)
+                    if ema_meta is not None:
+                        state["meta"]["ema"] = ema_meta
+                except Exception:
+                    pass
+                # Optionally bundle LoRA payload
+                try:
+                    fe = getattr(pl_module, "feature_extractor", None)
+                    if fe is not None and hasattr(fe, "backbone"):
+                        peft_payload = export_lora_payload_if_any(fe.backbone)
+                        if peft_payload is not None:
+                            state["peft"] = peft_payload
+                except Exception:
+                    pass
+
+                suffix_parts: list[str] = []
+                if val_loss is not None:
+                    suffix_parts.append(f"val_loss{val_loss:.6f}")
+                if train_loss is not None:
+                    suffix_parts.append(f"train_loss{train_loss:.6f}")
+                if val_r2 is not None:
+                    suffix_parts.append(f"val_r2{val_r2:.6f}")
+                metrics_suffix = ("-" + "-".join(suffix_parts)) if suffix_parts else ""
+                out_path = os.path.join(self.output_dir, f"head-epoch{epoch:03d}{metrics_suffix}.pt")
+                self._save(state, out_path)
+                return
+
             if head_type in ("dpt", "dpt_scalar", "dpt_head", "dense_dpt", "dpt_dense"):
                 # ---------------------------
                 # DPT-style head export

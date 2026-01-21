@@ -127,6 +127,33 @@ def run_training(
     if not isinstance(cfg, dict):
         raise TypeError(f"run_training expects cfg as dict, got: {type(cfg)}")
 
+    # ---- Global torch perf knobs (safe defaults, no model/hparam changes) ----
+    # These typically improve GPU throughput/utilization for mixed-precision training.
+    try:
+        import torch
+
+        # Enable TF32 on matmul/conv where applicable (AMP is still used for most ops).
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Slightly more permissive reductions can improve throughput on some GPUs.
+        try:
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        except Exception:
+            pass
+        try:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        except Exception:
+            pass
+        # Prefer Tensor Cores for fp32 matmul when it happens (Lightning warns about this).
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        # cuDNN autotune for fixed input sizes (your pipeline uses a fixed image_size).
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+
     repo_root = (repo_root or resolve_repo_root()).resolve()
     log_dir = _resolve_dir_under_root(Path(log_dir), repo_root=repo_root)
     ckpt_dir = _resolve_dir_under_root(Path(ckpt_dir), repo_root=repo_root)

@@ -43,6 +43,12 @@ def init_head_by_type(
     vitdet_dim: int,
     vitdet_patch_size: int,
     vitdet_scale_factors: List[float],
+    # Mamba axial head config (PyTorch-only)
+    mamba_dim: int = 320,
+    mamba_depth: int = 4,
+    mamba_patch_size: int = 16,
+    mamba_d_conv: int = 3,
+    mamba_bidirectional: bool = True,
     # EoMT-style query pooling config
     eomt_num_queries: int = 16,
     eomt_num_layers: int = 2,
@@ -118,6 +124,23 @@ def init_head_by_type(
             dropout=float(dropout),
         )
         init_vitdet_task_heads(model, bottleneck_dim=int(bottleneck_dim))
+        return int(bottleneck_dim)
+    if ht in ("mamba", "mamba_axial", "mamba_head"):
+        from .mamba import init_mamba_head, init_mamba_task_heads
+
+        bottleneck_dim = init_mamba_head(
+            model,
+            embedding_dim=int(embedding_dim),
+            mamba_dim=int(mamba_dim),
+            mamba_depth=int(mamba_depth),
+            mamba_patch_size=int(mamba_patch_size),
+            mamba_d_conv=int(mamba_d_conv),
+            mamba_bidirectional=bool(mamba_bidirectional),
+            hidden_dims=list(hidden_dims),
+            head_activation=str(head_activation),
+            dropout=float(dropout),
+        )
+        init_mamba_task_heads(model, bottleneck_dim=int(bottleneck_dim))
         return int(bottleneck_dim)
     if ht in ("eomt", "eomt_query", "query_pool", "qpool"):
         from .eomt import init_eomt_head, init_eomt_task_heads

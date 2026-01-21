@@ -49,6 +49,7 @@ from src.inference.predict import (
     predict_main_and_ratio_dpt,
     predict_main_and_ratio_eomt,
     predict_main_and_ratio_fpn,
+    predict_main_and_ratio_mamba,
     predict_main_and_ratio_vitdet,
     predict_main_and_ratio_global_multilayer,
     predict_main_and_ratio_patch_mode,
@@ -62,6 +63,7 @@ from src.models.head_builder import DualBranchHeadExport, MultiLayerHeadExport, 
 from src.models.peft_integration import _import_peft
 from src.models.spatial_fpn import FPNHeadConfig, FPNScalarHead
 from src.models.vitdet_head import ViTDetHeadConfig, ViTDetMultiLayerScalarHead, ViTDetScalarHead
+from src.models.mamba_head import MambaHeadConfig, MambaAxialScalarHead, MambaMultiLayerScalarHead
 
 
 def load_config(project_dir: str) -> Dict:
@@ -1158,6 +1160,85 @@ def infer_components_5d_for_model(
                 )
             else:
                 head_module = ViTDetScalarHead(vitdet_cfg)  # type: ignore[assignment]
+        elif head_type_meta == "mamba":
+            # PyTorch-only Mamba-like axial scan head.
+            mamba_dim_meta = int(
+                meta.get(
+                    "mamba_dim",
+                    first_meta.get(
+                        "mamba_dim",
+                        int(
+                            (cfg.get("model", {}).get("head", {}).get("mamba", {}) or {}).get(
+                                "dim", cfg["model"]["head"].get("vitdet_dim", 320)
+                            )
+                        ),
+                    ),
+                )
+            )
+            mamba_depth_meta = int(
+                meta.get(
+                    "mamba_depth",
+                    first_meta.get(
+                        "mamba_depth",
+                        int((cfg.get("model", {}).get("head", {}).get("mamba", {}) or {}).get("depth", 4)),
+                    ),
+                )
+            )
+            mamba_patch_size_meta = int(
+                meta.get(
+                    "mamba_patch_size",
+                    first_meta.get(
+                        "mamba_patch_size",
+                        int(
+                            (cfg.get("model", {}).get("head", {}).get("mamba", {}) or {}).get(
+                                "patch_size", cfg["model"]["head"].get("fpn_patch_size", 16)
+                            )
+                        ),
+                    ),
+                )
+            )
+            mamba_d_conv_meta = int(
+                meta.get(
+                    "mamba_d_conv",
+                    first_meta.get(
+                        "mamba_d_conv",
+                        int((cfg.get("model", {}).get("head", {}).get("mamba", {}) or {}).get("d_conv", 3)),
+                    ),
+                )
+            )
+            mamba_bidirectional_meta = bool(
+                meta.get(
+                    "mamba_bidirectional",
+                    first_meta.get(
+                        "mamba_bidirectional",
+                        bool((cfg.get("model", {}).get("head", {}).get("mamba", {}) or {}).get("bidirectional", True)),
+                    ),
+                )
+            )
+            enable_ndvi_meta = bool(meta.get("enable_ndvi", False))
+            num_layers_eff = max(1, len(backbone_layer_indices_head)) if use_layerwise_heads_head else 1
+            mamba_cfg = MambaHeadConfig(
+                embedding_dim=head_embedding_dim,
+                mamba_dim=int(mamba_dim_meta),
+                depth=int(mamba_depth_meta),
+                patch_size=int(mamba_patch_size_meta),
+                d_conv=int(mamba_d_conv_meta),
+                bidirectional=bool(mamba_bidirectional_meta),
+                num_outputs_main=head_num_main,
+                num_outputs_ratio=head_num_ratio if head_is_ratio else 0,
+                enable_ndvi=enable_ndvi_meta,
+                separate_ratio_head=bool(separate_ratio_head_eff),
+                separate_ratio_spatial_head=bool(separate_ratio_spatial_eff),
+                head_hidden_dims=head_hidden_dims,
+                head_activation=head_activation,
+                dropout=head_dropout,
+            )
+            if use_layerwise_heads_head:
+                head_module = MambaMultiLayerScalarHead(  # type: ignore[assignment]
+                    mamba_cfg, num_layers=num_layers_eff, layer_fusion=fusion_mode_meta
+                )
+            else:
+                head_module = MambaAxialScalarHead(mamba_cfg)  # type: ignore[assignment]
         elif head_type_meta == "dpt":
             dpt_features_meta = int(meta.get("dpt_features", first_meta.get("dpt_features", int(cfg["model"]["head"].get("dpt_features", 256)))))
             dpt_patch_size_meta = int(meta.get("dpt_patch_size", first_meta.get("dpt_patch_size", int(cfg["model"]["head"].get("dpt_patch_size", cfg["model"]["head"].get("fpn_patch_size", 16))))))
@@ -1423,6 +1504,34 @@ def infer_components_5d_for_model(
                     preds_main_var_v,
                     preds_ratio_var_v,
                 ) = predict_main_and_ratio_vitdet(
+                    backbone=backbone,
+                    head=head_module,
+                    dataset_root=dataset_root,
+                    image_paths=image_paths,
+                    image_size=image_size_view,
+                    mean=mean,
+                    std=std,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    head_num_main=head_num_main,
+                    head_num_ratio=head_num_ratio if head_is_ratio else 0,
+                    use_layerwise_heads=use_layerwise_heads_head,
+                    layer_indices=backbone_layer_indices_head if use_layerwise_heads_head else None,
+                    mc_dropout_enabled=mc_enabled,
+                    mc_dropout_samples=int(mc_samples_eff),
+                    hflip=bool(hflip_view),
+                    vflip=bool(vflip_view),
+                )
+            elif head_type_meta == "mamba":
+                (
+                    rels_v,
+                    preds_main_v,
+                    preds_ratio_v,
+                    preds_main_layers_v,
+                    preds_ratio_layers_v,
+                    preds_main_var_v,
+                    preds_ratio_var_v,
+                ) = predict_main_and_ratio_mamba(
                     backbone=backbone,
                     head=head_module,
                     dataset_root=dataset_root,
