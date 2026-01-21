@@ -1,5 +1,5 @@
 seed: 42
-version: mamba-v3
+version: mamba-v4
 data:
   root: data
   train_csv: train.csv
@@ -514,7 +514,7 @@ optimizer:
 # - UW (uncertainty-weighting) parameters are excluded by default to avoid injecting task gradients
 #   into log-variance weights.
 pcgrad:
-  enabled: true
+  enabled: false
   # Gradient surgery mode:
   # - symmetric        : standard PCGrad (all selected tasks treated equally)
   # - primary_anchored : protect primary tasks; project auxiliary gradients only

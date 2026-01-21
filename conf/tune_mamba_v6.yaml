@@ -20,7 +20,6 @@ defaults:
 # -----------------------------
 model:
   head:
-    _delete_: true
     type: mamba
     # New Mamba head settings (2D mixing).
     mamba:
@@ -60,14 +59,12 @@ model:
 # -----------------------------
 # Bookkeeping
 # -----------------------------
-version: tune-mamba-v5
+version: tune-mamba-v6
 tune:
-  name: tune-mamba-v5
+  name: tune-mamba-v6
 
   # Replace the ViTDet search space with Mamba-specific knobs + slightly narrower regularization ranges.
   search_space:
-    _delete_: true
-
     # ---- Optimizer / scheduler (same as vitdet v5 baseline) ----
     optimizer.lr:
       type: loguniform
@@ -92,6 +89,17 @@ tune:
         - [12, 24, 31]
         - [24, 31]
         - [31]
+
+    # ---- (Fixed) ViTDet-only knobs ----
+    # tune_vitdet_v5 defines these as a search dimension; for Mamba they are irrelevant.
+    # Keep them as a single-value choice to avoid expanding the search space.
+    model.head.vitdet_dim:
+      type: choice
+      values: [320]
+    model.head.vitdet_scale_factors:
+      type: choice
+      values:
+        - [2.0, 1.0, 0.5]
 
     # ---- Mamba head (2D mixing) ----
     model.head.mamba.dim:

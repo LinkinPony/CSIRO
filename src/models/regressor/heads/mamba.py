@@ -37,16 +37,19 @@ class _DiagonalSSMScan1D(nn.Module):
         d = int(dim)
         if d <= 0:
             raise ValueError("dim must be positive for _DiagonalSSMScan1D")
-        # a in (0,1) via sigmoid for stability
-        self.a_logit = nn.Parameter(torch.zeros(d, dtype=torch.float32))
+        # a in (0,1) via sigmoid for stability.
+        # Initialize a_logit to ~2.2 so a ≈ 0.9 (slower decay), avoiding numerical instability
+        # when computing a^t for long sequences. With a=0.9, a^100 ≈ 0.000027 which is stable.
+        # With a=0.5 (old init), a^100 ≈ 0 causing div-by-zero and NaN gradients.
+        self.a_logit = nn.Parameter(torch.full((d,), 2.2, dtype=torch.float32))
         self.b = nn.Parameter(torch.ones(d, dtype=torch.float32))
         self.c = nn.Parameter(torch.ones(d, dtype=torch.float32))
         self.d = nn.Parameter(torch.ones(d, dtype=torch.float32))
         # Numerical safety for the vectorized scan (avoid log(0) and div-by-0).
         self._a_eps: float = 1.0e-4
-        # Lower bound for a^t to avoid underflow -> inf in u/a^t. This effectively truncates
-        # extremely long horizons when `a` is very small, which is fine for this lightweight head.
-        self._pow_min: float = 1.0e-20
+        # Lower bound for a^t to avoid underflow -> inf in u/a^t. Use 1e-8 (not 1e-20) to
+        # ensure we stay well above float32 precision limits and avoid gradient explosion.
+        self._pow_min: float = 1.0e-8
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -89,14 +92,22 @@ class _DiagonalSSMScan1D(nn.Module):
             return x_f.to(dtype=x.dtype)
 
         # Build a_pow: (L, D)
+        # Use log-space computation with careful clamping to prevent numerical instability.
         t = torch.arange(int(L), device=x.device, dtype=torch.float32)  # (L,)
         log_a = torch.log(a)  # (D,)
-        a_pow = torch.exp(t.view(-1, 1) * log_a.view(1, -1))  # (L,D)
+        # Clamp log_a * t to prevent extreme values that cause overflow/underflow.
+        # log(1e-8) ≈ -18.4, so we clamp the exponent to avoid going below _pow_min.
+        log_a_pow = t.view(-1, 1) * log_a.view(1, -1)  # (L, D)
+        log_a_pow = log_a_pow.clamp_min(float(-18.0))  # Ensures a_pow >= ~1.5e-8
+        a_pow = torch.exp(log_a_pow)  # (L, D)
         a_pow = a_pow.clamp_min(float(self._pow_min))
         a_pow_b = a_pow.unsqueeze(0)  # (1,L,D)
 
         u = x_f * b.view(1, 1, -1)  # (B,L,D)
-        r = torch.cumsum(u / a_pow_b, dim=1)  # (B,L,D)
+        # Clamp the ratio to prevent extreme values before cumsum.
+        ratio = u / a_pow_b
+        ratio = ratio.clamp(min=-1e6, max=1e6)
+        r = torch.cumsum(ratio, dim=1)  # (B,L,D)
         s = r * a_pow_b  # (B,L,D)
         y = (s * c.view(1, 1, -1)) + (x_f * d.view(1, 1, -1))
         return y.to(dtype=x.dtype)
@@ -109,8 +120,10 @@ class _MambaMixBlock2D(nn.Module):
 
     Notes:
       - This block is **non-causal** (symmetric padding) which is more appropriate for image regression.
-      - "2D mixing" is implemented by running the diagonal SSM scan over the flattened HxW grid
-        in both row-major and column-major orderings and averaging the results.
+      - "2D mixing" is implemented as an **axial scan**: run the diagonal SSM scan along rows
+        (sequence length = W) and columns (sequence length = H), then average the results.
+        This avoids extremely long sequences of length H*W (e.g. 60*30=1800) which can be
+        numerically unstable for simple diagonal recurrences under AMP.
       - We keep this implementation PyTorch-only (no custom CUDA extensions).
     """
 
@@ -169,29 +182,30 @@ class _MambaMixBlock2D(nn.Module):
         if x.dim() != 4:
             raise RuntimeError(f"_scan2d expects (B,H,W,D), got: {tuple(x.shape)}")
         B, H, W, D = x.shape
-        L = int(H * W)
-        if L <= 0:
+        if int(H) <= 0 or int(W) <= 0:
             return x
 
-        # Row-major sequence: (h,w) with w varying fastest.
-        seq_row = x.reshape(int(B), int(L), int(D))  # (B,L,D)
+        # Axial scan to avoid very long sequences (H*W).
+        #
+        # Row-wise sequences: treat each row independently.
+        seq_row = x.reshape(int(B) * int(H), int(W), int(D))  # (B*H, W, D)
+        # Column-wise sequences: treat each column independently.
+        x_col = x.permute(0, 2, 1, 3).contiguous()  # (B, W, H, D)
+        seq_col = x_col.reshape(int(B) * int(W), int(H), int(D))  # (B*W, H, D)
 
-        # Column-major sequence: (w,h) with h varying fastest (permute H/W first).
-        x_col = x.permute(0, 2, 1, 3).contiguous()  # (B,W,H,D)
-        seq_col = x_col.reshape(int(B), int(L), int(D))  # (B,L,D)
-
-        # Run the diagonal scan on both orderings in a single batched call.
-        if self.bidirectional:
-            seqs = torch.cat([seq_row, seq_col], dim=0)  # (2B,L,D)
-            seqs_rev = torch.flip(seqs, dims=[1])  # (2B,L,D)
-            y2 = self.ssm(torch.cat([seqs, seqs_rev], dim=0))  # (4B,L,D)
-            y_f, y_rev = y2.chunk(2, dim=0)  # each (2B,L,D)
+        def _scan1d(seq: Tensor) -> Tensor:
+            # seq: (N, L, D)
+            if not self.bidirectional:
+                return self.ssm(seq)
+            seq_rev = torch.flip(seq, dims=[1])
+            y2 = self.ssm(torch.cat([seq, seq_rev], dim=0))  # (2N, L, D)
+            y_f, y_rev = y2.chunk(2, dim=0)
             y_b = torch.flip(y_rev, dims=[1])
-            y = 0.5 * (y_f + y_b)  # (2B,L,D)
-        else:
-            y = self.ssm(torch.cat([seq_row, seq_col], dim=0))  # (2B,L,D)
+            return 0.5 * (y_f + y_b)
 
-        y_row, y_col = y.chunk(2, dim=0)  # each (B,L,D)
+        y_row = _scan1d(seq_row)  # (B*H, W, D)
+        y_col = _scan1d(seq_col)  # (B*W, H, D)
+
         y_row_map = y_row.reshape(int(B), int(H), int(W), int(D))
         y_col_map = y_col.reshape(int(B), int(W), int(H), int(D)).permute(0, 2, 1, 3).contiguous()
         return 0.5 * (y_row_map + y_col_map)

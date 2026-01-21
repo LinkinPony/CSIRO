@@ -15,6 +15,7 @@ from src.callbacks.adaptive_swa_lrs import AdaptiveSwaLrsOnStart
 from src.callbacks.ema import ExponentialMovingAverage
 from src.callbacks.freeze_lora_on_swa import FreezeLoraOnSwaStart
 from src.callbacks.head_checkpoint import HeadCheckpoint
+from src.callbacks.nonfinite_guard import NonFiniteGuard
 from src.data.datamodule import PastureDataModule
 from src.models.regressor import BiomassRegressor
 from src.training.logging_utils import create_lightning_loggers, plot_epoch_metrics
@@ -786,6 +787,8 @@ def train_single_split(
         save_on_train_epoch_end=True,
     )
     callbacks.append(checkpoint_cb)
+    # Fail-fast on NaN/Inf so Ray Tune doesn't waste epochs on divergent trials.
+    callbacks.append(NonFiniteGuard(enabled=True, check_grads=False))
     callbacks.append(LearningRateMonitor(logging_interval="epoch"))
     callbacks.append(HeadCheckpoint(output_dir=str(head_ckpt_dir)))
     if extra_callbacks:
