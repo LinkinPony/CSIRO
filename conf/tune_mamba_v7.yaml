@@ -59,9 +59,9 @@ model:
 # -----------------------------
 # Bookkeeping
 # -----------------------------
-version: tune-mamba-v6
+version: tune-mamba-v7
 tune:
-  name: tune-mamba-v6
+  name: tune-mamba-v7
 
   # Replace the ViTDet search space with Mamba-specific knobs + slightly narrower regularization ranges.
   search_space:
