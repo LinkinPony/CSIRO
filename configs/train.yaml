@@ -219,8 +219,8 @@ data:
       value: random
     manifold_mixup:
       enabled: true
-      prob: 0.8514247119262943
-      alpha: 4.142265565950969
+      prob: 0.44560858743856546
+      alpha: 4.371168372869891
       apply_on: tokens
       detach_pair: false
       mix_cls_token: false
@@ -282,9 +282,10 @@ model:
     - 0.5
     hidden_dims:
     - 512
+    - 256
     activation: silu
-    dropout: 0.16594441534599902
-    ratio_head_mode: shared
+    dropout: 0.22994869958594497
+    ratio_head_mode: separate_mlp
     use_output_softplus: true
     use_cls_token: false
     use_patch_reg3: false
@@ -292,17 +293,17 @@ model:
       enabled: false
       alpha_init: 0.2
     mamba:
-      dim: 320
-      depth: 2
+      dim: 384
+      depth: 4
       patch_size: 16
-      d_conv: 3
-      bidirectional: true
+      d_conv: 5
+      bidirectional: false
     torch_compile:
       enabled: false
       mode: max-autotune
   backbone_layers:
     enabled: true
-    layer_fusion: mean
+    layer_fusion: learned
     separate_bottlenecks: true
     indices_by_backbone:
       dinov3_vitl16:
@@ -311,6 +312,7 @@ model:
       - 17
       - 23
       dinov3_vith16plus:
+      - 24
       - 31
       dinov3_vit7b16:
       - 9
@@ -328,20 +330,19 @@ mtl:
   sample_ratio:
     ndvi_dense: 0.0
 train_all:
-  enabled: true
+  enabled: false
 peft:
   enabled: true
   method: lora
   use_dora: false
   r: 8
   lora_alpha: 8
-  lora_dropout: 0.031912879303337506
+  lora_dropout: 0.1450966101813862
   init: true
   last_k_blocks: 16
   layers_pattern: blocks
-  target_modules:
-  - qkv
-  lora_lr: 0.0028774554868206993
+  target_modules: [qkv, proj, w1, w2, w3]
+  lora_lr: 0.0012325965417410531
   lora_weight_decay: 0.0
   lora_llrd: 0.8729858381132479
   lora_group_size: 1
@@ -357,8 +358,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 3.577782355737036e-05
-  weight_decay: 6.852035891841635e-06
+  lr: 0.00022095538920779078
+  weight_decay: 0.00024947694000957083
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -385,7 +386,7 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 0
+  warmup_epochs: 5
   warmup_start_factor: 0.1
 kfold:
   enabled: true
@@ -429,4 +430,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-mamba-v7-19
+version: tune-mamba-v7-69-lora

@@ -1,0 +1,113 @@
+# Mamba (2D-mixing) v9 sweep: reduce late-epoch overfitting **without** early-stopping.
+#
+# Motivation (from v8 curves):
+# - Many trials reach their best `val_loss_5d_weighted` around ~epoch 21-24 but degrade by epoch 35.
+# - Final training cannot use early-stop and the pipeline saves final-epoch head weights.
+# - So we (a) shorten the fixed epoch budget to end near the peak, and (b) bias Tune toward
+#   stronger regularization / simpler heads to reduce peak->last degradation.
+#
+# Run:
+#   python tune.py --config-name tune_mamba_v9
+#
+# Tip (cluster/NFS):
+#   python tune.py --config-name tune_mamba_v9 tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
+
+defaults:
+  - tune_mamba_v8
+  - _self_
+
+# -----------------------------
+# Bookkeeping
+# -----------------------------
+version: tune-mamba-v10
+
+# Fixed budget (no early-stop): chosen to end near v8 best-epoch distribution.
+trainer:
+  max_epochs: 25
+
+tune:
+  name: tune-mamba-v10
+
+  # Stage-2 candidate selection: prefer configs that are good at the end of the fixed budget.
+  # NOTE: this only affects stage-2 promotion selection; it does not introduce early-stopping.
+  two_stage:
+    scope: last
+    # Only consider trials that reached (near) the end of training, so ASHA-pruned trials
+    # (which can look deceptively good because they stop before overfitting) don't dominate.
+    min_epoch: 20
+
+  search_space:
+    # ---- LR (v7 wanted very low LR; v8 did well with modest LR) ----
+    optimizer.lr:
+      type: loguniform
+      lower: 2.0e-05
+      upper: 6.0e-04
+
+    # ---- Stronger regularization (v8: weight_decay had the largest impact) ----
+    optimizer.weight_decay:
+      type: loguniform
+      # Keep the lower tail: v7 best trial used ~7e-6, but v8 average preferred larger WD.
+      lower: 1.0e-06
+      upper: 1.0e-03
+
+    # ---- Backbone layer selection ----
+    model.backbone_layers.indices_by_backbone.dinov3_vith16plus:
+      type: choice
+      values:
+        - [28, 29, 30, 31]
+        - [31]
+
+    # ---- Head regularization / capacity ----
+    model.head.hidden_dims:
+      type: choice
+      # For the no-early-stop setting, we care about *final-epoch* behavior:
+      # v8 full-length trials suggested [256] can significantly reduce peak->last degradation.
+      values:
+        - []      # linear head on pooled features
+        - [256]
+        - [512]
+    model.head.dropout:
+      type: uniform
+      # v8 full-length trials: higher dropout correlated strongly with less late-epoch degradation.
+      lower: 0.10
+      upper: 0.35
+
+    # ---- Reduce wasted warmup (v8: warmup=0 was best; warmup=5 was worst) ----
+    scheduler.warmup_epochs:
+      type: choice
+      values: [0, 1]
+
+    # ---- LoRA: reduce late-epoch instability ----
+    peft.last_k_blocks:
+      type: choice
+      values: [16]
+    peft.lora_alpha:
+      type: choice
+      values: [8, 16]
+    peft.lora_lr:
+      type: loguniform
+      lower: 3.0e-04
+      # Keep the full v7/v8 range; v7 best trial used ~2.9e-3.
+      upper: 3.0e-03
+    peft.lora_dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.08
+
+    # ---- Ratio head coupling ----
+    model.head.ratio_head_mode:
+      type: choice
+      # v7 and v8 disagree on the mean; keep both and let Tune decide.
+      values: [shared, separate_mlp]
+
+    # ---- Manifold Mixup: bias toward stronger regularization to help late epochs ----
+    data.augment.manifold_mixup.prob:
+      type: uniform
+      lower: 0.5
+      upper: 1.0
+    data.augment.manifold_mixup.alpha:
+      type: uniform
+      # v8 full-length trials: higher alpha correlated with better last-epoch loss and less degradation.
+      lower: 2.0
+      upper: 5.0
+

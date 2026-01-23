@@ -484,7 +484,18 @@ def main(cfg: DictConfig) -> None:
     restart_errored = bool(tune_cfg.get("restart_errored", False))
 
     # Build Ray Tune search space
+    #
+    # Note: some Hydra configs may carry merge directives such as `_delete_` inside `tune.search_space`.
+    # These are not part of the Tune search space spec and would break `_build_search_space`.
     space_spec = dict(tune_cfg.get("search_space", {}) or {})
+    try:
+        space_spec = {
+            str(k): v
+            for k, v in (space_spec or {}).items()
+            if str(k) and not str(k).startswith("_")
+        }
+    except Exception:
+        space_spec = dict(tune_cfg.get("search_space", {}) or {})
 
     # Ray init
     ray_address = str(ray_cfg.get("address", "") or "").strip()
@@ -588,12 +599,63 @@ def main(cfg: DictConfig) -> None:
         for k, v in (config or {}).items():
             _set_by_dotted_path(cfg_trial, str(k), v)
 
-        # Determine whether this trial runs k-fold training (expensive; reported as aggregated metrics).
+        # Determine whether this trial runs k-fold training.
+        #
+        # Note on ASHA:
+        # - Full k-fold (multiple folds) only reports a single aggregated result at the end (no per-epoch),
+        #   which keeps ASHA semantics clean and avoids excessive Ray reports.
+        # - A *single selected fold* behaves like a normal single-split run, so we allow per-epoch reporting
+        #   (enabling ASHA) when kfold.enabled=true but kfold.folds selects exactly one fold.
         kfold_cfg_trial = cfg_trial.get("kfold", {}) or {}
         kfold_enabled_trial = bool(kfold_cfg_trial.get("enabled", False))
 
-        # Only enable per-epoch reporting for single-seed, non-kfold trials to keep ASHA semantics clean.
-        enable_epoch_reporting = bool(report_per_epoch) and len(seeds) == 1 and not kfold_enabled_trial
+        def _selected_folds_count(kfold_cfg: dict) -> Optional[int]:
+            """
+            Best-effort count of selected folds from kfold.folds.
+
+            Supported forms (mirrors src/training/kfold_runner.py semantics):
+              - null / missing / \"all\": run all folds -> return None
+              - int: single fold -> return 1
+              - list/tuple/set: return len(unique_folds) if parseable
+              - string: \"0,2,4\" -> return number of parsed indices
+            """
+            raw = None
+            try:
+                raw = kfold_cfg.get("folds", None)
+            except Exception:
+                raw = None
+
+            if raw is None:
+                return None
+            if isinstance(raw, int):
+                return 1
+            if isinstance(raw, (list, tuple, set)):
+                try:
+                    vals = [int(x) for x in list(raw)]
+                    return int(len(sorted(set(vals))))
+                except Exception:
+                    return None
+            if isinstance(raw, str):
+                s = raw.strip().lower()
+                if s in ("", "none", "null", "all"):
+                    return None
+                parts = [p for p in s.replace(",", " ").split() if p]
+                try:
+                    vals = [int(p) for p in parts]
+                    return int(len(sorted(set(vals)))) if vals else None
+                except Exception:
+                    return None
+            return None
+
+        selected_folds_count = _selected_folds_count(kfold_cfg_trial if isinstance(kfold_cfg_trial, dict) else {})
+        single_fold_kfold = bool(kfold_enabled_trial and selected_folds_count == 1)
+
+        # Enable per-epoch reporting only for single-seed trials and either:
+        # - non-kfold, or
+        # - kfold with exactly one fold selected (acts like a single split).
+        enable_epoch_reporting = bool(report_per_epoch) and len(seeds) == 1 and (
+            (not kfold_enabled_trial) or single_fold_kfold
+        )
 
         from src.callbacks.ray_tune_report import RayTuneReportCallback
 

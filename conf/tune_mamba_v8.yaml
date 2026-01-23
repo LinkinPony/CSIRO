@@ -1,0 +1,124 @@
+# Mamba (2D-mixing) v8 sweep: local refinement around v7 best.
+#
+# This config narrows `conf/tune_mamba_v7.yaml` based on offline analysis of:
+#   - /media/dl/dataset/ray_results/tune-mamba-v7/analysis_r2/report.md
+#   - outputs/tune_analysis_val_loss_5d_weighted/experiments_summary.csv
+#
+# Key takeaways from v7:
+# - `optimizer.lr` dominates; best trials sit near the lower bound -> narrow the range.
+# - `model.backbone_layers.layer_fusion=mean` is consistently better -> fix it.
+# - Mamba head prefers moderate size/depth (dim<=320, depth in {2,3}); dim=384 underperforms.
+# - Drop over-parameterized pooled MLP configs; keep [], [256], [512].
+# - LoRA alpha=32 is consistently worse; remove it.
+# - Manifold mixup tends to prefer higher prob; narrow ranges toward useful region.
+#
+# Run:
+#   python tune.py --config-name tune_mamba_v8
+#
+# Tip (cluster/NFS):
+#   python tune.py --config-name tune_mamba_v8 tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
+
+defaults:
+  - tune_mamba_v7
+  - _self_
+
+# -----------------------------
+# Bookkeeping
+# -----------------------------
+version: tune-mamba-v8
+tune:
+  name: tune-mamba-v8
+
+  # Refinement: keep the same Tune protocol as v7 (ASHA stage-1 + optional stage-2 k-fold),
+  # but narrow the search ranges to reduce wasted trials.
+  search_space:
+    # ---- Optimizer / scheduler ----
+    optimizer.lr:
+      type: loguniform
+      lower: 1.0e-05
+      upper: 6.0e-04
+    optimizer.weight_decay:
+      type: loguniform
+      lower: 1.0e-06
+      upper: 1.0e-03
+    scheduler.warmup_epochs:
+      type: choice
+      # v7: warmup=0 was best; warmup=3 was consistently poor.
+      values: [0, 1, 5]
+
+    # ---- Backbone multi-layer fusion ----
+    model.backbone_layers.layer_fusion:
+      type: choice
+      # v7: mean >> learned (by mean loss).
+      values: [mean]
+    model.backbone_layers.indices_by_backbone.dinov3_vith16plus:
+      type: choice
+      # v7: best-performing options on average (keep shortlist).
+      values:
+        - [28, 29, 30, 31]
+        - [31]
+
+    # ---- Mamba head (2D mixing) ----
+    model.head.mamba.dim:
+      type: choice
+      # v7: dim=384 underperforms; keep <=320.
+      values: [192, 256, 320]
+    model.head.mamba.depth:
+      type: choice
+      values: [2, 3]
+    model.head.mamba.d_conv:
+      type: choice
+      # Keep odd kernel sizes (Conv2d same-padding).
+      values: [3, 5, 7]
+    model.head.mamba.bidirectional:
+      type: choice
+      # v7: bidirectional often worse on average, but the best trial used it.
+      values: [false, true]
+
+    model.head.hidden_dims:
+      type: choice
+      values:
+        - []      # linear head on pooled features
+        - [256]
+        - [512]
+    model.head.activation:
+      type: choice
+      values: [relu, silu]
+    model.head.dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.35
+    model.head.ratio_head_mode:
+      type: choice
+      values: [shared, separate_mlp]
+
+    # ---- LoRA ----
+    peft.r:
+      type: choice
+      values: [8, 16]
+    peft.last_k_blocks:
+      type: choice
+      # v7: last_k_blocks=8 underperforms on average; focus on deeper adapters.
+      values: [12, 16]
+    peft.lora_alpha:
+      type: choice
+      values: [8, 16]
+    peft.lora_lr:
+      type: loguniform
+      lower: 3.0e-04
+      upper: 3.0e-03
+    peft.lora_dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.12
+
+    # ---- Manifold Mixup (regularization) ----
+    data.augment.manifold_mixup.prob:
+      type: uniform
+      lower: 0.2
+      upper: 1.0
+    data.augment.manifold_mixup.alpha:
+      type: uniform
+      lower: 0.4
+      upper: 5.0
+
