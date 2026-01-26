@@ -1,0 +1,279 @@
+# Hardest-fold (fold1) multi-head sweep for DINOv3 ViT-S+ (dinov3_vits16plus):
+# - Stage 1: k-fold enabled but run ONLY fold_1 (seed=42), with ASHA + per-epoch reporting.
+# - Stage 2: promote top-N configs and re-evaluate with full 5-fold, select by val_r2_global.
+#
+# Run:
+#   python tune.py --config-name tune_allheads_fold1_vits16plus_v1
+#
+# Tip (cluster/NFS):
+#   python tune.py --config-name tune_allheads_fold1_vits16plus_v1 tune.storage_path=/mnt/csiro_nfs/ray_results ray.address=auto
+
+defaults:
+  # Reuse v10 training defaults (augmentation/LoRA/backbone fusion), then override the backbone below.
+  - tune_vitdet_v10
+  - _self_
+
+version: tune-allheads-fold1-vits16plus-v1
+
+# -----------------------------
+# Stage-1 fold selection (hardest fold)
+# -----------------------------
+kfold:
+  enabled: true
+  k: 5
+  even_split: false
+  # IMPORTANT: only run fold_1 during Stage-1 HPO.
+  folds: [1]
+  group_by_date_state: true
+
+data:
+  # Not used when k-fold is enabled (splits are explicit), but keep explicit to avoid confusion.
+  val_split: 0.0
+
+trainer:
+  # Keep the short budget you used recently; stage-2 reruns full k-fold at the same budget.
+  max_epochs: 25
+
+# -----------------------------
+# Kaggle-metric aligned loss
+# -----------------------------
+loss:
+  # Loss space for 5D supervision:
+  # - legacy: keep historical behavior (g/m^2 space; optional log/z-score)
+  # - kaggle_log1p_grams: align with competition metric (R^2 in log1p(grams) space)
+  metric_space: kaggle_log1p_grams
+  # When true (recommended), normalize per-target log-space MSE by train-set var(log1p(grams))
+  # to better approximate the SST normalization inside R^2.
+  normalize_by_train_log_var: true
+
+model:
+  # DINOv3 backbone: ViT-S+ (frozen).
+  backbone: dinov3_vits16plus
+  weights_url: null
+  weights_path: dinov3_weights/dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pt
+  pretrained: true
+  freeze_backbone: true
+  backbone_weights_dtype: fp32
+  gradient_checkpointing: false
+  embedding_dim: 384
+
+  # Ensure multi-layer hooks exist for the selected backbone (ViT-S/+ has 12 blocks -> [0..11]).
+  backbone_layers:
+    indices_by_backbone:
+      dinov3_vits16plus: [2, 5, 8, 11]
+
+  # Based on v2: top candidates consistently preferred log-scale targets.
+  log_scale_targets: true
+
+tune:
+  name: tune-allheads-fold1-vits16plus-v1
+
+  # Stage-1 ASHA objective (per-epoch):
+  # - Use val_r2 because our Ray callback guarantees it is always present.
+  metric: val_r2
+  mode: max
+
+  # Default budget; override from CLI if you want a longer sweep.
+  num_samples: 500
+
+  # Keep Stage-1 single-seed so ASHA semantics stay clean.
+  seeds: [42]
+  report_per_epoch: true
+
+  scheduler:
+    type: asha
+    max_epochs: ${trainer.max_epochs}
+    grace_period: 10
+    reduction_factor: 2
+
+  two_stage:
+    enabled: true
+    # Prefer configs that are good at the end of the fixed budget (helps reduce peak->last mismatch).
+    scope: last
+    # Require trials to reach late epochs so early-pruned runs don't dominate promotion.
+    min_epoch: 20
+    top_n: 8
+    name_suffix: "-stage2-kfold"
+
+    # Stage-2 selection metric (full k-fold): align to the competition-style global baseline.
+    stage2_metric: val_r2_global
+    stage2_mode: max
+
+    train_overrides:
+      # Full k-fold in stage 2
+      kfold.enabled: true
+      kfold.k: 5
+      kfold.even_split: false
+      kfold.folds: null
+      kfold.group_by_date_state: true
+      # Keep train_all disabled (k-fold already covers the whole dataset across folds).
+      train_all.enabled: false
+      # Not used under k-fold, kept explicit.
+      data.val_split: 0.0
+      # Keep epoch budget consistent across stages by default.
+      trainer.max_epochs: ${trainer.max_epochs}
+      # Ensure stage-2 uses the same Kaggle-aligned loss knobs.
+      loss.metric_space: kaggle_log1p_grams
+      loss.normalize_by_train_log_var: true
+      model.log_scale_targets: true
+
+  # Search space: match tune_allheads_fold1_v2 but make it ViT-S+ (12 blocks) compatible.
+  # Keys are dotted paths into the training config.
+  search_space:
+    _delete_: true
+
+    # ---- Head type (multi-head) ----
+    model.head.type:
+      type: choice
+      values: [vitdet, mamba, mlp]
+
+    # ---- Backbone multi-layer fusion ----
+    model.backbone_layers.layer_fusion:
+      type: choice
+      values: [mean, learned]
+    # ViT-S/+ has 12 transformer blocks -> valid indices: [0..11]
+    model.backbone_layers.indices_by_backbone.dinov3_vits16plus:
+      type: choice
+      values:
+        - [11]
+        - [5, 11]
+        - [2, 5, 8, 11]     # default multi.yaml hooks
+        - [8, 9, 10, 11]    # last-4 blocks
+
+    # ---- Optimizer / scheduler ----
+    optimizer.lr:
+      type: loguniform
+      lower: 8.0e-06
+      upper: 6.0e-04
+    optimizer.weight_decay:
+      type: loguniform
+      lower: 1.0e-06
+      upper: 3.0e-03
+    scheduler.warmup_epochs:
+      type: choice
+      values: [0, 1, 3, 5]
+
+    # ---- Shared head knobs (apply across head types) ----
+    model.head.hidden_dims:
+      type: choice
+      values:
+        - []          # linear head
+        - [256]
+        - [512]
+        - [512, 256]
+    model.head.activation:
+      type: choice
+      values: [silu, relu]
+    model.head.dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.45
+    model.head.ratio_head_mode:
+      type: choice
+      values: [shared, separate_mlp]
+
+    # ---- ViTDet head ----
+    model.head.vitdet_dim:
+      type: choice
+      values: [256, 512]
+    model.head.vitdet_scale_factors:
+      type: choice
+      values:
+        - [2.0, 1.0, 0.5]
+        - [2.0, 1.0, 0.5, 0.25]
+
+    # ---- Mamba head (2D mixing) ----
+    model.head.mamba.dim:
+      type: choice
+      values: [192, 256, 320]
+    model.head.mamba.depth:
+      type: choice
+      values: [2, 3]
+    model.head.mamba.d_conv:
+      type: choice
+      values: [3, 5, 7]
+    model.head.mamba.bidirectional:
+      type: choice
+      values: [false, true]
+
+    # ---- LoRA / DoRA ----
+    peft.use_dora:
+      type: choice
+      values: [false, true]
+    peft.target_modules:
+      type: choice
+      values:
+        - [qkv]
+        - [qkv, proj]
+        - [qkv, proj, w1, w2, w3]
+    peft.r:
+      type: choice
+      values: [4, 8, 16]
+    peft.lora_alpha:
+      type: choice
+      values: [4, 8, 16, 32]
+    peft.lora_lr:
+      type: loguniform
+      lower: 3.0e-05
+      upper: 5.0e-03
+    peft.lora_dropout:
+      type: uniform
+      lower: 0.0
+      upper: 0.15
+    # ViT-S/+ has 12 blocks; keep last_k_blocks within [0..12] for safety.
+    peft.last_k_blocks:
+      type: choice
+      values: [4, 6, 8, 12]
+    peft.lora_llrd:
+      type: choice
+      values: [1.0, 0.8729858381132479, 0.8]
+
+    # ---- Manifold MixUp ----
+    data.augment.manifold_mixup.prob:
+      type: uniform
+      lower: 0.0
+      upper: 1.0
+    data.augment.manifold_mixup.alpha:
+      type: uniform
+      lower: 0.3
+      upper: 6.0
+    data.augment.manifold_mixup.detach_pair:
+      type: choice
+      values: [false, true]
+
+    # ---- Extra augmentation toggles (coarse) ----
+    data.augment.watermark.prob:
+      type: choice
+      values: [0.0, 0.1, 0.2, 0.3]
+    data.augment.light_spot.prob:
+      type: choice
+      values: [0.0, 0.1, 0.2, 0.3]
+    data.augment.gaussian_noise.prob:
+      type: choice
+      values: [0.0, 0.25, 0.5]
+    data.augment.gaussian_noise.std:
+      type: choice
+      values: [0.0, 0.005, 0.01, 0.02]
+    data.augment.random_erasing.p:
+      type: choice
+      values: [0.0, 0.1, 0.25]
+    data.augment.no_augment_prob:
+      type: choice
+      values: [0.0, 0.05, 0.1]
+
+    # ---- Optimization strategy ablations ----
+    mtl.enabled:
+      type: choice
+      values: [true, false]
+    pcgrad.enabled:
+      type: choice
+      values: [true, false]
+
+    # ---- Optional extra data (can help the 5D/ratio supervision; keep as coarse toggle) ----
+    irish_glass_clover.enabled:
+      type: choice
+      values: [false, true]
+    biomass_data.enabled:
+      type: choice
+      values: [false, true]
+

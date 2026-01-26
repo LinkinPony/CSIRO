@@ -37,7 +37,7 @@ kfold:
   # IMPORTANT:
   # - false: classic k-fold style (each sample should be validated once) -> enables OOF aggregation.
   # - true : for each fold, generate a fresh random ~50/50 split (NOT classic k-fold).
-  even_split: true
+  even_split: false
 
   # Default behavior in the main project: keep all samples from the same
   # (Sampling_Date, State) group in the same fold.

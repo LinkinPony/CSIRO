@@ -394,6 +394,9 @@ def train_single_split(
             [0.1, 0.1, 0.1, 0.2, 0.5],
         )
     )
+    # Optional metric-aligned loss configuration (Kaggle: weighted R^2 in log-space).
+    loss_metric_space = str(loss_cfg.get("metric_space", loss_cfg.get("loss_metric_space", "legacy")) or "legacy").strip()
+    normalize_by_train_log_var = bool(loss_cfg.get("normalize_by_train_log_var", True))
 
     # Multi-layer backbone / layer-wise head configuration (optional)
     backbone_layers_cfg = (
@@ -717,6 +720,9 @@ def train_single_split(
         # Keep ratio_kl_weight argument for checkpoint compatibility; it is not used for manual task weighting.
         enable_5d_loss=loss_5d_enabled,
         biomass_5d_weights=mse_5d_weights_per_target,
+        loss_metric_space=str(loss_metric_space),
+        loss_normalize_by_train_log_var=bool(normalize_by_train_log_var),
+        biomass_5d_log1p_var=list(getattr(dm, "biomass_5d_log1p_var", None) or []),
         # Multi-layer heads
         use_layerwise_heads=use_layerwise_heads,
         backbone_layer_indices=list(backbone_layer_indices)

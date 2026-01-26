@@ -18,7 +18,7 @@ data:
   val_batch_size: 1
   num_workers: 8
   prefetch_factor: 2
-  val_split: 0.2
+  val_split: 0.1
   shuffle: true
   target_order:
   - Dry_Total_g
@@ -219,8 +219,8 @@ data:
       value: random
     manifold_mixup:
       enabled: true
-      prob: 0.44560858743856546
-      alpha: 4.371168372869891
+      prob: 1.0
+      alpha: 2.0
       apply_on: tokens
       detach_pair: false
       mix_cls_token: false
@@ -273,45 +273,47 @@ model:
   embedding_dim: 1280
   log_scale_targets: false
   head:
-    type: mamba
-    vitdet_dim: 320
+    type: vitdet
+    vitdet_dim: 512
     vitdet_patch_size: 16
     vitdet_scale_factors:
     - 2.0
     - 1.0
     - 0.5
+    - 0.25
     hidden_dims:
-    - 512
-    - 256
+    - 1280
     activation: silu
-    dropout: 0.22994869958594497
-    ratio_head_mode: separate_mlp
+    dropout: 0.35
+    ratio_head_mode: shared
     use_output_softplus: true
     use_cls_token: false
     use_patch_reg3: false
     dual_branch:
       enabled: false
       alpha_init: 0.2
-    mamba:
-      dim: 384
-      depth: 4
-      patch_size: 16
-      d_conv: 5
-      bidirectional: false
-    torch_compile:
-      enabled: false
-      mode: max-autotune
   backbone_layers:
     enabled: true
     layer_fusion: learned
     separate_bottlenecks: true
     indices_by_backbone:
+      dinov3_vits16:
+      - 2
+      - 5
+      - 8
+      - 11
+      dinov3_vits16plus:
+      - 2
+      - 5
+      - 8
+      - 11
       dinov3_vitl16:
       - 5
       - 11
       - 17
       - 23
       dinov3_vith16plus:
+      - 12
       - 24
       - 31
       dinov3_vit7b16:
@@ -330,21 +332,22 @@ mtl:
   sample_ratio:
     ndvi_dense: 0.0
 train_all:
-  enabled: false
+  enabled: true
 peft:
   enabled: true
   method: lora
   use_dora: false
-  r: 8
-  lora_alpha: 8
-  lora_dropout: 0.1450966101813862
+  r: 4
+  lora_alpha: 16
+  lora_dropout: 0.03451400041698553
   init: true
-  last_k_blocks: 16
+  last_k_blocks: 12
   layers_pattern: blocks
-  target_modules: [qkv, proj, w1, w2, w3]
-  lora_lr: 0.0012325965417410531
+  target_modules:
+  - qkv
+  lora_lr: 0.0006858219996583702
   lora_weight_decay: 0.0
-  lora_llrd: 0.8729858381132479
+  lora_llrd: 0.86887955343612
   lora_group_size: 1
 loss:
   weighting: uw
@@ -358,8 +361,8 @@ loss:
   - 0.5
 optimizer:
   name: adamw
-  lr: 0.00022095538920779078
-  weight_decay: 0.00024947694000957083
+  lr: 0.0002241468265217848
+  weight_decay: 0.0029320551257249984
   uw_lr: 0.01
   uw_weight_decay: 0.0
   use_sam: false
@@ -386,15 +389,15 @@ pcgrad:
   exclude_tasks: []
 scheduler:
   name: cosine
-  warmup_epochs: 5
+  warmup_epochs: 0
   warmup_start_factor: 0.1
 kfold:
-  enabled: true
+  enabled: false
   k: 5
   even_split: false
   folds: null
 trainer:
-  max_epochs: 35
+  max_epochs: 45
   accelerator: auto
   devices: 1
   precision: 16-mixed
@@ -404,22 +407,22 @@ trainer:
   checkpoint:
     every_n_epochs: 1
   resume_from: null
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 8
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
   swa:
-    enabled: false
+    enabled: true
     adaptive_lrs: true
     swa_lrs: 0.0001
     auto_lrs: true
     freeze_lora: false
     freeze_lora_lr: 0.0
-    swa_epoch_start: 0.8
+    swa_epoch_start: 0.9
     annealing_epochs: 5
     annealing_strategy: cos
   ema:
-    enabled: true
-    decay: 0.992
+    enabled: false
+    decay: 0.999
     update_every_n_steps: 1
     start_step: 0
     eval_with_ema: true
@@ -430,4 +433,4 @@ logging:
   ckpt_dir: outputs/checkpoints
   use_loguru: true
 seed: 42
-version: tune-mamba-v7-69-lora
+version: tune-vitdet-v1-12h-56-10

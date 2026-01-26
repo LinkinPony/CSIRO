@@ -383,6 +383,65 @@ def _try_load_kfold_swa_metrics(
     return metrics_path, by_fold
 
 
+def _try_load_kfold_splits_from_image_run(
+    *,
+    repo_root: Path,
+    cfg_img: Dict[str, Any],
+    full_df: pd.DataFrame,
+    k: int,
+) -> tuple[Optional[Path], dict[int, tuple[np.ndarray, np.ndarray]]]:
+    """
+    Best-effort load the **exact** k-fold splits used by an image-model run:
+        outputs/<image_version>/folds/fold_<i>/{train,val}.csv
+
+    This is produced by `src/training/kfold_runner.py` and is the single source of truth
+    for leakage-free TabPFN CV when TabPFN X depends on per-fold head weights.
+    """
+    ver = str(cfg_img.get("version", "") or "").strip()
+    if not ver:
+        return None, {}
+
+    logging_cfg = dict(cfg_img.get("logging", {}) or {})
+    base_log_dir = resolve_under_repo(repo_root, str(logging_cfg.get("log_dir", "outputs") or "outputs"))
+    folds_root = (base_log_dir / ver / "folds").resolve()
+    if not folds_root.is_dir():
+        return folds_root, {}
+
+    # Build index lookup from the pivoted dataframe.
+    if not {"image_id", "image_path"}.issubset(set(full_df.columns)):
+        raise KeyError("Pivoted dataframe missing required columns: image_id, image_path")
+    key_df = full_df[["image_id", "image_path"]].copy()
+    key_df["__idx"] = np.arange(len(full_df), dtype=np.int64)
+
+    splits_by_fold: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for fold_idx in range(int(max(0, k))):
+        fold_dir = (folds_root / f"fold_{int(fold_idx)}").resolve()
+        train_csv = (fold_dir / "train.csv").resolve()
+        val_csv = (fold_dir / "val.csv").resolve()
+        if not (train_csv.is_file() and val_csv.is_file()):
+            continue
+
+        try:
+            tdf = pd.read_csv(str(train_csv))
+            vdf = pd.read_csv(str(val_csv))
+        except Exception:
+            continue
+
+        if not {"image_id", "image_path"}.issubset(set(tdf.columns)) or not {"image_id", "image_path"}.issubset(set(vdf.columns)):
+            continue
+
+        merged_train = tdf.merge(key_df, on=["image_id", "image_path"], how="inner")
+        merged_val = vdf.merge(key_df, on=["image_id", "image_path"], how="inner")
+        if len(merged_train) == 0 or len(merged_val) == 0:
+            continue
+
+        train_idx = merged_train["__idx"].to_numpy(dtype=np.int64, copy=False)
+        val_idx = merged_val["__idx"].to_numpy(dtype=np.int64, copy=False)
+        splits_by_fold[int(fold_idx)] = (train_idx, val_idx)
+
+    return folds_root, splits_by_fold
+
+
 def _resolve_versioned_dirs(
     *,
     repo_root: Path,
@@ -544,23 +603,47 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
     if not kfold_enabled and not train_all_enabled:
         raise SystemExit("Nothing to run: both `kfold.enabled` and `train_all.enabled` are false.")
 
-    # Resolve k-fold split knobs (only used when kfold_enabled=true).
+    # Resolve k-fold split knobs.
+    # NOTE: We prefer loading the image-run exported fold splits from:
+    #   outputs/<image_version>/folds/fold_<i>/{train,val}.csv
+    # to avoid any split mismatch / leakage when using per-fold head features.
     k_eff = int(args.k) if args.k is not None else int(kfold_cfg.get("k", 5))
     even_split_effective = bool(args.even_split) if args.even_split is not None else bool(kfold_cfg.get("even_split", False))
     group_by_date_state_effective = bool(args.group_by_date_state) if args.group_by_date_state is not None else bool(kfold_cfg.get("group_by_date_state", True))
 
-    splits: list[tuple[np.ndarray, np.ndarray]] = []
+    splits_source: str = "generated"
+    splits_by_fold: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     oof_pred: Optional[np.ndarray] = None
     val_counts = np.zeros((len(full_df),), dtype=np.int64)
     if kfold_enabled:
-        splits = build_kfold_splits(
-            full_df,
-            cfg,
-            k=k_eff,
-            even_split=even_split_effective,
-            group_by_date_state=group_by_date_state_effective,
-            seed=int(seed),
+        # 1) Preferred: load exported splits from the image run (single source of truth).
+        try:
+            img_kfold_cfg = dict(cfg_img.get("kfold", {}) or {})
+        except Exception:
+            img_kfold_cfg = {}
+        k_img = int(img_kfold_cfg.get("k", k_eff))
+        folds_root, loaded = _try_load_kfold_splits_from_image_run(
+            repo_root=repo_root, cfg_img=cfg_img, full_df=full_df, k=int(k_img)
         )
+        if loaded:
+            splits_by_fold = dict(loaded)
+            splits_source = f"image_run:{str(folds_root)}"
+            # Align reporting knobs with the image run (since splits come from there).
+            k_eff = int(k_img)
+            even_split_effective = bool(img_kfold_cfg.get("even_split", False))
+            group_by_date_state_effective = bool(img_kfold_cfg.get("group_by_date_state", True))
+        else:
+            # 2) Fallback: generate splits (legacy behaviour).
+            splits = build_kfold_splits(
+                full_df,
+                cfg,
+                k=k_eff,
+                even_split=even_split_effective,
+                group_by_date_state=group_by_date_state_effective,
+                seed=int(seed),
+            )
+            splits_by_fold = {int(i): s for i, s in enumerate(splits)}
+
         if even_split_effective:
             oof_pred = None
         else:
@@ -579,12 +662,13 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
     logger.info("Full pivoted samples: {}", len(full_df))
     if kfold_enabled:
         logger.info(
-            "Folds: {} (k={} even_split={} group_by_date_state={} split_seed={})",
-            len(splits),
+            "Folds: {} (k={} even_split={} group_by_date_state={} split_seed={} source={})",
+            len(splits_by_fold),
             int(k_eff),
             even_split_effective,
             group_by_date_state_effective,
             int(seed),
+            str(splits_source),
         )
     else:
         logger.info("Folds: (kfold disabled)")
@@ -662,10 +746,17 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
             }
         )
 
-    for fold_idx, (train_idx, val_idx) in enumerate(splits):
-        if args.max_folds is not None and fold_idx >= int(args.max_folds):
-            logger.info("Stopping early due to --max-folds={} (completed {} folds).", args.max_folds, fold_idx)
+    fold_keys = sorted(int(k) for k in splits_by_fold.keys())
+    for fold_pos, fold_idx in enumerate(fold_keys):
+        if args.max_folds is not None and fold_pos >= int(args.max_folds):
+            logger.info(
+                "Stopping early due to --max-folds={} (completed {} folds).",
+                args.max_folds,
+                fold_pos,
+            )
             break
+
+        train_idx, val_idx = splits_by_fold[int(fold_idx)]
 
         fold_log_dir = (log_dir / f"fold_{fold_idx}").resolve()
         fold_ckpt_dir = (ckpt_dir / f"fold_{fold_idx}").resolve()
@@ -916,7 +1007,7 @@ def run_tabpfn_cv(*, repo_root: Path, args: argparse.Namespace) -> Path:
         "targets_5d_order": list(TARGETS_5D_ORDER),
         "kfold": {
             "enabled": bool(kfold_enabled),
-            "k": int(len(splits)) if kfold_enabled else int(k_eff),
+            "k": int(len(splits_by_fold)) if kfold_enabled else int(k_eff),
             "even_split": bool(even_split_effective),
             "group_by_date_state": bool(group_by_date_state_effective),
         },

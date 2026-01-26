@@ -422,8 +422,15 @@ def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -
     if isinstance(model_cache_dir, str) and model_cache_dir.strip():
         os.environ["TABPFN_MODEL_CACHE_DIR"] = str((weights_dir / model_cache_dir.strip()).resolve())
 
-    # Import TabPFN + feature extractors
-    from src.inference.tabpfn import _import_tabpfn_regressor, extract_dinov3_cls_features, extract_head_penultimate_features
+    # Import TabPFN + feature extractors (+ stable hashing helpers for signature checks)
+    from src.inference.tabpfn import (
+        _fast_sha256_file,
+        _import_tabpfn_regressor,
+        _load_head_state_best_effort,
+        _sha256_file,
+        extract_dinov3_cls_features,
+        extract_head_penultimate_features,
+    )
 
     TabPFNRegressor = _import_tabpfn_regressor(
         tabpfn_python_path=str(tab_cfg.get("python_path", "") or "").strip(),
@@ -552,7 +559,10 @@ def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -
                 raise FileNotFoundError(f"[TABPFN][PKG] Cannot resolve DINO weights for ensemble model: {model_id!r}")
 
             base_tag = str(version).strip() if isinstance(version, (str, int, float)) and str(version).strip() else model_id
-            model_tag = safe_slug("__".join([base_tag, feature_mode, feature_fusion if feature_mode != "dinov3_only" else ""]))
+            parts = [str(base_tag), str(feature_mode)]
+            if feature_mode != "dinov3_only":
+                parts.append(str(feature_fusion))
+            model_tag = safe_slug("__".join([p for p in parts if str(p).strip()]))
             cache_train = str((train_cache_dir / f"train__{model_tag}.pt").resolve())
 
             models_eff.append(
@@ -563,6 +573,7 @@ def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -
                     "head_base": str(head_base),
                     "dino_weights_file": str(dino_weights_file),
                     "base_image_size_hw": tuple(base_image_size_hw),
+                    "model_tag": str(model_tag),
                     "cache_train": cache_train,
                 }
             )
@@ -626,12 +637,53 @@ def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -
         # Deduplicate while preserving order
         _seen = set()
         image_versions = [v for v in image_versions if not (v in _seen or _seen.add(v))]
+
+        # Strong signature tying fit-state <-> feature extractor weights.
+        # This prevents silently reusing a stale `tabpfn_fit/` after changing head/backbone weights.
+        train_feature_signatures: list[dict] = []
+        for mi in models_eff:
+            model_tag_i = str(mi.get("model_tag", "") or "").strip()
+            dino_w_i = str(mi.get("dino_weights_file", "") or "")
+            if not model_tag_i:
+                raise RuntimeError("[TABPFN][PKG] Missing model_tag for an ensemble model (cannot build signatures).")
+
+            dino_fast = _fast_sha256_file(dino_w_i)
+            if not dino_fast:
+                raise RuntimeError(f"[TABPFN][PKG] Failed to compute DINO weights fast sha256: {dino_w_i}")
+
+            head_sha = None
+            head_hint = None
+            if feature_mode != "dinov3_only":
+                head_pt_i, _st_i, _meta_i, _peft_i = _load_head_state_best_effort(
+                    project_dir_abs=str(weights_dir),
+                    cfg_train_yaml=dict(mi.get("cfg", {}) or {}),
+                    head_weights_pt_path=str(mi.get("head_base", "") or ""),
+                )
+                head_sha = _sha256_file(str(head_pt_i))
+                if not head_sha:
+                    raise RuntimeError(f"[TABPFN][PKG] Failed to compute head weights sha256: {head_pt_i}")
+                try:
+                    head_hint = os.path.relpath(str(head_pt_i), str(weights_dir))
+                except Exception:
+                    head_hint = str(head_pt_i)
+
+            train_feature_signatures.append(
+                {
+                    "model_tag": model_tag_i,
+                    "version": mi.get("version", None),
+                    "head_weights_sha256": (str(head_sha) if head_sha else None),
+                    "head_weights_path_hint": head_hint,
+                    "dino_weights_fast_sha256": str(dino_fast),
+                    "dino_weights_basename": os.path.basename(dino_w_i) if dino_w_i else None,
+                }
+            )
         _fit_and_save(
             X=X_train_all,
             y=y_train_all,
             meta_extra={
                 "image_versions": list(image_versions),
-                "ensemble_models": [{"version": m.get("version")} for m in models_eff],
+                "ensemble_models": [{"version": m.get("version"), "model_tag": m.get("model_tag")} for m in models_eff],
+                "train_feature_signatures": train_feature_signatures,
             },
         )
     else:
@@ -687,6 +739,36 @@ def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -
         if not (isinstance(X_train, np.ndarray) and X_train.ndim == 2 and X_train.shape[0] == len(train_image_paths)):
             raise RuntimeError(f"[TABPFN][PKG] Bad train feature array: shape={getattr(X_train, 'shape', None)}")
         image_version_single = str(cfg_img.get("version", "") or "").strip()
+
+        # Strong signature tying fit-state <-> feature extractor weights.
+        dino_fast = _fast_sha256_file(str(dino_weights_file))
+        if not dino_fast:
+            raise RuntimeError(f"[TABPFN][PKG] Failed to compute DINO weights fast sha256: {dino_weights_file}")
+        head_sha = None
+        head_hint = None
+        if feature_mode != "dinov3_only":
+            head_pt, _st, _meta, _peft = _load_head_state_best_effort(
+                project_dir_abs=str(weights_dir),
+                cfg_train_yaml=cfg_img,
+                head_weights_pt_path=str((weights_dir / "head").resolve()),
+            )
+            head_sha = _sha256_file(str(head_pt))
+            if not head_sha:
+                raise RuntimeError(f"[TABPFN][PKG] Failed to compute head weights sha256: {head_pt}")
+            try:
+                head_hint = os.path.relpath(str(head_pt), str(weights_dir))
+            except Exception:
+                head_hint = str(head_pt)
+        train_feature_signatures = [
+            {
+                "model_tag": "single",
+                "version": image_version_single if image_version_single else None,
+                "head_weights_sha256": (str(head_sha) if head_sha else None),
+                "head_weights_path_hint": head_hint,
+                "dino_weights_fast_sha256": str(dino_fast),
+                "dino_weights_basename": os.path.basename(str(dino_weights_file)),
+            }
+        ]
         _fit_and_save(
             X=X_train,
             y=y_train,
@@ -695,6 +777,7 @@ def _package_tabpfn_inference_artifacts(*, repo_root: Path, weights_dir: Path) -
                 "image_versions": ([image_version_single] if image_version_single else []),
                 # Legacy single-version key (kept for readability/backward-compat)
                 "image_version": (image_version_single if image_version_single else None),
+                "train_feature_signatures": train_feature_signatures,
             },
         )
 

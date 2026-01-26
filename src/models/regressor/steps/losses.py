@@ -379,25 +379,43 @@ class LossesMixin:
             y_5d_g_safe = torch.nan_to_num(y_5d_g_raw, nan=0.0, posinf=0.0, neginf=0.0)
             metrics_targets_5d = y_5d_g_safe.to(device=metrics_preds_5d.device, dtype=metrics_preds_5d.dtype)
 
-            y_5d_gm2 = y_5d_g_safe.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype) / float(self._area_m2)
-
-            pred_5d_input = pred_5d_gm2
-            target_5d_input = y_5d_gm2
-            if self.log_scale_targets:
-                pred_5d_input = torch.log1p(torch.clamp(pred_5d_input, min=0.0))
-                target_5d_input = torch.log1p(torch.clamp(target_5d_input, min=0.0))
-
-            if self._use_biomass_5d_zscore:
-                mean_5d = self._biomass_5d_mean.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype)  # type: ignore[union-attr]
-                std_5d = torch.clamp(
-                    self._biomass_5d_std.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype),  # type: ignore[union-attr]
-                    min=1e-8,
-                )
-                pred_5d = (pred_5d_input - mean_5d) / std_5d
-                target_5d = (target_5d_input - mean_5d) / std_5d
+            # ----------------------------------------------------------
+            # Loss space selection
+            #
+            # Kaggle metric (per `DESCRIPTION.md`) is R^2 computed in log-space.
+            # This repo's validation metric implements it as R^2 in log1p(grams).
+            #
+            # We therefore support an optional loss mode that computes the 5D MSE
+            # directly in log1p(grams), matching `EpochMetricsMixin`.
+            # ----------------------------------------------------------
+            metric_space = str(getattr(self, "loss_metric_space", "legacy") or "legacy").strip().lower()
+            if metric_space in ("kaggle_log1p_grams", "kaggle_log1p", "log1p_grams"):
+                # Metric-aligned space: log1p(grams)
+                pred_5d = torch.log1p(metrics_preds_5d.clamp_min(0.0))
+                target_5d = torch.log1p(metrics_targets_5d.clamp_min(0.0))
             else:
-                pred_5d = pred_5d_input
-                target_5d = target_5d_input
+                # Legacy/training space: g/m^2 (optionally log1p + optional 5D z-score)
+                y_5d_gm2 = (
+                    y_5d_g_safe.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype) / float(self._area_m2)
+                )
+
+                pred_5d_input = pred_5d_gm2
+                target_5d_input = y_5d_gm2
+                if self.log_scale_targets:
+                    pred_5d_input = torch.log1p(torch.clamp(pred_5d_input, min=0.0))
+                    target_5d_input = torch.log1p(torch.clamp(target_5d_input, min=0.0))
+
+                if self._use_biomass_5d_zscore:
+                    mean_5d = self._biomass_5d_mean.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype)  # type: ignore[union-attr]
+                    std_5d = torch.clamp(
+                        self._biomass_5d_std.to(device=pred_5d_gm2.device, dtype=pred_5d_gm2.dtype),  # type: ignore[union-attr]
+                        min=1e-8,
+                    )
+                    pred_5d = (pred_5d_input - mean_5d) / std_5d
+                    target_5d = (target_5d_input - mean_5d) / std_5d
+                else:
+                    pred_5d = pred_5d_input
+                    target_5d = target_5d_input
 
             w = self.biomass_5d_weights.to(device=pred_5d.device, dtype=pred_5d.dtype)  # (5,)
             m5 = mask_5d.to(device=pred_5d.device, dtype=pred_5d.dtype)
@@ -410,14 +428,38 @@ class LossesMixin:
             per_dim_den_raw = m5.sum(dim=0)
             per_dim_den = per_dim_den_raw.clamp_min(1.0)
             mse_per_dim = diff2_5d.sum(dim=0) / per_dim_den  # (5,)
-            mse_5d_per_dim = mse_per_dim
+            # Optional normalization to approximate weighted R^2:
+            # minimize SSE_k / SST_k ≈ MSE_k / Var_k in the metric space.
+            mse_per_dim_eff = mse_per_dim
+            normalize_var = (
+                metric_space in ("kaggle_log1p_grams", "kaggle_log1p", "log1p_grams")
+                and bool(getattr(self, "loss_normalize_by_train_log_var", True))
+            )
+            if bool(normalize_var):
+                try:
+                    var = getattr(self, "biomass_5d_log1p_var", None)
+                except Exception:
+                    var = None
+                if isinstance(var, torch.Tensor) and var.dim() == 1 and int(var.numel()) == 5:
+                    inv_var = 1.0 / var.to(device=mse_per_dim.device, dtype=mse_per_dim.dtype).clamp_min(1e-8)
+                    mse_per_dim_eff = mse_per_dim * inv_var
+
+            mse_5d_per_dim = mse_per_dim_eff
             valid_weight = w * (per_dim_den_raw > 0).to(dtype=w.dtype)
             total_w = valid_weight.sum().clamp_min(1e-8)
-            loss_5d = (valid_weight * mse_per_dim).sum() / total_w
+            loss_5d = (valid_weight * mse_per_dim_eff).sum() / total_w
 
             names_5d = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"]
             for i, name in enumerate(names_5d):
                 _log(f"{stage}_mse_5d_{name}", mse_per_dim[i], on_step=False, on_epoch=True, prog_bar=False)
+                if bool(normalize_var):
+                    _log(
+                        f"{stage}_mse_5d_norm_{name}",
+                        mse_per_dim_eff[i],
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=False,
+                    )
             _log(f"{stage}_loss_5d_weighted", loss_5d, on_step=False, on_epoch=True, prog_bar=False)
 
         # Aggregate reg3-related losses for logging

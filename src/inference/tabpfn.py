@@ -162,6 +162,57 @@ def _file_fingerprint(path: str) -> dict:
         return {"size": None, "mtime_ns": None}
 
 
+def _sha256_file(path: str, *, chunk_size: int = 1024 * 1024) -> Optional[str]:
+    """
+    Stable content hash for small-ish files (e.g., head weights).
+
+    Returns None on failure.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(int(chunk_size))
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _fast_sha256_file(path: str, *, head_bytes: int = 1024 * 1024, tail_bytes: int = 1024 * 1024) -> Optional[str]:
+    """
+    Stable *cheap* content hash for large files (e.g., DINOv3 backbone weights).
+
+    We hash:
+      sha256( <size_bytes> + <head_bytes> + <tail_bytes> )
+
+    Returns None on failure.
+    """
+    try:
+        st = os.stat(path)
+        size = int(getattr(st, "st_size", 0) or 0)
+        hb = max(0, int(head_bytes))
+        tb = max(0, int(tail_bytes))
+        h = hashlib.sha256()
+        h.update(str(size).encode("utf-8"))
+        with open(path, "rb") as f:
+            head = f.read(hb) if hb > 0 else b""
+            h.update(head)
+            tail = b""
+            if tb > 0 and size > 0:
+                try:
+                    f.seek(max(0, size - tb))
+                    tail = f.read(tb)
+                except Exception:
+                    tail = b""
+            h.update(tail)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 def _stable_json_sha256(obj: dict) -> str:
     """
     Deterministic hash for small dicts (e.g., head meta) used in cache invalidation.
@@ -235,6 +286,7 @@ def _load_tabpfn_predictor_from_fit_state(
     subdir: str,
     expected_targets: list[str],
     expected_image_versions: Optional[list[str]] = None,
+    expected_feature_signatures: Optional[list[dict]] = None,
 ) -> _TabPFNMultiOutputPredictor:
     """
     Load a packaged multi-output TabPFN predictor from:
@@ -297,6 +349,62 @@ def _load_tabpfn_predictor_from_fit_state(
             raise RuntimeError(
                 f"TabPFN fit-state version mismatch: fit_state={sorted(set(have))} vs current={sorted(set(want))}"
             )
+
+        # Strong compatibility check: ensure the packaged fit-state was trained using the
+        # same *weights / feature extractor* that will be used for inference right now.
+        #
+        # This prevents a subtle but common failure mode:
+        #   - user changes head weights / backbone weights
+        #   - but reuses an old `tabpfn_fit/` (fit-state)
+        # which can silently degrade Kaggle leaderboard performance.
+        exp_sigs = list(expected_feature_signatures or [])
+        if exp_sigs:
+            have_sigs = meta.get("train_feature_signatures", None)
+            if not isinstance(have_sigs, list) or not have_sigs:
+                raise RuntimeError(
+                    "TabPFN fit-state meta.json is missing `train_feature_signatures`, so weight/feature compatibility cannot be verified"
+                )
+            have_sigs = [s for s in have_sigs if isinstance(s, dict)]
+            if not have_sigs:
+                raise RuntimeError(
+                    "TabPFN fit-state meta.json has an invalid/empty `train_feature_signatures` (expected a non-empty list of dicts)"
+                )
+
+            by_tag: dict[str, dict] = {}
+            for rec in have_sigs:
+                tag = str(rec.get("model_tag", "") or "").strip()
+                if tag:
+                    by_tag[tag] = rec
+
+            def _pick_rec(i: int, exp: dict) -> dict:
+                tag = str(exp.get("model_tag", "") or "").strip()
+                if tag and tag in by_tag:
+                    return by_tag[tag]
+                # Fallback to positional matching (single-model).
+                if i < len(have_sigs):
+                    return have_sigs[i]
+                return {}
+
+            for i, exp in enumerate(exp_sigs):
+                if not isinstance(exp, dict):
+                    continue
+                rec = _pick_rec(i, exp)
+                if not rec:
+                    raise RuntimeError(
+                        f"TabPFN fit-state meta.json is missing a required train_feature_signatures entry (idx={i}, model_tag={exp.get('model_tag', None)!r})"
+                    )
+
+                # Compare stable hashes (prefer sha256 / fast-sha256; do NOT rely on mtime).
+                for key in ("head_weights_sha256", "dino_weights_fast_sha256"):
+                    want_v = exp.get(key, None)
+                    have_v = rec.get(key, None)
+                    if want_v is None or have_v is None:
+                        # Allow legacy fit-states to load without this stronger check.
+                        continue
+                    if str(want_v).strip() and str(have_v).strip() and str(want_v).strip() != str(have_v).strip():
+                        raise RuntimeError(
+                            f"TabPFN fit-state {key} mismatch: fit_state={str(have_v)[:12]}... vs current={str(want_v)[:12]}..."
+                        )
     except Exception as e:
         raise RuntimeError(
             str(e)
@@ -447,6 +555,125 @@ def _derive_shard_cache_path(cache_path: str, shard_id: int) -> str:
     return f"{root}__shard{int(shard_id)}{ext_eff}"
 
 
+def _load_head_state_best_effort(
+    *,
+    project_dir_abs: str,
+    cfg_train_yaml: dict,
+    head_weights_pt_path: str,
+) -> tuple[str, dict, dict, Optional[dict]]:
+    """
+    Resolve + load a head checkpoint using the **same semantics** as TabPFN feature extraction.
+
+    Returns:
+        (head_pt_abs, head_state_dict, head_meta_dict, peft_payload_or_none)
+    """
+    from src.inference.paths import resolve_path_best_effort
+    from src.inference.torch_load import load_head_state
+
+    # Resolve + load head weights (accept file or directory).
+    head_base = str(head_weights_pt_path or "").strip()
+    if not head_base:
+        raise FileNotFoundError("head_weights_pt_path is empty (cannot load head weights).")
+    head_base_abs = resolve_path_best_effort(str(project_dir_abs), head_base) if project_dir_abs else os.path.abspath(head_base)
+
+    head_candidates: list[str] = []
+    if os.path.isfile(head_base_abs):
+        head_candidates.append(head_base_abs)
+    elif os.path.isdir(head_base_abs):
+        # 1) Prefer packaged single-head file
+        cand = os.path.join(head_base_abs, "infer_head.pt")
+        if os.path.isfile(cand):
+            head_candidates.append(cand)
+        # 2) Per-fold packaged heads
+        try:
+            for name in sorted(os.listdir(head_base_abs)):
+                if name.startswith("fold_"):
+                    c = os.path.join(head_base_abs, name, "infer_head.pt")
+                    if os.path.isfile(c):
+                        head_candidates.append(c)
+        except Exception:
+            pass
+        # 3) Any .pt directly under directory
+        try:
+            pts = [os.path.join(head_base_abs, n) for n in os.listdir(head_base_abs) if n.endswith(".pt")]
+            pts.sort()
+            head_candidates.extend([p for p in pts if p not in head_candidates])
+        except Exception:
+            pass
+    else:
+        raise FileNotFoundError(f"Head weights path not found: {head_base_abs}")
+
+    head_pt: Optional[str] = None
+    head_state: Optional[dict] = None
+    head_meta: Optional[dict] = None
+    peft_payload: Optional[dict] = None
+    last_err: Optional[Exception] = None
+
+    for cand in head_candidates:
+        try:
+            st, meta, peft = load_head_state(str(cand))
+            head_pt = str(cand)
+            head_state, head_meta, peft_payload = st, (meta if isinstance(meta, dict) else {}), peft  # type: ignore[assignment]
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    # Fallback: latest per-epoch head checkpoint from outputs/checkpoints/<version>/...
+    if head_pt is None or head_state is None or head_meta is None:
+        ver = str(cfg_train_yaml.get("version", "") or "").strip()
+        fb_dirs: list[str] = []
+        if ver and project_dir_abs:
+            fb_dirs.append(os.path.join(project_dir_abs, "outputs", "checkpoints", ver, "train_all", "head"))
+            fb_dirs.append(os.path.join(project_dir_abs, "outputs", "checkpoints", ver, "head"))
+
+        def _epoch_num(path: str) -> int:
+            import re
+
+            m = re.search(r"head-epoch(\\d+)", os.path.basename(path))
+            if not m:
+                return -1
+            try:
+                return int(m.group(1))
+            except Exception:
+                return -1
+
+        fb_files: list[str] = []
+        for d in fb_dirs:
+            if not os.path.isdir(d):
+                continue
+            try:
+                for n in os.listdir(d):
+                    if n.startswith("head-epoch") and n.endswith(".pt"):
+                        fb_files.append(os.path.join(d, n))
+            except Exception:
+                continue
+
+        fb_files = [p for p in fb_files if os.path.isfile(p)]
+        fb_files.sort(key=lambda p: (_epoch_num(p), os.path.getmtime(p) if os.path.exists(p) else 0.0))
+
+        for cand in reversed(fb_files):
+            try:
+                st, meta, peft = load_head_state(str(cand))
+                head_pt = str(cand)
+                head_state, head_meta, peft_payload = st, (meta if isinstance(meta, dict) else {}), peft  # type: ignore[assignment]
+                print(f"[TABPFN][WARN] Falling back to loadable head checkpoint: {head_pt}")
+                break
+            except Exception as e:
+                last_err = e
+                continue
+
+    if head_pt is None or head_state is None or head_meta is None:
+        raise RuntimeError(
+            "Failed to load any head checkpoint. "
+            f"head_weights_pt_path={head_weights_pt_path!r} resolved={head_base_abs!r}. "
+            f"Last error: {last_err}"
+        )
+
+    head_meta = dict(head_meta or {})
+    return os.path.abspath(str(head_pt)), dict(head_state), head_meta, peft_payload
+
+
 def _extract_head_penultimate_features_2gpu_worker(q, shard_id: int, device_id: int, payload: dict) -> None:
     """
     Worker for 2-GPU data-parallel feature extraction (head penultimate).
@@ -532,7 +759,6 @@ def extract_head_penultimate_features(
 
     from src.inference.data import TestImageDataset, build_transforms
     from src.inference.paths import resolve_path_best_effort
-    from src.inference.torch_load import load_head_state
     from src.models.backbone import build_feature_extractor
     from src.models.head_builder import DualBranchHeadExport, MultiLayerHeadExport, build_head_layer
     from src.models.vitdet_head import ViTDetHeadConfig, ViTDetMultiLayerScalarHead, ViTDetScalarHead
@@ -545,106 +771,11 @@ def extract_head_penultimate_features(
     dataset_root_abs = os.path.abspath(dataset_root) if dataset_root else ""
 
     # Resolve + load head weights (accept file or directory).
-    head_base = str(head_weights_pt_path or "").strip()
-    if not head_base:
-        raise FileNotFoundError("head_weights_pt_path is empty (cannot load head weights).")
-    head_base_abs = resolve_path_best_effort(project_dir_abs, head_base)
-
-    head_candidates: List[str] = []
-    if os.path.isfile(head_base_abs):
-        head_candidates.append(head_base_abs)
-    elif os.path.isdir(head_base_abs):
-        # 1) Prefer packaged single-head file
-        cand = os.path.join(head_base_abs, "infer_head.pt")
-        if os.path.isfile(cand):
-            head_candidates.append(cand)
-        # 2) Per-fold packaged heads
-        try:
-            for name in sorted(os.listdir(head_base_abs)):
-                if name.startswith("fold_"):
-                    c = os.path.join(head_base_abs, name, "infer_head.pt")
-                    if os.path.isfile(c):
-                        head_candidates.append(c)
-        except Exception:
-            pass
-        # 3) Any .pt directly under directory
-        try:
-            pts = [os.path.join(head_base_abs, n) for n in os.listdir(head_base_abs) if n.endswith(".pt")]
-            pts.sort()
-            head_candidates.extend([p for p in pts if p not in head_candidates])
-        except Exception:
-            pass
-    else:
-        raise FileNotFoundError(f"Head weights path not found: {head_base_abs}")
-
-    head_pt: Optional[str] = None
-    head_state: Optional[dict] = None
-    head_meta: Optional[dict] = None
-    peft_payload: Optional[dict] = None
-    last_err: Optional[Exception] = None
-
-    for cand in head_candidates:
-        try:
-            st, meta, peft = load_head_state(str(cand))
-            head_pt = str(cand)
-            head_state, head_meta, peft_payload = st, (meta if isinstance(meta, dict) else {}), peft  # type: ignore[assignment]
-            break
-        except Exception as e:
-            last_err = e
-            continue
-
-    # Fallback: latest per-epoch head checkpoint from outputs/checkpoints/<version>/...
-    if head_pt is None or head_state is None or head_meta is None:
-        ver = str(cfg_train_yaml.get("version", "") or "").strip()
-        fb_dirs: List[str] = []
-        if ver and project_dir_abs:
-            fb_dirs.append(os.path.join(project_dir_abs, "outputs", "checkpoints", ver, "train_all", "head"))
-            fb_dirs.append(os.path.join(project_dir_abs, "outputs", "checkpoints", ver, "head"))
-
-        def _epoch_num(path: str) -> int:
-            import re
-
-            m = re.search(r"head-epoch(\\d+)", os.path.basename(path))
-            if not m:
-                return -1
-            try:
-                return int(m.group(1))
-            except Exception:
-                return -1
-
-        fb_files: List[str] = []
-        for d in fb_dirs:
-            if not os.path.isdir(d):
-                continue
-            try:
-                for n in os.listdir(d):
-                    if n.startswith("head-epoch") and n.endswith(".pt"):
-                        fb_files.append(os.path.join(d, n))
-            except Exception:
-                continue
-
-        fb_files = [p for p in fb_files if os.path.isfile(p)]
-        fb_files.sort(key=lambda p: (_epoch_num(p), os.path.getmtime(p) if os.path.exists(p) else 0.0))
-
-        for cand in reversed(fb_files):
-            try:
-                st, meta, peft = load_head_state(str(cand))
-                head_pt = str(cand)
-                head_state, head_meta, peft_payload = st, (meta if isinstance(meta, dict) else {}), peft  # type: ignore[assignment]
-                print(f"[TABPFN][WARN] Falling back to loadable head checkpoint: {head_pt}")
-                break
-            except Exception as e:
-                last_err = e
-                continue
-
-    if head_pt is None or head_state is None or head_meta is None:
-        raise RuntimeError(
-            "Failed to load any head checkpoint. "
-            f"head_weights_pt_path={head_weights_pt_path!r} resolved={head_base_abs!r}. "
-            f"Last error: {last_err}"
-        )
-
-    head_meta = dict(head_meta or {})
+    head_pt, head_state, head_meta, peft_payload = _load_head_state_best_effort(
+        project_dir_abs=str(project_dir_abs),
+        cfg_train_yaml=cfg_train_yaml,
+        head_weights_pt_path=str(head_weights_pt_path),
+    )
     head_type = str(head_meta.get("head_type", "mlp") or "mlp").strip().lower()
     if head_type not in ("mlp", "vitdet", "eomt"):
         raise RuntimeError(
@@ -688,24 +819,42 @@ def extract_head_penultimate_features(
                     feats = obj["features"]
                     cached_meta = dict(obj.get("meta", {}) or {})
                     cfg_ver = _cfg_version(cfg_train_yaml)
-                    head_fp = _file_fingerprint(str(head_pt))
-                    dino_fp = _file_fingerprint(str(dino_weights_pt_file))
                     head_meta_sig = _stable_json_sha256(head_meta)
+                    # Prefer stable hashes when available (portable across packaging/unpacking),
+                    # otherwise fall back to cheap (size, mtime_ns) fingerprints.
+                    head_sha = _sha256_file(str(head_pt))
+                    dino_fast = _fast_sha256_file(str(dino_weights_pt_file))
+                    cached_head_sha = str(cached_meta.get("head_weights_sha256", "") or "").strip()
+                    cached_dino_fast = str(cached_meta.get("dino_weights_fast_sha256", "") or "").strip()
+                    if cached_head_sha:
+                        head_ok = head_sha is not None and str(head_sha) == cached_head_sha
+                    else:
+                        head_fp = _file_fingerprint(str(head_pt))
+                        head_ok = (
+                            str(cached_meta.get("head_weights_path", "")) == str(head_pt)
+                            and dict(cached_meta.get("head_weights_fingerprint", {}) or {}) == dict(head_fp)
+                        )
+                    if cached_dino_fast:
+                        dino_ok = dino_fast is not None and str(dino_fast) == cached_dino_fast
+                    else:
+                        dino_fp = _file_fingerprint(str(dino_weights_pt_file))
+                        dino_ok = (
+                            str(cached_meta.get("dino_weights_pt_file", "")) == str(dino_weights_pt_file)
+                            and dict(cached_meta.get("dino_weights_fingerprint", {}) or {}) == dict(dino_fp)
+                        )
                     if (
                         cached_paths == list(image_paths)
                         and isinstance(feats, torch.Tensor)
                         and feats.dim() == 2
                         and str(cached_meta.get("cfg_version", "")) == str(cfg_ver)
-                        and str(cached_meta.get("head_weights_path", "")) == str(head_pt)
-                        and dict(cached_meta.get("head_weights_fingerprint", {}) or {}) == dict(head_fp)
                         and str(cached_meta.get("head_type", "")) == str(head_type)
                         and str(cached_meta.get("head_meta_sha256", "")) == str(head_meta_sig)
-                        and str(cached_meta.get("dino_weights_pt_file", "")) == str(dino_weights_pt_file)
-                        and dict(cached_meta.get("dino_weights_fingerprint", {}) or {}) == dict(dino_fp)
                         and str(cached_meta.get("fusion", "")) == str(fusion_eff)
                         and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
                         and bool(cached_meta.get("hflip", False)) == bool(hflip)
                         and bool(cached_meta.get("vflip", False)) == bool(vflip)
+                        and bool(head_ok)
+                        and bool(dino_ok)
                     ):
                         return cached_paths, feats.cpu().numpy()
             except Exception:
@@ -792,6 +941,8 @@ def extract_head_penultimate_features(
                         head_fp = _file_fingerprint(str(head_pt))
                         dino_fp = _file_fingerprint(str(dino_weights_pt_file))
                         head_meta_sig = _stable_json_sha256(head_meta)
+                        head_sha = _sha256_file(str(head_pt))
+                        dino_fast = _fast_sha256_file(str(dino_weights_pt_file))
                         torch.save(
                             {
                                 "image_paths": list(image_paths),
@@ -802,9 +953,11 @@ def extract_head_penultimate_features(
                                     "head_type": head_type,
                                     "head_weights_path": str(head_pt),
                                     "head_weights_fingerprint": dict(head_fp),
+                                    "head_weights_sha256": (str(head_sha) if head_sha else None),
                                     "head_meta_sha256": str(head_meta_sig),
                                     "dino_weights_pt_file": str(dino_weights_pt_file),
                                     "dino_weights_fingerprint": dict(dino_fp),
+                                    "dino_weights_fast_sha256": (str(dino_fast) if dino_fast else None),
                                     "fusion": str(fusion_eff),
                                     "image_size": tuple(image_size),
                                     "hflip": bool(hflip),
@@ -1212,6 +1365,8 @@ def extract_head_penultimate_features(
             head_fp = _file_fingerprint(str(head_pt))
             dino_fp = _file_fingerprint(str(dino_weights_pt_file))
             head_meta_sig = _stable_json_sha256(head_meta)
+            head_sha = _sha256_file(str(head_pt))
+            dino_fast = _fast_sha256_file(str(dino_weights_pt_file))
             torch.save(
                 {
                     "image_paths": list(image_paths),
@@ -1222,9 +1377,11 @@ def extract_head_penultimate_features(
                         "head_type": head_type,
                         "head_weights_path": str(head_pt),
                         "head_weights_fingerprint": dict(head_fp),
+                        "head_weights_sha256": (str(head_sha) if head_sha else None),
                         "head_meta_sha256": str(head_meta_sig),
                         "dino_weights_pt_file": str(dino_weights_pt_file),
                         "dino_weights_fingerprint": dict(dino_fp),
+                        "dino_weights_fast_sha256": (str(dino_fast) if dino_fast else None),
                         "fusion": str(fusion_eff),
                         "image_size": tuple(image_size),
                         "hflip": bool(hflip),
@@ -1309,19 +1466,27 @@ def extract_dinov3_cls_features(
                     feats = obj["features"]
                     cached_meta = dict(obj.get("meta", {}) or {})
                     cfg_ver = _cfg_version(cfg_train_yaml)
-                    w_fp = _file_fingerprint(str(dino_weights_pt_file))
+                    w_fast = _fast_sha256_file(str(dino_weights_pt_file))
+                    cached_fast = str(cached_meta.get("weights_fast_sha256", "") or "").strip()
+                    if cached_fast:
+                        w_ok = w_fast is not None and str(w_fast) == cached_fast
+                    else:
+                        w_fp = _file_fingerprint(str(dino_weights_pt_file))
+                        w_ok = (
+                            str(cached_meta.get("weights_path", "")) == str(dino_weights_pt_file)
+                            and dict(cached_meta.get("weights_fingerprint", {}) or {}) == dict(w_fp)
+                        )
                     if (
                         cached_paths == list(image_paths)
                         and isinstance(feats, torch.Tensor)
                         and feats.dim() == 2
                         and str(cached_meta.get("mode", "")) == "dinov3_only"
                         and str(cached_meta.get("backbone", "")) == str(backbone_name)
-                        and str(cached_meta.get("weights_path", "")) == str(dino_weights_pt_file)
-                        and dict(cached_meta.get("weights_fingerprint", {}) or {}) == dict(w_fp)
                         and str(cached_meta.get("cfg_version", "")) == str(cfg_ver)
                         and tuple(cached_meta.get("image_size", ())) == tuple(image_size)
                         and bool(cached_meta.get("hflip", False)) == bool(hflip)
                         and bool(cached_meta.get("vflip", False)) == bool(vflip)
+                        and bool(w_ok)
                     ):
                         return cached_paths, feats.cpu().numpy()
             except Exception:
@@ -1404,6 +1569,7 @@ def extract_dinov3_cls_features(
                         os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
                         cfg_ver = _cfg_version(cfg_train_yaml)
                         w_fp = _file_fingerprint(str(dino_weights_pt_file))
+                        w_fast = _fast_sha256_file(str(dino_weights_pt_file))
                         torch.save(
                             {
                                 "image_paths": list(image_paths),
@@ -1415,6 +1581,7 @@ def extract_dinov3_cls_features(
                                     "backbone": str(backbone_name),
                                     "weights_path": str(dino_weights_pt_file),
                                     "weights_fingerprint": dict(w_fp),
+                                    "weights_fast_sha256": (str(w_fast) if w_fast else None),
                                     "image_size": tuple(image_size),
                                     "hflip": bool(hflip),
                                     "vflip": bool(vflip),
@@ -1478,6 +1645,7 @@ def extract_dinov3_cls_features(
             os.makedirs(os.path.dirname(cache_path_eff), exist_ok=True)
             cfg_ver = _cfg_version(cfg_train_yaml)
             w_fp = _file_fingerprint(str(dino_weights_pt_file))
+            w_fast = _fast_sha256_file(str(dino_weights_pt_file))
             torch.save(
                 {
                     "image_paths": list(image_paths),
@@ -1489,6 +1657,7 @@ def extract_dinov3_cls_features(
                         "backbone": str(backbone_name),
                         "weights_path": str(dino_weights_pt_file),
                         "weights_fingerprint": dict(w_fp),
+                        "weights_fast_sha256": (str(w_fast) if w_fast else None),
                         "image_size": tuple(image_size),
                         "hflip": bool(hflip),
                         "vflip": bool(vflip),
@@ -1745,6 +1914,35 @@ def run_tabpfn_submission(
         # Load packaged ensemble fit-state (no online fitting).
         from src.metrics import TARGETS_5D_ORDER
 
+        # Compute a stable signature of the *current* feature extractor weights (head + DINO)
+        # and require the packaged fit-state to match. This prevents silently using a stale
+        # `tabpfn_fit/` after changing head weights or backbone weights.
+        expected_sigs: list[dict] = []
+        for mi in models_eff:
+            model_tag_i = str(mi.get("model_tag", "") or "").strip()
+            if not model_tag_i:
+                continue
+            dino_fast = _fast_sha256_file(str(mi.get("dino_weights_file", "") or ""))
+            if not dino_fast:
+                raise RuntimeError(f"Failed to compute DINO weights fast sha256 for model_tag={model_tag_i!r}")
+            head_sha: Optional[str] = None
+            if feature_mode != "dinov3_only":
+                head_pt_i, _st_i, _meta_i, _peft_i = _load_head_state_best_effort(
+                    project_dir_abs=str(project_dir_abs),
+                    cfg_train_yaml=dict(mi.get("cfg", {}) or {}),
+                    head_weights_pt_path=str(mi.get("head_base", "") or ""),
+                )
+                head_sha = _sha256_file(str(head_pt_i))
+                if not head_sha:
+                    raise RuntimeError(f"Failed to compute head weights sha256 for model_tag={model_tag_i!r}")
+            expected_sigs.append(
+                {
+                    "model_tag": str(model_tag_i),
+                    "head_weights_sha256": (str(head_sha) if head_sha else None),
+                    "dino_weights_fast_sha256": str(dino_fast),
+                }
+            )
+
         predictor = _load_tabpfn_predictor_from_fit_state(
             project_dir_abs=project_dir_abs,
             tabpfn=tabpfn,
@@ -1755,6 +1953,7 @@ def run_tabpfn_submission(
                 for mi in models_eff
                 if isinstance(mi.get("version", None), str) and str(mi.get("version")).strip()
             ],
+            expected_feature_signatures=expected_sigs,
         )
         D_ref: Optional[int] = None
 
@@ -1899,19 +2098,43 @@ def run_tabpfn_submission(
     from src.metrics import TARGETS_5D_ORDER
 
     # Load packaged single-model fit-state (no online fitting).
+    feature_mode = str(getattr(tabpfn, "feature_mode", "head_penultimate") or "head_penultimate").strip().lower()
+    if feature_mode not in ("head_penultimate", "dinov3_only"):
+        raise ValueError(f"Unsupported TabPFN feature_mode: {feature_mode!r} (expected 'head_penultimate' or 'dinov3_only')")
+
+    dino_fast = _fast_sha256_file(str(dino_weights_file))
+    if not dino_fast:
+        raise RuntimeError("Failed to compute DINO weights fast sha256 for single-model TabPFN inference")
+    head_sha: Optional[str] = None
+    if feature_mode != "dinov3_only":
+        head_pt, _st, _meta, _peft = _load_head_state_best_effort(
+            project_dir_abs=str(project_dir_abs),
+            cfg_train_yaml=cfg,
+            head_weights_pt_path=str(settings.head_weights_pt_path),
+        )
+        head_sha = _sha256_file(str(head_pt))
+        if not head_sha:
+            raise RuntimeError("Failed to compute head weights sha256 for single-model TabPFN inference")
+
+    expected_sigs = [
+        {
+            "model_tag": "single",
+            "head_weights_sha256": (str(head_sha) if head_sha else None),
+            "dino_weights_fast_sha256": str(dino_fast),
+        }
+    ]
+
     predictor = _load_tabpfn_predictor_from_fit_state(
         project_dir_abs=project_dir_abs,
         tabpfn=tabpfn,
         subdir="single",
         expected_targets=list(TARGETS_5D_ORDER),
         expected_image_versions=[cfg_version] if cfg_version else None,
+        expected_feature_signatures=expected_sigs,
     )
 
     print("[TABPFN] Loaded packaged fit-state (single).")
     print("[TABPFN] DINO weights:", dino_weights_file)
-    feature_mode = str(getattr(tabpfn, "feature_mode", "head_penultimate") or "head_penultimate").strip().lower()
-    if feature_mode not in ("head_penultimate", "dinov3_only"):
-        raise ValueError(f"Unsupported TabPFN feature_mode: {feature_mode!r} (expected 'head_penultimate' or 'dinov3_only')")
 
     if feature_mode == "dinov3_only":
         print("[TABPFN] Feature mode: dinov3_only (CLS token; no head)")

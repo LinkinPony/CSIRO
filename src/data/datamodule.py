@@ -509,6 +509,10 @@ class PastureDataModule(LightningDataModule):
         # [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
         self._biomass_5d_mean: Optional[List[float]] = None
         self._biomass_5d_std: Optional[List[float]] = None
+        # Optional Kaggle-metric helper: per-dimension variance in log1p(grams) space,
+        # aligned with the competition's evaluation (R^2 in log-space).
+        # Order: [Dry_Clover_g, Dry_Dead_g, Dry_Green_g, GDM_g, Dry_Total_g]
+        self._biomass_5d_log1p_var: Optional[List[float]] = None
 
     def _read_and_pivot(self) -> pd.DataFrame:
         # Shared implementation (kept in src/tabular so tabular-only experiments
@@ -1043,6 +1047,27 @@ class PastureDataModule(LightningDataModule):
             b_stds.append(sigma)
         self._biomass_5d_mean = b_means
         self._biomass_5d_std = b_stds
+
+        # Also compute per-dimension variance in log1p(grams) space (no area normalization).
+        # This is useful for approximating the per-target SST normalization in weighted R^2.
+        b_log_vars: List[float] = []
+        for t in biomass_targets:
+            if t not in self.train_df.columns:
+                b_log_vars.append(1.0)
+                continue
+            vals = self.train_df[t].astype(float).to_numpy()
+            vals = vals[np.isfinite(vals)]
+            if vals.size <= 1:
+                b_log_vars.append(1.0)
+                continue
+            # Kaggle metric uses log1p(grams) with non-negativity.
+            vals = np.clip(vals, a_min=0.0, a_max=None)
+            lv = np.log1p(vals)
+            v = float(np.var(lv))
+            if (not np.isfinite(v)) or v <= 0.0:
+                v = 1.0
+            b_log_vars.append(v)
+        self._biomass_5d_log1p_var = b_log_vars
         try:
             ndvi_vals = self.train_df["Pre_GSHH_NDVI"].astype(float).to_numpy()
             ndvi_mu = float(np.mean(ndvi_vals)) if ndvi_vals.size > 0 else 0.0
@@ -1075,6 +1100,11 @@ class PastureDataModule(LightningDataModule):
                 "biomass_5d": {
                     "mean": list(self._biomass_5d_mean or []),
                     "std": list(self._biomass_5d_std or []),
+                    "order": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"],
+                },
+                # Optional metric helper stats (log1p(grams) variance per dimension).
+                "biomass_5d_log1p_g": {
+                    "var": list(self._biomass_5d_log1p_var or []),
                     "order": ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "GDM_g", "Dry_Total_g"],
                 },
                 "meta": {
@@ -1111,3 +1141,7 @@ class PastureDataModule(LightningDataModule):
     @property
     def biomass_5d_zscore_std(self) -> Optional[List[float]]:
         return self._biomass_5d_std
+
+    @property
+    def biomass_5d_log1p_var(self) -> Optional[List[float]]:
+        return self._biomass_5d_log1p_var

@@ -1,0 +1,137 @@
+defaults:
+  # Base wiring (data/model/training) from baseline experiment
+  - experiment@_global_: baseline_no_irish
+  # Lock head + LoRA on (centered at the original trial-56 config)
+  - override /model/head: vitdet
+  - override /train/peft: lora
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .
+
+# Tune uses a single train/val split (fast). Final selection should still be by Kaggle public LB.
+kfold:
+  enabled: false
+  folds: null
+train_all:
+  enabled: false
+
+# --- Requested hard constraints ---
+data:
+  batch_size: 2
+  # Reduce loader contention during multi-trial runs
+  num_workers: 8
+  prefetch_factor: 2
+  augment:
+    manifold_mixup:
+      detach_pair: false
+
+# --- Trial-56 center (values from tune-vitdet-v1-12h trial 56) ---
+model:
+  head:
+    vitdet_dim: 512
+    vitdet_scale_factors: [2.0, 1.0, 0.5, 0.25]
+    hidden_dims: [1280]
+    activation: silu
+    dropout: 0.4586939537234684
+    ratio_head_mode: shared
+  backbone_layers:
+    layer_fusion: learned
+
+peft:
+  use_dora: false
+  r: 4
+  lora_alpha: 16
+  lora_dropout: 0.03451400041698553
+  last_k_blocks: 16
+  target_modules: [qkv]
+  lora_llrd: 0.86887955343612
+  lora_lr: 0.0012829542106450487
+
+optimizer:
+  lr: 0.0001286444268039004
+  weight_decay: 0.0021589341253740045
+
+scheduler:
+  warmup_epochs: 0
+
+trainer:
+  max_epochs: 45
+  limit_train_batches: 1500
+  log_every_n_steps: 10
+  accumulate_grad_batches: 8
+  checkpoint:
+    every_n_epochs: 1
+  # Keep SWA behavior consistent with the original 56 trial; disable EMA so SWA actually runs.
+  ema:
+    enabled: false
+  swa:
+    enabled: true
+    adaptive_lrs: true
+    auto_lrs: true
+    freeze_lora: false
+    swa_epoch_start: 0.8
+    annealing_epochs: 5
+    annealing_strategy: cos
+
+ray:
+  address: auto
+
+tune:
+  name: tune-vitdet-v1-12h-56-targeted-bsz2-detach0
+  resume: false
+  restore_path: null
+  resume_unfinished: true
+  resume_errored: true
+  restart_errored: false
+  storage_path: ray_results
+
+  metric: val_loss_5d_weighted
+  mode: min
+
+  # Small-range targeted search (around trial 56)
+  num_samples: 16
+  max_concurrent_trials: 2
+  resources_per_trial:
+    cpu: 8
+    gpu: 1
+
+  # Targeted search: no early pruning (full-budget comparability).
+  scheduler:
+    type: fifo
+    max_epochs: ${trainer.max_epochs}
+
+  seeds: [42]
+  report_per_epoch: true
+
+  # Search space: ONLY small perturbations around 56.
+  search_space:
+    model.head.dropout:
+      type: choice
+      values: [0.35, 0.4586939537234684, 0.55]
+
+    optimizer.lr:
+      type: loguniform
+      lower: 6.0e-5
+      upper: 2.5e-4
+    peft.lora_lr:
+      type: loguniform
+      lower: 6.0e-4
+      upper: 2.5e-3
+
+    optimizer.weight_decay:
+      type: loguniform
+      lower: 8.0e-4
+      upper: 6.0e-3
+
+    peft.last_k_blocks:
+      type: choice
+      values: [12, 16]
+
+    trainer.swa.swa_epoch_start:
+      type: choice
+      values: [0.7, 0.8, 0.9]

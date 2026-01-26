@@ -149,6 +149,15 @@ class BiomassRegressor(
         enable_5d_loss: bool = True,
         loss_5d_weight: float = 1.0,
         biomass_5d_weights: Optional[List[float]] = None,
+        # Metric-aligned loss configuration (optional).
+        # - "legacy"            : keep historical behavior (g/m^2 space; optional log/z-score)
+        # - "kaggle_log1p_grams" : match competition evaluation space (log1p(grams))
+        loss_metric_space: str = "legacy",
+        # When True and metric_space is kaggle_log1p_grams, normalize per-dimension MSE by
+        # the train-set variance in log1p(grams) to approximate the SST normalization in R^2.
+        loss_normalize_by_train_log_var: bool = True,
+        # Optional per-dimension variance of log1p(grams) targets (train-set), order matches 5D.
+        biomass_5d_log1p_var: Optional[List[float]] = None,
         # Multi-layer backbone features / layer-wise heads
         use_layerwise_heads: bool = False,
         backbone_layer_indices: Optional[List[int]] = None,
@@ -474,6 +483,24 @@ class BiomassRegressor(
             torch.tensor(weights_list, dtype=torch.float32),
             persistent=False,
         )
+
+        # Loss-space configuration (used by LossesMixin).
+        self.loss_metric_space: str = str(loss_metric_space or "legacy").strip().lower()
+        self.loss_normalize_by_train_log_var: bool = bool(loss_normalize_by_train_log_var)
+
+        # Optional per-dimension variance of log1p(grams) targets (train-set).
+        # Used to approximate the per-target SST normalization in weighted R^2.
+        var_default = torch.ones(5, dtype=torch.float32)
+        var_t = var_default
+        if biomass_5d_log1p_var is not None:
+            try:
+                v_list = [float(v) for v in list(biomass_5d_log1p_var)]
+                if len(v_list) == 5:
+                    var_t = torch.tensor(v_list, dtype=torch.float32)
+            except Exception:
+                var_t = var_default
+        var_t = torch.clamp(var_t, min=1e-8)
+        self.register_buffer("biomass_5d_log1p_var", var_t, persistent=False)
 
         # Log-scale control applies only to main reg3 outputs
         self.log_scale_targets: bool = bool(log_scale_targets)
