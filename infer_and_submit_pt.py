@@ -75,6 +75,27 @@ TTA_VFLIP = True
 TTA_SCALES = [1.0]
 # =======================================
 
+# ===== Transductive affine calibration (post-hoc; no backprop) =====
+# When enabled, we match the test prediction distribution to the training distribution
+# in an evaluation-aligned space while preserving hard constraints:
+#   Total = Clover + Dead + Green
+#   GDM   = Clover + Green
+#
+# Implementation detail (in src/inference/pipeline.py):
+# - Calibrate Total in log1p(grams)
+# - Calibrate composition in logits space over [Clover, Dead, Green]
+TRANSDUCTIVE_CALIBRATION_ENABLED = False
+# Strength of the calibration in [0,1]. 0 -> no-op, 1 -> full mean/std match.
+TRANSDUCTIVE_CALIBRATION_LAM = 0.3
+# Robust quantile clip for estimating mean/std from distributions (lo, hi).
+TRANSDUCTIVE_CALIBRATION_Q_CLIP = (0.01, 0.99)
+# Clamp scale factors for stability.
+TRANSDUCTIVE_CALIBRATION_A_CLIP_TOTAL = (0.7, 1.3)
+TRANSDUCTIVE_CALIBRATION_A_CLIP_RATIO = (0.7, 1.3)
+# If False, only calibrate Total (keep original composition).
+TRANSDUCTIVE_CALIBRATION_CALIBRATE_RATIO = True
+# ================================================================
+
 
 import os
 import sys
@@ -177,6 +198,12 @@ def main() -> None:
         mc_dropout_enabled=bool(MC_DROPOUT_ENABLED),
         mc_dropout_samples=int(MC_DROPOUT_SAMPLES),
         mc_dropout_seed=int(MC_DROPOUT_SEED),
+        transductive_calibration_enabled=bool(TRANSDUCTIVE_CALIBRATION_ENABLED),
+        transductive_calibration_lam=float(TRANSDUCTIVE_CALIBRATION_LAM),
+        transductive_calibration_q_clip=tuple(float(x) for x in TRANSDUCTIVE_CALIBRATION_Q_CLIP),
+        transductive_calibration_a_clip_total=tuple(float(x) for x in TRANSDUCTIVE_CALIBRATION_A_CLIP_TOTAL),
+        transductive_calibration_a_clip_ratio=tuple(float(x) for x in TRANSDUCTIVE_CALIBRATION_A_CLIP_RATIO),
+        transductive_calibration_calibrate_ratio=bool(TRANSDUCTIVE_CALIBRATION_CALIBRATE_RATIO),
     )
 
     if bool(TABPFN_ENABLED):

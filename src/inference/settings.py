@@ -62,4 +62,30 @@ class InferenceSettings:
     # are derived deterministically from this value.
     mc_dropout_seed: int = -1
 
+    # --------------------
+    # Transductive affine calibration (post-hoc; no backprop).
+    #
+    # When enabled, we match the test prediction distribution to the training
+    # distribution in an evaluation-aligned space:
+    # - Total: log1p(grams)
+    # - Composition: logits over [Clover, Dead, Green] (softmax space)
+    #
+    # This preserves hard constraints:
+    #   Total = Clover + Dead + Green
+    #   GDM   = Clover + Green
+    # --------------------
+    transductive_calibration_enabled: bool = False
+    # Shrink strength in [0,1]. 0 -> identity, 1 -> full mean/std match.
+    transductive_calibration_lam: float = 0.3
+    # Quantile clipping for robust stats (lo, hi). Set to (0.0, 1.0) to effectively disable.
+    transductive_calibration_q_clip: tuple[float, float] = (0.01, 0.99)
+    # Clamp scale factors (a) for stability.
+    transductive_calibration_a_clip_total: tuple[float, float] = (0.7, 1.3)
+    transductive_calibration_a_clip_ratio: tuple[float, float] = (0.7, 1.3)
+    # Optional: disable ratio-logits calibration (still calibrates Total).
+    transductive_calibration_calibrate_ratio: bool = True
+    # Numerical epsilons.
+    transductive_calibration_std_eps: float = 1e-8
+    transductive_calibration_p_eps: float = 1e-6
+
 

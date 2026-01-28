@@ -6,12 +6,14 @@ import re
 import tempfile
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 import yaml
 from torch import nn
 
+from src.data.csiro_pivot import read_and_pivot_csiro_train_csv
 from src.inference.data import resolve_paths
 from src.inference.ensemble import (
     load_ensemble_cache,
@@ -1979,6 +1981,282 @@ def _write_submission(df: pd.DataFrame, image_to_components: Dict[str, Dict[str,
             f.write(f"{sample_id},{value}\n")
 
 
+def _resolve_train_csv_path_for_calibration(*, project_dir: str, cfg: Dict, dataset_root: str) -> Optional[str]:
+    """
+    Resolve train.csv path for transductive calibration.
+
+    We try:
+      1) Under the inference input root (dataset_root)
+      2) Under cfg.data.root relative to the repo root (project_dir)
+      3) As an absolute cfg.data.train_csv path
+    """
+    train_csv_name = str(cfg.get("data", {}).get("train_csv", "train.csv") or "train.csv")
+    candidates: List[str] = []
+
+    # 1) dataset_root (resolved from settings.input_path)
+    try:
+        candidates.append(os.path.join(str(dataset_root), train_csv_name))
+    except Exception:
+        pass
+
+    # 2) cfg.data.root relative to project_dir
+    data_root_cfg = cfg.get("data", {}).get("root", None)
+    if isinstance(data_root_cfg, str) and data_root_cfg.strip():
+        try:
+            candidates.append(os.path.join(str(project_dir), data_root_cfg.strip(), train_csv_name))
+        except Exception:
+            pass
+
+    # 3) absolute override
+    if os.path.isabs(train_csv_name):
+        candidates.append(train_csv_name)
+
+    for p in candidates:
+        p = str(p or "").strip()
+        if p and os.path.isfile(p):
+            return os.path.abspath(p)
+    return None
+
+
+def _compute_train_stats_total_and_ratio(
+    train_csv_path: str,
+    *,
+    q_clip: Tuple[float, float] = (0.01, 0.99),
+    std_eps: float = 1e-8,
+    p_eps: float = 1e-6,
+) -> Tuple[float, float, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Compute training distribution stats for the recommended calibration space:
+
+    - Total: u = log1p(max(Total_g, 0))
+    - Ratio logits: r = log(p), where p = normalize([Clover, Dead, Green])
+
+    Returns:
+      (mu_u, std_u, mu_r(3,), std_r(3,))
+    """
+    # Keep target_order strict so we only use rows where all required columns exist.
+    df = read_and_pivot_csiro_train_csv(
+        data_root="",
+        train_csv=str(train_csv_path),
+        target_order=("Dry_Total_g", "Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g"),
+    )
+
+    cols = ["Dry_Clover_g", "Dry_Dead_g", "Dry_Green_g", "Dry_Total_g"]
+    for c in cols:
+        if c not in df.columns:
+            raise RuntimeError(f"Missing column in train.csv pivot: {c}")
+    arr = df[cols].to_numpy(dtype=np.float64, copy=True)
+    if arr.ndim != 2 or arr.shape[1] != 4:
+        raise RuntimeError(f"Unexpected train array shape: {arr.shape}")
+
+    comp = np.maximum(arr[:, :3], 0.0)
+    total = np.maximum(arr[:, 3], 0.0)
+
+    # --- Total stats (log1p) ---
+    u = np.log1p(total)
+    u_stat = u
+    if q_clip is not None:
+        try:
+            lo = float(np.nanquantile(u, float(q_clip[0])))
+            hi = float(np.nanquantile(u, float(q_clip[1])))
+            u_stat = np.clip(u, lo, hi)
+        except Exception:
+            u_stat = u
+    mu_u = float(np.nanmean(u_stat))
+    std_u = float(np.nanstd(u_stat))
+    std_u = max(float(std_u), float(std_eps))
+    if not (np.isfinite(mu_u) and np.isfinite(std_u)):
+        raise RuntimeError("Non-finite train stats for Total (log1p).")
+
+    # --- Ratio stats (log p) ---
+    mu_r: Optional[np.ndarray] = None
+    std_r: Optional[np.ndarray] = None
+    comp_sum = np.sum(comp, axis=1)
+    mask = np.isfinite(comp_sum) & (comp_sum > 0.0)
+    if int(np.sum(mask)) >= 8:
+        comp_m = comp[mask]
+        comp_sum_m = comp_sum[mask]
+        p = comp_m / np.maximum(comp_sum_m[:, None], float(p_eps))
+        p = np.clip(p, float(p_eps), 1.0)
+        # Re-normalize to ensure sum-to-one after clipping.
+        p = p / np.maximum(np.sum(p, axis=1, keepdims=True), float(p_eps))
+        r = np.log(p)
+
+        r_stat = r
+        if q_clip is not None:
+            try:
+                lo = np.nanquantile(r, float(q_clip[0]), axis=0)
+                hi = np.nanquantile(r, float(q_clip[1]), axis=0)
+                r_stat = np.clip(r, lo, hi)
+            except Exception:
+                r_stat = r
+        mu_r = np.nanmean(r_stat, axis=0).astype(np.float64)
+        std_r = np.nanstd(r_stat, axis=0).astype(np.float64)
+        std_r = np.maximum(std_r, float(std_eps))
+        if mu_r.shape != (3,) or std_r.shape != (3,):
+            mu_r = None
+            std_r = None
+
+    return mu_u, std_u, mu_r, std_r
+
+
+def _transductive_affine_calibrate_total_and_ratio(
+    comps_5d_g: torch.Tensor,
+    *,
+    project_dir: str,
+    dataset_root: str,
+    cfg: Dict,
+    q_clip: Tuple[float, float] = (0.01, 0.99),
+    lam: float = 0.3,
+    a_clip_total: Tuple[float, float] = (0.7, 1.3),
+    a_clip_ratio: Tuple[float, float] = (0.7, 1.3),
+    calibrate_ratio: bool = True,
+    std_eps: float = 1e-8,
+    p_eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Recommended transductive affine calibration that preserves hard constraints by construction.
+
+    - Calibrate Total in u = log1p(grams) space with u' = a*u + b.
+    - Calibrate composition in logits space over [Clover, Dead, Green] with r' = a*r + b,
+      where r = log(p) and p sums to 1.
+
+    Reconstruct per sample:
+      total' = expm1(u')
+      p' = softmax(r')
+      [C',D',G'] = total' * p'
+      GDM' = C' + G'
+
+    Output is (N,5) in grams with constraints:
+      Total' = C'+D'+G',  GDM' = C'+G'
+    """
+    if not isinstance(comps_5d_g, torch.Tensor):
+        return comps_5d_g
+    if comps_5d_g.numel() == 0:
+        return comps_5d_g
+    if comps_5d_g.dim() != 2 or int(comps_5d_g.shape[1]) != 5:
+        raise RuntimeError(f"Expected comps_5d_g shape (N,5), got: {tuple(comps_5d_g.shape)}")
+
+    train_csv_path = _resolve_train_csv_path_for_calibration(project_dir=project_dir, cfg=cfg, dataset_root=dataset_root)
+    if not (train_csv_path and os.path.isfile(train_csv_path)):
+        print("[CALIB] train.csv not found; skipping transductive calibration.")
+        return comps_5d_g
+
+    try:
+        mu_u_t, std_u_t, mu_r_t, std_r_t = _compute_train_stats_total_and_ratio(
+            train_csv_path, q_clip=q_clip, std_eps=float(std_eps), p_eps=float(p_eps)
+        )
+    except Exception as e:
+        print(f"[CALIB] Failed to compute training stats from: {train_csv_path}. Skipping. Error: {e}")
+        return comps_5d_g
+
+    x = comps_5d_g.detach().cpu()
+    out_dtype = x.dtype
+    x64 = x.to(torch.float64)
+
+    # ----- Build calibration variables from predictions -----
+    total = x64[:, 4].clamp_min(0.0)
+    u = torch.log1p(total)
+
+    comp = x64[:, :3].clamp_min(0.0)
+    comp_sum = comp.sum(dim=-1, keepdim=True)
+    p = comp / comp_sum.clamp_min(float(p_eps))
+    zero_mask = (comp_sum.view(-1) <= float(p_eps)) | (~torch.isfinite(comp_sum.view(-1)))
+    if bool(zero_mask.any().item()):
+        p[zero_mask] = 1.0 / 3.0
+    p = p.clamp_min(float(p_eps))
+    p = p / p.sum(dim=-1, keepdim=True).clamp_min(float(p_eps))
+    # log(p) is a valid logits parameterization since softmax(log(p)) == p.
+    r = torch.log(p)
+
+    # ----- Compute prediction stats (with optional robust clipping) -----
+    u_stat = u
+    if q_clip is not None:
+        try:
+            u_lo = torch.quantile(u, float(q_clip[0]))
+            u_hi = torch.quantile(u, float(q_clip[1]))
+            u_stat = u.clamp(u_lo, u_hi)
+        except Exception:
+            u_stat = u
+    mu_u_p = u_stat.mean()
+    std_u_p = u_stat.std(unbiased=False).clamp_min(float(std_eps))
+
+    # ----- Total affine params (shrink towards identity) -----
+    mu_u_t_t = torch.tensor(float(mu_u_t), dtype=torch.float64)
+    std_u_t_t = torch.tensor(float(std_u_t), dtype=torch.float64)
+    a_u = (std_u_t_t / std_u_p).clamp(min=float(a_clip_total[0]), max=float(a_clip_total[1]))
+    b_u = mu_u_t_t - a_u * mu_u_p
+    a_u = 1.0 + float(lam) * (a_u - 1.0)
+    b_u = float(lam) * b_u
+
+    u_cal = a_u * u + b_u
+    total_cal = torch.expm1(u_cal).clamp_min(0.0)
+
+    # ----- Ratio affine params (optional if we have valid train stats) -----
+    ratio_ok = bool(calibrate_ratio) and (
+        isinstance(mu_r_t, np.ndarray)
+        and isinstance(std_r_t, np.ndarray)
+        and mu_r_t.shape == (3,)
+        and std_r_t.shape == (3,)
+        and bool(np.isfinite(mu_r_t).all())
+        and bool(np.isfinite(std_r_t).all())
+    )
+    r_cal = r
+    if ratio_ok:
+        r_stat = r
+        if q_clip is not None:
+            try:
+                r_lo = torch.quantile(r, float(q_clip[0]), dim=0)
+                r_hi = torch.quantile(r, float(q_clip[1]), dim=0)
+                r_stat = r.clamp(r_lo.view(1, 3), r_hi.view(1, 3))
+            except Exception:
+                r_stat = r
+        mu_r_p = r_stat.mean(dim=0)
+        std_r_p = r_stat.std(dim=0, unbiased=False).clamp_min(float(std_eps))
+        mu_r_t_t = torch.as_tensor(mu_r_t, dtype=torch.float64)
+        std_r_t_t = torch.as_tensor(std_r_t, dtype=torch.float64)
+        a_r = (std_r_t_t / std_r_p).clamp(min=float(a_clip_ratio[0]), max=float(a_clip_ratio[1]))
+        b_r = mu_r_t_t - a_r * mu_r_p
+        a_r = 1.0 + float(lam) * (a_r - 1.0)
+        b_r = float(lam) * b_r
+        r_cal = (r * a_r.view(1, 3)) + b_r.view(1, 3)
+
+    # ----- Reconstruct constraint-consistent 5D outputs -----
+    p_cal = torch.softmax(r_cal, dim=-1)
+    comp_cal = p_cal * total_cal.view(-1, 1)
+    clover = comp_cal[:, 0]
+    dead = comp_cal[:, 1]
+    green = comp_cal[:, 2]
+    gdm = clover + green
+    out = torch.stack([clover, dead, green, gdm, total_cal], dim=-1).to(dtype=out_dtype)
+
+    # ----- Logging -----
+    try:
+        print(f"[CALIB] Enabled (train_csv={train_csv_path})")
+        print(
+            "[CALIB] Total log1p: "
+            f"mu_pred={float(mu_u_p.item()):.4f}, std_pred={float(std_u_p.item()):.4f} "
+            f"-> mu_train={float(mu_u_t):.4f}, std_train={float(std_u_t):.4f} "
+            f"(a={float(a_u.item()):.4f}, b={float(b_u.item()):.4f}, lam={float(lam):.3f})"
+        )
+        if ratio_ok:
+            # Report averages for readability (3 dims).
+            mu_r_p0 = r.mean(dim=0)
+            std_r_p0 = r.std(dim=0, unbiased=False)
+            print(
+                "[CALIB] Ratio logits: "
+                f"mu_pred_mean={float(mu_r_p0.mean().item()):.4f}, std_pred_mean={float(std_r_p0.mean().item()):.4f} "
+                f"-> mu_train_mean={float(np.mean(mu_r_t)):.4f}, std_train_mean={float(np.mean(std_r_t)):.4f} "
+                f"(lam={float(lam):.3f})"
+            )
+        else:
+            print("[CALIB] Ratio logits: train stats unavailable; keeping original composition.")
+    except Exception:
+        pass
+
+    return out
+
+
 def run(settings: InferenceSettings) -> None:
     """
     Entry point for offline inference + submission generation.
@@ -2310,6 +2588,21 @@ def run(settings: InferenceSettings) -> None:
                 w_sum_dyn = w_sum_dyn.clamp_min(1e-12)
             w_norm = w_dyn / w_sum_dyn.view(1, N)
             comps_avg = (comps_stack * w_norm.view(M, N, 1)).sum(dim=0)
+
+        if bool(getattr(settings, "transductive_calibration_enabled", False)):
+            comps_avg = _transductive_affine_calibrate_total_and_ratio(
+                comps_avg,
+                project_dir=project_dir_abs,
+                dataset_root=dataset_root,
+                cfg=cfg,
+                q_clip=tuple(getattr(settings, "transductive_calibration_q_clip", (0.01, 0.99))),
+                lam=float(getattr(settings, "transductive_calibration_lam", 0.3)),
+                a_clip_total=tuple(getattr(settings, "transductive_calibration_a_clip_total", (0.7, 1.3))),
+                a_clip_ratio=tuple(getattr(settings, "transductive_calibration_a_clip_ratio", (0.7, 1.3))),
+                calibrate_ratio=bool(getattr(settings, "transductive_calibration_calibrate_ratio", True)),
+                std_eps=float(getattr(settings, "transductive_calibration_std_eps", 1e-8)),
+                p_eps=float(getattr(settings, "transductive_calibration_p_eps", 1e-6)),
+            )
         image_to_components: Dict[str, Dict[str, float]] = {}
         for rel_path, vec in zip(rels_ref, comps_avg.tolist()):
             clover_g, dead_g, green_g, gdm_g, total_g = vec
@@ -2369,6 +2662,21 @@ def run(settings: InferenceSettings) -> None:
         image_paths=unique_image_paths,
         prefer_packaged_head_manifest=prefer_packaged_manifest,
     )
+
+    if bool(getattr(settings, "transductive_calibration_enabled", False)):
+        comps_5d_g = _transductive_affine_calibrate_total_and_ratio(
+            comps_5d_g,
+            project_dir=project_dir_abs,
+            dataset_root=dataset_root,
+            cfg=cfg,
+            q_clip=tuple(getattr(settings, "transductive_calibration_q_clip", (0.01, 0.99))),
+            lam=float(getattr(settings, "transductive_calibration_lam", 0.3)),
+            a_clip_total=tuple(getattr(settings, "transductive_calibration_a_clip_total", (0.7, 1.3))),
+            a_clip_ratio=tuple(getattr(settings, "transductive_calibration_a_clip_ratio", (0.7, 1.3))),
+            calibrate_ratio=bool(getattr(settings, "transductive_calibration_calibrate_ratio", True)),
+            std_eps=float(getattr(settings, "transductive_calibration_std_eps", 1e-8)),
+            p_eps=float(getattr(settings, "transductive_calibration_p_eps", 1e-6)),
+        )
 
     # Build image -> component mapping
     image_to_components: Dict[str, Dict[str, float]] = {}
