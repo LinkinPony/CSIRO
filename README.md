@@ -1,3 +1,6 @@
+# Code for contest: https://www.kaggle.com/competitions/csiro-biomass/
+
+
 # CSIRO Pasture Biomass (DINOv3 + Head)
 
 Train models that predict pasture biomass components from pasture images (plus optional auxiliary signals like NDVI/height).
