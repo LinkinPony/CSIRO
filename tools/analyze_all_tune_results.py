@@ -600,7 +600,7 @@ def _write_param_importance_md(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results-root", type=str, default="/media/dl/dataset/ray_results", help="Ray results root dir")
+    ap.add_argument("--results-root", type=str, required=True, help="Ray results root dir (e.g. ~/ray_results)")
     ap.add_argument("--output-root", type=str, default="", help="Output root (default: <repo>/outputs/tune_analysis)")
     ap.add_argument("--metric", type=str, default="val_loss_5d_weighted", help="Metric to analyze (from result.json)")
     ap.add_argument("--mode", type=str, default="min", choices=["min", "max"], help="Optimization direction for metric")

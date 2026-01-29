@@ -3,8 +3,8 @@ set -euo pipefail
 
 # One-click launcher for a Ray WORKER node (join an existing Ray head).
 #
-# Usage (on worker machine 192.168.199.241):
-#   bash run_ray_worker.sh
+# Usage (on worker machine):
+#   HEAD_IP=<head_node_ip> WORKER_IP=<this_machine_ip> bash run_ray_worker.sh
 #
 # Override via env vars if needed:
 #   HEAD_IP=... WORKER_IP=... bash run_ray_worker.sh
@@ -17,11 +17,12 @@ cd "${REPO_ROOT}"
 export CSIRO_REPO_ROOT="${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-HEAD_IP="${HEAD_IP:-192.168.10.14}"
+# IMPORTANT: Set HEAD_IP to the Ray head node's IP address
+HEAD_IP="${HEAD_IP:-YOUR_HEAD_IP}"
 HEAD_PORT="${HEAD_PORT:-6379}"
 
 # IMPORTANT: Set this to the worker machine's reachable IP on the Ray network.
-WORKER_IP="${WORKER_IP:-192.168.199.241}"
+WORKER_IP="${WORKER_IP:-$(hostname -I | awk '{print $1}')}"
 
 RAY_MIN_WORKER_PORT="${RAY_MIN_WORKER_PORT:-10002}"
 RAY_MAX_WORKER_PORT="${RAY_MAX_WORKER_PORT:-10100}"

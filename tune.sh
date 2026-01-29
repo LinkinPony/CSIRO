@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /media/dl/dataset/Git/CSIRO
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Usage:
 #   ./tune.sh <run_name>                        # start a new run with a custom name

@@ -13,7 +13,7 @@ python train.py --config configs/train.yaml
 Notes:
 - Backbone weights are loaded via `torch.hub` from `facebookresearch/dinov3` and kept frozen by default.
 - All configurable parameters live in `configs/train.yaml`.
-- Data must be under `/home/dl/Git/CSIRO/data` with `train.csv` and images.
+- Data must be under `data/` with `train.csv` and images.
 
 ---
 
@@ -47,17 +47,17 @@ Hydra config layout:
 
 ---
 
-### Hyperparameter search with Ray Tune (2 machines, 1×RTX4090 each)
+### Hyperparameter search with Ray Tune (2 machines, 1×GPU each)
 
 Cluster assumptions for this repo:
-- **Ray head IP**: `192.168.10.14` (this machine)
-- **Ray worker IP**: `192.168.199.241`
+- **Ray head IP**: `<HEAD_IP>` (your head node)
+- **Ray worker IP**: `<WORKER_IP>`
 - **Shared storage**: NFS (recommended) mounted at the same path on both nodes (example: `/mnt/csiro_nfs`)
-- **Training data**: keep on local SSD on each node (don’t put the dataset on NFS)
+- **Training data**: keep on local SSD on each node (don't put the dataset on NFS)
 
 #### 0) (Recommended) Setup NFS for shared Tune results
 
-On the **head** node (`192.168.10.14`):
+On the **head** node:
 
 ```bash
 sudo apt update
@@ -67,23 +67,23 @@ sudo mkdir -p /srv/nfs/csiro/ray_results
 sudo chown -R $USER:$USER /srv/nfs/csiro
 
 # Export to the worker node (edit /etc/exports and add the following line)
-echo "/srv/nfs/csiro 192.168.199.241(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
+echo "/srv/nfs/csiro <WORKER_IP>(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
 
 sudo exportfs -ra
 sudo systemctl restart nfs-kernel-server
 ```
 
-On the **worker** node (`192.168.199.241`):
+On the **worker** node:
 
 ```bash
 sudo apt update
 sudo apt install -y nfs-common
 
 sudo mkdir -p /mnt/csiro_nfs
-sudo mount -t nfs4 192.168.10.14:/srv/nfs/csiro /mnt/csiro_nfs -o vers=4,proto=tcp
+sudo mount -t nfs4 <HEAD_IP>:/srv/nfs/csiro /mnt/csiro_nfs -o vers=4,proto=tcp
 
 # Optional: auto-mount on boot
-echo "192.168.10.14:/srv/nfs/csiro /mnt/csiro_nfs nfs4 defaults,_netdev,vers=4,proto=tcp 0 0" | sudo tee -a /etc/fstab
+echo "<HEAD_IP>:/srv/nfs/csiro /mnt/csiro_nfs nfs4 defaults,_netdev,vers=4,proto=tcp 0 0" | sudo tee -a /etc/fstab
 ```
 
 #### 1) Start a Ray cluster
@@ -92,7 +92,7 @@ On the **head** node:
 
 ```bash
 ray start --head \
-  --node-ip-address=192.168.10.14 \
+  --node-ip-address=<HEAD_IP> \
   --port=6379 \
   --dashboard-host=0.0.0.0 --dashboard-port=8265 \
   --num-gpus=1 \
@@ -103,8 +103,8 @@ On the **worker** node:
 
 ```bash
 ray start \
-  --address='192.168.10.14:6379' \
-  --node-ip-address=192.168.199.241 \
+  --address='<HEAD_IP>:6379' \
+  --node-ip-address=<WORKER_IP> \
   --num-gpus=1 \
   --min-worker-port=10000 --max-worker-port=10100
 ```
@@ -138,7 +138,7 @@ python tune.py trainer.max_epochs=10 trainer.limit_train_batches=200
 python tune.py tune.seeds='[42,43,44]' tune.scheduler.type=fifo tune.report_per_epoch=false
 
 # Dashboard (head node)
-# Open: `http://192.168.10.14:8265`
+# Open: `http://<HEAD_IP>:8265`
 ```
 
 Resume after interruption:

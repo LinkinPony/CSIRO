@@ -1,7 +1,7 @@
 # Mamba (2D-mixing) v8 sweep: local refinement around v7 best.
 #
 # This config narrows `conf/tune_mamba_v7.yaml` based on offline analysis of:
-#   - /media/dl/dataset/ray_results/tune-mamba-v7/analysis_r2/report.md
+#   - (local ray results tune-mamba-v7 analysis)
 #   - outputs/tune_analysis_val_loss_5d_weighted/experiments_summary.csv
 #
 # Key takeaways from v7:

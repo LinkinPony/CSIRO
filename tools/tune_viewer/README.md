@@ -13,21 +13,21 @@ It focuses on the **file outputs you already produce**:
 ### Backend (FastAPI)
 
 ```bash
-cd /media/dl/dataset/Git/CSIRO/tools/tune_viewer/backend
+cd tools/tune_viewer/backend
 
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
 
-export CSIRO_TUNE_VIEWER_RESULTS_ROOT="/mnt/csiro_nfs/ray_results"
+export CSIRO_TUNE_VIEWER_RESULTS_ROOT="/path/to/ray_results"
 uvicorn tune_viewer.api.main:app --reload --host 0.0.0.0 --port 8008
 ```
 
 ### Frontend (React/Vite)
 
 ```bash
-cd /media/dl/dataset/Git/CSIRO/tools/tune_viewer/frontend
+cd tools/tune_viewer/frontend
 npm install
 VITE_TUNE_VIEWER_API_URL="http://localhost:8008" npm run dev
 ```

@@ -7,7 +7,7 @@
 # epoch: 31
 # done: False
 # trial_id: d9a15_00042
-# trial_dir: /media/dl/dataset/ray_results/tune-vitdet-v1-12h/trainable_d9a15_00042_42_model_backbone_layers_layer_fusion=mean,model_head_activation=silu,model_head_dropout=0.2090,model_head_h_2026-01-10_10-19-19
+# trial_dir: (local ray results directory)
 # ----------------------------------
 
 data:

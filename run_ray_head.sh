@@ -22,7 +22,8 @@ cd "${REPO_ROOT}"
 export CSIRO_REPO_ROOT="${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-HEAD_IP="${HEAD_IP:-192.168.10.14}"
+# Set HEAD_IP to the IP address of this machine on the Ray cluster network
+HEAD_IP="${HEAD_IP:-$(hostname -I | awk '{print $1}')}"
 RAY_GCS_PORT="${RAY_GCS_PORT:-6379}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 RAY_METRICS_EXPORT_PORT="${RAY_METRICS_EXPORT_PORT:-18080}"

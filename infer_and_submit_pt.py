@@ -19,7 +19,7 @@ DINOV3_PATH = "third_party/dinov3"
 PEFT_PATH = "third_party/peft/src"  # path to peft source folder (contains peft/*)
 
 # New: specify the project directory that contains both `configs/` and `src/` folders.
-# Example: PROJECT_DIR = "/media/dl/dataset/Git/CSIRO"
+# Example: PROJECT_DIR = "/path/to/CSIRO"
 PROJECT_DIR = "."
 
 # ===== TabPFN inference (optional) =====

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOCAL_ROOT="/media/dl/dataset/Git/CSIRO"
-REMOTE_HOST="192.168.199.241"
-REMOTE_USER="${REMOTE_USER:-dl}"
-REMOTE_ROOT="/media/dl/dataset/Git/CSIRO"
+# Configure these for your environment:
+LOCAL_ROOT="${LOCAL_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+REMOTE_HOST="${REMOTE_HOST:-YOUR_WORKER_IP}"
+REMOTE_USER="${REMOTE_USER:-YOUR_USER}"
+REMOTE_ROOT="${REMOTE_ROOT:-/path/to/CSIRO}"
 
 # 1 => mirror deletes (dangerous if you have extra files on remote); 0 => safer incremental sync
 DELETE="${DELETE:-0}"
