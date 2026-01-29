@@ -30,8 +30,8 @@
   },
   "versions": [
     "tune-vitdet-v1-12h-56-c-05-ema-0.99",
-    "tune-vitdet-v1-12h-56-c-05-ema-0.99-seed1",
-    "tune-vitdet-v1-12h-56-c-05-ema-0.99-seed2",
-    "tune-vitdet-v1-12h-56-c-05-ema-0.99-seed3"
+    "tune-vitdet-v1-12h-56-10-vit7b",
+    "tune-vitdet-v1-12h-56-c-05-ema-0.99-vit7b-v2",
+    "tune-vitdet-v1-12h-56-c-05-ema-0.99-vit7b-v3"
   ]
 }
