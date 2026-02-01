@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "aggregation": "per_sample_weighted_mean",
   "per_sample_weighting": {
     "enabled": false,

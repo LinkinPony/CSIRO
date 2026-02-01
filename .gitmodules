@@ -67,3 +67,6 @@
 [submodule "third_party/causal-conv1d"]
 	path = third_party/causal-conv1d
 	url = git@github.com:Dao-AILab/causal-conv1d.git
+[submodule "third_party/d2"]
+	path = third_party/d2
+	url = git@github.com:terrastruct/d2.git
